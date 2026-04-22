@@ -3,42 +3,36 @@ import re
 from Bio import SeqIO
 
 
-def make_tables(parameters):
-    tables = parameters['outdir'] + "/tables"
-    if not os.path.isdir(tables):
-        os.mkdir(tables)
+def make_tables(alignment_dir: str, ident_dir: str, tables_dir: str, anchor: str):
+    """Generate ranked output tables from alignments and identity reports.
+
+    Args:
+        alignment_dir: Directory of MAFFT alignment files.
+        ident_dir:     Directory of trimAl identity report files.
+        tables_dir:    Directory where output tables are written.
+        anchor:        Anchor species ID used to map group → gene ID.
+    """
+    os.makedirs(tables_dir, exist_ok=True)
     ortho_mean = {}
-    dirpath1 = parameters['outdir'] + "/alignment"
-    input_files1 = os.listdir(dirpath1)
-    group2anchor_path = tables + "/group2anchor.tsv"
-    group2anchor = open(group2anchor_path, "a")
-    dirpath2 = parameters['outdir'] + "/ident_alignment"
-    input_files2 = os.listdir(dirpath2)
-    group2mean_path = tables + "/group2mean.tsv"
-    anchor2mean_path = tables + "/anchor2mean.tsv"
-    anchor2mean = open(anchor2mean_path, "a")
-    group2mean = open(group2mean_path, "a")
-    for file2 in input_files2:
-        aux2 = file2.split(".")
-        group_name2 = aux2[0]
-        ident_files = dirpath2 + '/' + file2
-        ident_file = open(ident_files, "r")
-        for line in ident_file:
-            line = line.rstrip()
-            match = re.search("identity:", line)
-            if match:
-                values = line.split()
-                mean_percent = values[-1]
-                ortho_mean[group_name2] = mean_percent
-                group2mean.write("%s\t%s\n" % (group_name2, mean_percent))
-    for file1 in input_files1:
-        aux = file1.split(".")
-        group_name = aux[0]
-        seq_file = dirpath1 + '/' + file1
-        for seq_record in SeqIO.parse(seq_file, "fasta"):
-            ids_fields = seq_record.id.split("|")
-            specie = ids_fields[0]
-            sequence_id = ids_fields[1]
-            if specie == parameters['anchor']:
-                anchor2mean.write("%s\t%s\n" % (sequence_id, ortho_mean[group_name]))
-                group2anchor.write("%s\t%s\n" % (group_name, sequence_id))
+    with open(os.path.join(tables_dir, "group2mean.tsv"), "a") as group2mean, \
+         open(os.path.join(tables_dir, "anchor2mean.tsv"), "a") as anchor2mean, \
+         open(os.path.join(tables_dir, "group2anchor.tsv"), "a") as group2anchor:
+        for file in os.listdir(ident_dir):
+            group_name = file.split(".")[0]
+            ident_path = os.path.join(ident_dir, file)
+            with open(ident_path, "r") as ident_file:
+                for line in ident_file:
+                    line = line.rstrip()
+                    if re.search("identity:", line):
+                        mean_percent = line.split()[-1]
+                        ortho_mean[group_name] = mean_percent
+                        group2mean.write("%s\t%s\n" % (group_name, mean_percent))
+        for file in os.listdir(alignment_dir):
+            group_name = file.split(".")[0]
+            seq_file = os.path.join(alignment_dir, file)
+            for seq_record in SeqIO.parse(seq_file, "fasta"):
+                ids_fields = seq_record.id.split("|")
+                species, gene_id = ids_fields[0], ids_fields[1]
+                if species == anchor:
+                    anchor2mean.write("%s\t%s\n" % (gene_id, ortho_mean[group_name]))
+                    group2anchor.write("%s\t%s\n" % (group_name, gene_id))
