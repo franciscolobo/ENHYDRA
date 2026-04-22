@@ -9,6 +9,7 @@ from .utils import check_parameters
 from .filtering import filter_length, filter_groups
 from .alignment import run_mafft, run_trimal
 from .tables import make_tables
+from .gsea import run_gsea
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
@@ -32,6 +33,27 @@ def _build_arg_parser():
     )
     parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
+    parser.add_argument(
+        "--gene-sets",
+        default="GO_Biological_Process_2023",
+        help="Gene set database name or path to a .gmt file (default: GO_Biological_Process_2023)."
+    )
+    parser.add_argument(
+        "--permutations", type=int, default=1000,
+        help="Number of GSEA permutations (default: 1000)."
+    )
+    parser.add_argument(
+        "--min-size", type=int, default=5,
+        help="Minimum gene set size to test (default: 5)."
+    )
+    parser.add_argument(
+        "--max-size", type=int, default=500,
+        help="Maximum gene set size to test (default: 500)."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility (default: 42)."
+    )
     return parser
 
 
@@ -113,6 +135,18 @@ def main():
         ident_dir=ident_dir,
         tables_dir=tables_dir,
         anchor=parameters['anchor']
+    )
+
+    logger.info("Step 6: Running GSEA prerank")
+    gsea_dir = os.path.join(outdir, "gsea")
+    run_gsea(
+        anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+        gsea_dir=gsea_dir,
+        gene_sets=args.gene_sets,
+        permutations=args.permutations,
+        min_size=args.min_size,
+        max_size=args.max_size,
+        seed=args.seed,
     )
 
     logger.info("Enhydra finished successfully.")
