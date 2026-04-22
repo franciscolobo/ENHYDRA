@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enhydra"
+version = "0.1.0"
+description = "Gene Set Enrichment Analysis for evolutionary genomics"
+requires-python = ">=3.9"
+dependencies = [
+    "biopython>=1.81",
+    "numpy>=1.24",
+    "gseapy>=1.0",
+    "pandas>=2.0",
+]
+
+[project.scripts]
+enhydra = "enhydra.cli:main"
