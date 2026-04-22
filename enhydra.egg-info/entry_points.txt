@@ -1,0 +1,2 @@
+[console_scripts]
+enhydra = enhydra.cli:main
