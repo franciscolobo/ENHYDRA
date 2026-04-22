@@ -1,4 +1,0 @@
-biopython>=1.81
-numpy>=1.24
-gseapy>=1.0
-pandas>=2.0
