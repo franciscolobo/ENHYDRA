@@ -1,3 +1,7 @@
+import logging
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 from .io import read_config_file
 from .utils import check_parameters
 from .filtering import filter_length, filter_groups

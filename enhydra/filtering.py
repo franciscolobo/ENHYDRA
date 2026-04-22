@@ -1,12 +1,15 @@
 import os
 import shutil
+import logging
 import statistics
 import numpy as np
 from Bio import SeqIO
 from Bio.Seq import Seq
 
+logger = logging.getLogger(__name__)
 
-def filter_length(parameters, outlog, file):
+
+def filter_length(parameters, file):
     inputfile = parameters['inputdir'] + "/" + file
     if os.stat(inputfile).st_size == 0:
         return
@@ -38,12 +41,12 @@ def filter_length(parameters, outlog, file):
         for seq_record in SeqIO.parse(inputfile, "fasta"):
             seq = Seq(seq_record.seq)
             if (len(seq) < mean - 2 * stddev) or (len(seq) > mean + 2 * stddev):
-                outlog.write("Sequence %s in group %s removed for length filter step\n" % (seq_record.id, file))
+                logger.warning("Sequence %s in group %s removed by length filter", seq_record.id, file)
             else:
                 outfile.write(">%s\n%s\n" % (seq_record.id, seq))
 
 
-def filter_groups(parameters, outlog):
+def filter_groups(parameters):
     out = parameters['outdir'] + "/group_filter"
     if not os.path.isdir(out):
         os.mkdir(out)
@@ -58,9 +61,9 @@ def filter_groups(parameters, outlog):
             species_ids.append(sid)
         uniq_ids = list(set(species_ids))
         if parameters['anchor'] not in uniq_ids:
-            outlog.write("Group %s does not contain any sequence of anchor species %s. Group removed.\n" % (file_fields[0], parameters['anchor']))
+            logger.warning("Group %s does not contain anchor species %s. Group removed.", file_fields[0], parameters['anchor'])
             continue
         if len(uniq_ids) < int(parameters['min_species']):
-            outlog.write("Group %s has fewer species than minimum required (%s). Group removed.\n" % (file_fields[0], parameters['min_species']))
+            logger.warning("Group %s has fewer species than minimum required (%s). Group removed.", file_fields[0], parameters['min_species'])
         else:
             shutil.copy(path_to_file, outfile_path)
