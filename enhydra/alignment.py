@@ -1,4 +1,6 @@
 import os
+import subprocess
+from .exceptions import EnhydraToolError
 
 
 def run_mafft(parameters):
@@ -10,7 +12,19 @@ def run_mafft(parameters):
     for file in input_files:
         input_seq = dirpath + "/" + file
         output_seq = outdir + "/" + file + ".aln"
-        os.system('%s --auto --quiet --thread %s %s > %s' % (parameters['mafft'], parameters['max_process'], input_seq, output_seq))
+        try:
+            with open(output_seq, 'w') as outfile:
+                subprocess.run(
+                    [parameters['mafft'], '--auto', '--quiet',
+                     '--thread', str(parameters['max_process']), input_seq],
+                    stdout=outfile,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+        except subprocess.CalledProcessError as e:
+            raise EnhydraToolError(
+                "mafft failed on %s:\n%s" % (file, e.stderr.decode())
+            )
 
 
 def run_trimal(parameters):
@@ -22,4 +36,15 @@ def run_trimal(parameters):
     for file in input_files:
         input_seq = dirpath + "/" + file
         outident = outdir + "/" + file + ".ident"
-        os.system('%s -sident -in %s > %s' % (parameters['trimal'], input_seq, outident))
+        try:
+            with open(outident, 'w') as outfile:
+                subprocess.run(
+                    [parameters['trimal'], '-sident', '-in', input_seq],
+                    stdout=outfile,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+        except subprocess.CalledProcessError as e:
+            raise EnhydraToolError(
+                "trimal failed on %s:\n%s" % (file, e.stderr.decode())
+            )
