@@ -9,7 +9,7 @@ from .utils import check_parameters
 from .filtering import filter_length, filter_groups
 from .alignment import run_mafft, run_trimal
 from .tables import make_tables
-from .gsea import download_gmt, run_gsea
+from .gsea import run_gsea
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
@@ -35,15 +35,13 @@ def _build_arg_parser():
     parser.add_argument("project_config", help="Path to the project configuration file.")
     gmt_group = parser.add_mutually_exclusive_group(required=True)
     gmt_group.add_argument(
-        "--organism",
-        help="g:Profiler organism name (e.g. 'hsapiens', 'athaliana'). "
-             "Automatically downloads the corresponding GMT file. "
-             "See https://biit.cs.ut.ee/gprofiler for supported organisms."
-    )
-    gmt_group.add_argument(
         "--gene-sets",
-        help="Path to a local .gmt file. Use this for custom annotations "
-             "or organisms not supported by g:Profiler."
+        help=(
+            "Path to a local .gmt file. "
+            "Species-specific GMT files can be downloaded from the "
+            "g:Profiler GMT Helper at https://biit.cs.ut.ee/gmt-helper "
+            "(select your anchor species and download the ENSG-keyed GMT)."
+        )
     )
     parser.add_argument(
         "--permutations", type=int, default=1000,
@@ -146,16 +144,10 @@ def main():
 
     logger.info("Step 6: Running GSEA prerank")
     gsea_dir = os.path.join(outdir, "gsea")
-
-    if args.organism:
-        gmt_path = download_gmt(organism=args.organism, outdir=outdir)
-    else:
-        gmt_path = args.gene_sets
-
     run_gsea(
         anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
         gsea_dir=gsea_dir,
-        gene_sets=gmt_path,
+        gene_sets=args.gene_sets,
         permutations=args.permutations,
         min_size=args.min_size,
         max_size=args.max_size,
