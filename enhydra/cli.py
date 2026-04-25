@@ -35,13 +35,27 @@ def _build_arg_parser():
     parser.add_argument("project_config", help="Path to the project configuration file.")
     gmt_group = parser.add_mutually_exclusive_group(required=True)
     gmt_group.add_argument(
+        "--organism",
+        help=(
+            "g:Profiler organism name (e.g. 'hsapiens', 'athaliana', 'ecoli_k12'). "
+            "Runs an ordered enrichment query via the g:Profiler API — "
+            "no file downloads required. "
+            "See https://biit.cs.ut.ee/gprofiler for supported organisms."
+        )
+    )
+    gmt_group.add_argument(
         "--gene-sets",
         help=(
-            "Path to a local .gmt file. "
-            "Species-specific GMT files can be downloaded from the "
-            "g:Profiler GMT Helper at https://biit.cs.ut.ee/gmt-helper "
-            "(select your anchor species and download the ENSG-keyed GMT)."
+            "Path to a local .gmt file for GSEApy prerank. "
+            "Use for species not supported by g:Profiler or custom annotations."
         )
+    )
+    parser.add_argument(
+        "--sources",
+        nargs="+",
+        default=["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"],
+        help="g:Profiler data sources to query (default: GO:BP GO:MF GO:CC KEGG REAC). "
+             "Only used with --organism."
     )
     parser.add_argument(
         "--permutations", type=int, default=1000,
@@ -142,12 +156,14 @@ def main():
         anchor=parameters['anchor']
     )
 
-    logger.info("Step 6: Running GSEA prerank")
-    gsea_dir = os.path.join(outdir, "gsea")
+    logger.info("Step 6: Enrichment analysis")
+    results_dir = os.path.join(outdir, "enrichment")
     run_gsea(
         anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
-        gsea_dir=gsea_dir,
+        results_dir=results_dir,
         gene_sets=args.gene_sets,
+        organism=args.organism,
+        sources=args.sources,
         permutations=args.permutations,
         min_size=args.min_size,
         max_size=args.max_size,
