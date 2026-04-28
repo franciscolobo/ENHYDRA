@@ -1,0 +1,5 @@
+inputdir    = test_data/input
+outdir      = test_data/output
+min_species = 4
+anchor      = hsapiens
+max_process = 4

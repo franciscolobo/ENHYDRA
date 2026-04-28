@@ -1,0 +1,22 @@
+# test_project_config
+
+```
+inputdir    = test_data/input
+outdir      = test_data/output
+min_species = 4
+anchor      = hsapiens
+max_process = 4
+```
+
+# test_code_config
+
+```
+mafft  = /usr/local/bin/mafft    # adjust to your mafft path
+trimal = /usr/local/bin/trimal   # adjust to your trimal path
+```
+
+Find your paths with:
+```bash
+which mafft
+which trimal
+```

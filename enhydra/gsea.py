@@ -61,7 +61,7 @@ def build_gmt_from_gprofiler(
         organism=organism,
         query=gene_ids,
         sources=sources,
-        significant=False,      # return all terms, not just significant ones
+        user_threshold=1.0,     # return all terms regardless of significance
         no_evidences=False,     # include intersections column (gene members)
     )
 

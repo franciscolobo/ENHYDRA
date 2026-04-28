@@ -1,0 +1,2 @@
+mafft  = /opt/homebrew/bin/mafft    # adjust to your mafft path
+trimal = /opt/homebrew/bin/trimal   # adjust to your trimal path

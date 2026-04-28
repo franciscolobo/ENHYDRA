@@ -10,6 +10,7 @@ from .filtering import filter_length, filter_groups
 from .alignment import run_mafft, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
+from .orthofinder import preprocess_orthofinder
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
@@ -33,6 +34,14 @@ def _build_arg_parser():
     )
     parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "--orthofinder-dir",
+        help="Path to an OrthoFinder 3 output directory. When provided, "
+             "ENHYDRA will preprocess the Orthogroup_Sequences/ directory "
+             "into inputdir before running the pipeline. Overrides the "
+             "inputdir parameter in the project config."
+    )
     gmt_group = parser.add_mutually_exclusive_group(required=True)
     gmt_group.add_argument(
         "--organism",
@@ -113,6 +122,14 @@ def main():
 
     os.makedirs(length_stats_dir)
     os.makedirs(length_filter_dir)
+
+    # --- OrthoFinder preprocessing (optional) ---
+    if args.orthofinder_dir:
+        logger.info("OrthoFinder mode: preprocessing Orthogroup_Sequences/")
+        preprocess_orthofinder(
+            orthofinder_dir=args.orthofinder_dir,
+            inputdir=parameters['inputdir'],
+        )
 
     # --- Pipeline ---
     inputfiles = os.listdir(parameters['inputdir'])

@@ -1,0 +1,9 @@
+##Overall sequence length stats
+Total seqs: 2
+Average: 400
+Median: 400.0
+SD: 0.0
+##Sequence lengths (sorted from smallest to largest)
+#SequenceID	Length	PercentageDifFromAvg
+hsapiens|ENSG00000133703	400	1.0
+mmusculus|OG000005_MMU	400	1.0

@@ -1,0 +1,22 @@
+## MaxIdentity	0.7575
+#> MaxIdentity	Get the maximum identity value for any pair of sequences in the alignment
+
+## AverageIdentity	0.7358
+#> AverageIdentity	Average identity between all sequences
+
+## Identity sequences matrix
+hsapiens|ENSG00000139618  	1.0000    	0.7325    	0.7200    	0.7225    	0.7375    	
+mmusculus|OG000003_MMU    	0.7325    	1.0000    	0.7400    	0.7400    	0.7575    	
+drerio|OG000003_DRE       	0.7200    	0.7400    	1.0000    	0.7325    	0.7450    	
+ggallus|OG000003_GGA      	0.7225    	0.7400    	0.7325    	1.0000    	0.7300    	
+xtropicalis|OG000003_XTR  	0.7375    	0.7575    	0.7450    	0.7300    	1.0000    	
+
+## AverageMostSimilarIdentity	0.7475
+#> AverageMostSimilarIdentity	 Average identity between most similar pair-wise sequences
+
+## Identity for most similar pair-wise sequences matrix
+hsapiens|ENSG00000139618  	0.7375	xtropicalis|OG000003_XTR
+mmusculus|OG000003_MMU    	0.7575	xtropicalis|OG000003_XTR
+drerio|OG000003_DRE       	0.7450	xtropicalis|OG000003_XTR
+ggallus|OG000003_GGA      	0.7400	mmusculus|OG000003_MMU
+xtropicalis|OG000003_XTR  	0.7575	mmusculus|OG000003_MMU
