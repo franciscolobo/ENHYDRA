@@ -1,4 +1,5 @@
 import os
+import random
 import shutil
 import logging
 import statistics
@@ -7,6 +8,31 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 
 logger = logging.getLogger(__name__)
+
+PARALOG_MODES = ("all", "remove", "longest")
+
+
+def _resolve_paralogs_longest(records: list) -> list:
+    """Keep one sequence per species — the longest, with random tiebreaking.
+
+    Args:
+        records: List of SeqRecord objects.
+
+    Returns:
+        Filtered list with at most one record per species.
+    """
+    best: dict[str, object] = {}  # species_id → SeqRecord
+    for record in records:
+        species_id = record.id.split("|")[0]
+        current = best.get(species_id)
+        if current is None:
+            best[species_id] = record
+        else:
+            current_len = len(current.seq)
+            new_len = len(record.seq)
+            if new_len > current_len or (new_len == current_len and random.random() < 0.5):
+                best[species_id] = record
+    return list(best.values())
 
 
 def filter_length(input_path: str, length_stats_dir: str, length_filter_dir: str):
@@ -68,6 +94,9 @@ def filter_groups(length_filter_dir: str, group_filter_dir: str, anchor: str, mi
             for seq_record in SeqIO.parse(path_to_file, "fasta")
         ]
         uniq_ids = set(species_ids)
+        if len(species_ids) < 2:
+            logger.warning("Group %s has fewer than 2 sequences after length filtering. Group removed.", group_name)
+            continue
         if anchor not in uniq_ids:
             logger.warning("Group %s does not contain anchor species %s. Group removed.", group_name, anchor)
             continue

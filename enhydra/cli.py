@@ -34,13 +34,8 @@ def _build_arg_parser():
     )
     parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help="Resume a previously interrupted run. Skips steps whose output "
-             "directories already exist. The outdir must already exist."
-    )
+
+    input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--orthofinder-dir",
         help="Path to an OrthoFinder 3 output directory. When provided, "
@@ -48,6 +43,25 @@ def _build_arg_parser():
              "into inputdir before running the pipeline. Overrides the "
              "inputdir parameter in the project config."
     )
+
+    parser.add_argument(
+        "--paralogs",
+        choices=["all", "remove", "longest"],
+        default="all",
+        help=(
+            "How to handle paralogs (multiple sequences per species per group). "
+            "'all'     — keep all sequences, paralogs included (default). "
+            "'remove'  — discard any group that contains paralogs. "
+            "'longest' — keep only the longest sequence per species, "
+                        "breaking ties at random."
+        )
+    )
+        action="store_true",
+        default=False,
+        help="Resume a previously interrupted run. Skips steps whose output "
+             "directories already exist. The outdir must already exist."
+    )
+
     gmt_group = parser.add_mutually_exclusive_group(required=True)
     gmt_group.add_argument(
         "--organism",
@@ -128,9 +142,14 @@ def main():
     alignment_dir     = os.path.join(outdir, "alignment")
     ident_dir         = os.path.join(outdir, "ident_alignment")
     tables_dir        = os.path.join(outdir, "tables")
+    results_dir       = os.path.join(outdir, "enrichment")
 
-    os.makedirs(length_stats_dir)
-    os.makedirs(length_filter_dir)
+    def _should_skip(step_dir: str, step_name: str) -> bool:
+        """Return True if the step output already exists and --resume is set."""
+        if args.resume and os.path.isdir(step_dir):
+            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
+            return True
+        return False
 
     # --- OrthoFinder preprocessing (optional) ---
     if args.orthofinder_dir:
@@ -140,20 +159,13 @@ def main():
             inputdir=parameters['inputdir'],
         )
 
-    def _should_skip(step_dir: str, step_name: str) -> bool:
-        """Return True if the step output already exists and --resume is set."""
-        if args.resume and os.path.isdir(step_dir):
-            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
-            return True
-        return False
-
     # --- Pipeline ---
     inputfiles = os.listdir(parameters['inputdir'])
 
     logger.info("Step 1: Length filtering")
     if not _should_skip(length_filter_dir, "length filtering"):
-        os.makedirs(length_stats_dir)
-        os.makedirs(length_filter_dir)
+        os.makedirs(length_stats_dir, exist_ok=True)
+        os.makedirs(length_filter_dir, exist_ok=True)
         args_list = [
             (os.path.join(parameters['inputdir'], f), length_stats_dir, length_filter_dir)
             for f in inputfiles
@@ -167,7 +179,8 @@ def main():
             length_filter_dir=length_filter_dir,
             group_filter_dir=group_filter_dir,
             anchor=parameters['anchor'],
-            min_species=parameters['min_species']
+            min_species=parameters['min_species'],
+            paralog_mode=args.paralogs,
         )
 
     logger.info("Step 3: Alignment with MAFFT")
@@ -198,17 +211,16 @@ def main():
 
     logger.info("Step 6: Enrichment analysis")
     if not _should_skip(results_dir, "enrichment analysis"):
-    results_dir = os.path.join(outdir, "enrichment")
-    run_gsea(
-        anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
-        results_dir=results_dir,
-        gene_sets=args.gene_sets,
-        organism=args.organism,
-        sources=args.sources,
-        permutations=args.permutations,
-        min_size=args.min_size,
-        max_size=args.max_size,
-        seed=args.seed,
-    )
+        run_gsea(
+            anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+            results_dir=results_dir,
+            gene_sets=args.gene_sets,
+            organism=args.organism,
+            sources=args.sources,
+            permutations=args.permutations,
+            min_size=args.min_size,
+            max_size=args.max_size,
+            seed=args.seed,
+        )
 
     logger.info("Enhydra finished successfully.")
