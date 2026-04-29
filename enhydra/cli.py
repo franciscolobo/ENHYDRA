@@ -34,7 +34,13 @@ def _build_arg_parser():
     )
     parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
-    input_group = parser.add_mutually_exclusive_group()
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume a previously interrupted run. Skips steps whose output "
+             "directories already exist. The outdir must already exist."
+    )
     input_group.add_argument(
         "--orthofinder-dir",
         help="Path to an OrthoFinder 3 output directory. When provided, "
@@ -104,9 +110,12 @@ def main():
 
     # --- Set up output directory and logging ---
     outdir = parameters['outdir']
-    if os.path.isdir(outdir):
-        sys.exit("Output directory '%s' already exists, please change 'outdir'." % outdir)
-    os.makedirs(outdir)
+    if os.path.isdir(outdir) and not args.resume:
+        sys.exit(
+            "Output directory '%s' already exists. Use --resume to continue "
+            "a previous run, or change 'outdir' in your project config." % outdir
+        )
+    os.makedirs(outdir, exist_ok=True)
 
     _setup_logging(outdir)
     logger = logging.getLogger(__name__)
@@ -131,49 +140,64 @@ def main():
             inputdir=parameters['inputdir'],
         )
 
+    def _should_skip(step_dir: str, step_name: str) -> bool:
+        """Return True if the step output already exists and --resume is set."""
+        if args.resume and os.path.isdir(step_dir):
+            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
+            return True
+        return False
+
     # --- Pipeline ---
     inputfiles = os.listdir(parameters['inputdir'])
 
     logger.info("Step 1: Length filtering")
-    args_list = [
-        (os.path.join(parameters['inputdir'], f), length_stats_dir, length_filter_dir)
-        for f in inputfiles
-    ]
-    with multiprocessing.Pool(processes=parameters['max_process']) as pool:
-        pool.starmap(filter_length, args_list)
+    if not _should_skip(length_filter_dir, "length filtering"):
+        os.makedirs(length_stats_dir)
+        os.makedirs(length_filter_dir)
+        args_list = [
+            (os.path.join(parameters['inputdir'], f), length_stats_dir, length_filter_dir)
+            for f in inputfiles
+        ]
+        with multiprocessing.Pool(processes=parameters['max_process']) as pool:
+            pool.starmap(filter_length, args_list)
 
     logger.info("Step 2: Group filtering (anchor and min_species)")
-    filter_groups(
-        length_filter_dir=length_filter_dir,
-        group_filter_dir=group_filter_dir,
-        anchor=parameters['anchor'],
-        min_species=parameters['min_species']
-    )
+    if not _should_skip(group_filter_dir, "group filtering"):
+        filter_groups(
+            length_filter_dir=length_filter_dir,
+            group_filter_dir=group_filter_dir,
+            anchor=parameters['anchor'],
+            min_species=parameters['min_species']
+        )
 
     logger.info("Step 3: Alignment with MAFFT")
-    run_mafft(
-        group_filter_dir=group_filter_dir,
-        alignment_dir=alignment_dir,
-        mafft_path=parameters['mafft'],
-        threads=parameters['max_process']
-    )
+    if not _should_skip(alignment_dir, "alignment"):
+        run_mafft(
+            group_filter_dir=group_filter_dir,
+            alignment_dir=alignment_dir,
+            mafft_path=parameters['mafft'],
+            threads=parameters['max_process']
+        )
 
     logger.info("Step 4: Identity estimation with trimAl")
-    run_trimal(
-        alignment_dir=alignment_dir,
-        ident_dir=ident_dir,
-        trimal_path=parameters['trimal']
-    )
+    if not _should_skip(ident_dir, "identity estimation"):
+        run_trimal(
+            alignment_dir=alignment_dir,
+            ident_dir=ident_dir,
+            trimal_path=parameters['trimal']
+        )
 
     logger.info("Step 5: Generating tables")
-    make_tables(
-        alignment_dir=alignment_dir,
-        ident_dir=ident_dir,
-        tables_dir=tables_dir,
-        anchor=parameters['anchor']
-    )
+    if not _should_skip(tables_dir, "table generation"):
+        make_tables(
+            alignment_dir=alignment_dir,
+            ident_dir=ident_dir,
+            tables_dir=tables_dir,
+            anchor=parameters['anchor']
+        )
 
     logger.info("Step 6: Enrichment analysis")
+    if not _should_skip(results_dir, "enrichment analysis"):
     results_dir = os.path.join(outdir, "enrichment")
     run_gsea(
         anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
