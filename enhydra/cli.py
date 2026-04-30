@@ -4,7 +4,7 @@ import logging
 import argparse
 import multiprocessing
 
-from .io import read_config_file
+from .io import read_config_file, read_species_list
 from .utils import check_parameters
 from .filtering import filter_length, filter_groups
 from .alignment import run_mafft, run_trimal
@@ -69,7 +69,40 @@ def _build_arg_parser():
         )
     )
 
-    # --- Gene set source (mutually exclusive, one required) ---
+    # --- Two-list differential mode ---
+    diff_group = parser.add_argument_group("two-list differential mode")
+    diff_group.add_argument(
+        "--list1",
+        help="Path to a text file listing species IDs for list 1 "
+             "(one species ID per line, '#' lines ignored)."
+    )
+    diff_group.add_argument(
+        "--list2",
+        help="Path to a text file listing species IDs for list 2 "
+             "(one species ID per line, '#' lines ignored)."
+    )
+    diff_group.add_argument(
+        "--anchor1",
+        help="Anchor species ID for list 1. Used for group filtering and "
+             "table generation. Does not need to be present in list 2."
+    )
+    diff_group.add_argument(
+        "--anchor2",
+        help="Anchor species ID for list 2. Used for group filtering and "
+             "table generation. Does not need to be present in list 1."
+    )
+    diff_group.add_argument(
+        "--metric",
+        choices=["identity", "rank"],
+        default="identity",
+        help=(
+            "Metric used to compute the differential score between the two lists. "
+            "'identity' — difference in mean alignment identity (default). "
+            "'rank'     — difference in normalised rank position. "
+            "Both metrics produce signed scores: positive values indicate "
+            "higher conservation in list 1, negative in list 2."
+        )
+    )
     gmt_group = parser.add_mutually_exclusive_group(required=True)
     gmt_group.add_argument(
         "--organism",

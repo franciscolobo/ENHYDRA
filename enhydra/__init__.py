@@ -2,7 +2,7 @@ import logging
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
-from .io import read_config_file
+from .io import read_config_file, read_species_list
 from .utils import check_parameters
 from .filtering import filter_length, filter_groups
 from .alignment import run_mafft, run_trimal
