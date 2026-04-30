@@ -11,6 +11,7 @@ from .alignment import run_mafft, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
+from .differential import compute_differential
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
@@ -360,8 +361,42 @@ def main():
             **common_kwargs,
         )
 
-        # Differential ranking and GSEA wired in Commit 16
-        logger.info("Differential ranking will be implemented in the next commit.")
+        # --- Differential ranking ---
+        diff_dir = os.path.join(outdir, "differential")
+        results_dir = os.path.join(diff_dir, "enrichment")
+
+        def _should_skip_diff(step_dir, step_name):
+            if args.resume and os.path.isdir(step_dir):
+                logger.info("Skipping %s (output already exists).", step_name)
+                return True
+            return False
+
+        logger.info("--- Computing differential scores ---")
+        if not _should_skip_diff(diff_dir, "differential ranking"):
+            anchor2mean_path = compute_differential(
+                tables_dir1=tables_dir1,
+                tables_dir2=tables_dir2,
+                diff_dir=diff_dir,
+                metric=args.metric,
+            )
+        else:
+            anchor2mean_path = os.path.join(diff_dir, "anchor2mean.tsv")
+
+        logger.info("Step 6: Enrichment analysis (differential)")
+        if not _should_skip_diff(results_dir, "enrichment analysis"):
+            run_gsea(
+                anchor2mean_path=anchor2mean_path,
+                results_dir=results_dir,
+                gene_sets=args.gene_sets,
+                organism=args.organism,
+                sources=args.sources,
+                permutations=args.permutations,
+                min_size=args.min_size,
+                max_size=args.max_size,
+                seed=args.seed,
+            )
+
+        logger.info("Enhydra finished successfully.")
         return
 
     # --- GSEA (single-list mode) ---
