@@ -19,7 +19,7 @@ def run_mafft(group_filter_dir: str, alignment_dir: str, mafft_path: str, thread
         try:
             with open(output_seq, 'w') as outfile:
                 subprocess.run(
-                    [mafft_path, '--auto', '--quiet', '--thread', str(threads), input_seq],
+                    [mafft_path, '--auto', '--quiet', '--anysymbol', '--thread', str(threads), input_seq],
                     stdout=outfile,
                     stderr=subprocess.PIPE,
                     check=True

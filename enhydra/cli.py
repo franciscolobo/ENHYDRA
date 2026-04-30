@@ -32,43 +32,50 @@ def _build_arg_parser():
         prog="enhydra",
         description="Gene Set Enrichment Analysis for evolutionary genomics."
     )
+
+    # --- Positional arguments ---
     parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
 
+    # --- Input mode ---
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--orthofinder-dir",
         help="Path to an OrthoFinder 3 output directory. When provided, "
              "ENHYDRA will preprocess the Orthogroup_Sequences/ directory "
-             "into inputdir before running the pipeline. Overrides the "
-             "inputdir parameter in the project config."
+             "into inputdir before running the pipeline."
     )
 
+    # --- Run control ---
     parser.add_argument(
-        "--paralogs",
-        choices=["all", "remove", "longest"],
-        default="all",
-        help=(
-            "How to handle paralogs (multiple sequences per species per group). "
-            "'all'     — keep all sequences, paralogs included (default). "
-            "'remove'  — discard any group that contains paralogs. "
-            "'longest' — keep only the longest sequence per species, "
-                        "breaking ties at random."
-        )
-    )
+        "--resume",
         action="store_true",
         default=False,
         help="Resume a previously interrupted run. Skips steps whose output "
              "directories already exist. The outdir must already exist."
     )
 
+    # --- Paralog handling ---
+    parser.add_argument(
+        "--paralogs",
+        choices=["all", "remove", "longest"],
+        default="all",
+        help=(
+            "How to handle paralogs (multiple sequences per species per group). "
+            "'all' keeps all sequences (default). "
+            "'remove' discards any group that contains paralogs. "
+            "'longest' keeps only the longest sequence per species, "
+            "breaking ties at random."
+        )
+    )
+
+    # --- Gene set source (mutually exclusive, one required) ---
     gmt_group = parser.add_mutually_exclusive_group(required=True)
     gmt_group.add_argument(
         "--organism",
         help=(
-            "g:Profiler organism name (e.g. 'hsapiens', 'athaliana', 'ecoli_k12'). "
-            "Runs an ordered enrichment query via the g:Profiler API — "
-            "no file downloads required. "
+            "g:Profiler organism name (e.g. 'hsapiens', 'athaliana'). "
+            "Fetches annotations via the g:Profiler API. "
             "See https://biit.cs.ut.ee/gprofiler for supported organisms."
         )
     )
@@ -79,13 +86,17 @@ def _build_arg_parser():
             "Use for species not supported by g:Profiler or custom annotations."
         )
     )
+
+    # --- g:Profiler options ---
     parser.add_argument(
         "--sources",
         nargs="+",
         default=["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"],
-        help="g:Profiler data sources to query (default: GO:BP GO:MF GO:CC KEGG REAC). "
-             "Only used with --organism."
+        help="g:Profiler data sources to query. Only used with --organism. "
+             "Default: GO:BP GO:MF GO:CC KEGG REAC."
     )
+
+    # --- GSEA options ---
     parser.add_argument(
         "--permutations", type=int, default=1000,
         help="Number of GSEA permutations (default: 1000)."
@@ -102,6 +113,7 @@ def _build_arg_parser():
         "--seed", type=int, default=42,
         help="Random seed for reproducibility (default: 42)."
     )
+
     return parser
 
 
@@ -145,9 +157,10 @@ def main():
     results_dir       = os.path.join(outdir, "enrichment")
 
     def _should_skip(step_dir: str, step_name: str) -> bool:
-        """Return True if the step output already exists and --resume is set."""
         if args.resume and os.path.isdir(step_dir):
-            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
+            logger.info(
+                "Skipping %s (output already exists: %s)", step_name, step_dir
+            )
             return True
         return False
 

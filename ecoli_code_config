@@ -1,0 +1,2 @@
+mafft  = /opt/homebrew/Caskroom/miniforge/base/bin/mafft
+trimal = /opt/homebrew/bin/trimal

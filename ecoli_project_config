@@ -1,0 +1,5 @@
+inputdir    = test_data/ecoli_orthogroups/non_pathogenic/
+outdir      = test_data/ecoli_output_non_patho/
+min_species = 5        # at least 50% of the 80 strains
+anchor      = NZ_CP016546
+max_process = 8         # adjust to the number of cores available
