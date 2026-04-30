@@ -82,19 +82,24 @@ def filter_groups(
     anchor: str,
     min_species: int,
     paralog_mode: str = "all",
+    require_anchor: bool = True,
 ):
     """Filter groups lacking the anchor species or below the minimum species count.
 
     Args:
         length_filter_dir: Directory of length-filtered FASTA files.
         group_filter_dir:  Directory where passing groups are written.
-        anchor:            Species ID that must be present in each group.
+        anchor:            Species ID used for annotation mapping.
         min_species:       Minimum number of distinct species required.
         paralog_mode:      How to handle paralogs (multiple sequences per species):
                            'all'     — keep all sequences (default).
                            'remove'  — discard any group containing paralogs.
                            'longest' — keep only the longest sequence per species,
                                        breaking ties at random.
+        require_anchor:    If True (default, single-list mode), discard groups
+                           that do not contain the anchor species. If False
+                           (two-list differential mode), anchor presence is not
+                           required — groups are matched across lists by OG ID.
     """
     if paralog_mode not in PARALOG_MODES:
         raise ValueError(
@@ -117,7 +122,7 @@ def filter_groups(
         species_ids = [r.id.split("|")[0] for r in records]
         uniq_ids = set(species_ids)
 
-        if anchor not in uniq_ids:
+        if require_anchor and anchor not in uniq_ids:
             logger.warning(
                 "Group %s does not contain anchor species %s. Group removed.",
                 group_name, anchor
