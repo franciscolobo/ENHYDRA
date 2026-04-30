@@ -1,0 +1,5 @@
+inputdir    = test_data/ecoli_orthogroups/all  # full orthogroup set — subsetting done internally
+outdir      = test_data/ecoli_diff_output
+min_species = 20        # applied independently to each list (~50% of ~40 strains per group)
+anchor      = NC_004431 # used by both lists for OG → gene ID mapping and GMT annotation
+max_process = 8

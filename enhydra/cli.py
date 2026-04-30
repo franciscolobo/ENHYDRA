@@ -191,14 +191,6 @@ def _build_arg_parser():
              "(one species ID per line, '#' lines ignored)."
     )
     diff_group.add_argument(
-        "--anchor1",
-        help="Anchor species ID for list 1. Used for table generation."
-    )
-    diff_group.add_argument(
-        "--anchor2",
-        help="Anchor species ID for list 2. Used for table generation."
-    )
-    diff_group.add_argument(
         "--metric",
         choices=["identity", "rank"],
         default="identity",
@@ -265,11 +257,11 @@ def main():
     # --- Validate two-list arguments ---
     two_list_mode = args.list1 is not None or args.list2 is not None
     if two_list_mode:
-        missing = [f for f in ["--list1", "--list2", "--anchor1", "--anchor2"]
+        missing = [f for f in ["--list1", "--list2"]
                    if getattr(args, f.lstrip("-").replace("-", "_")) is None]
         if missing:
             parser.error(
-                "Two-list mode requires all of: --list1 --list2 --anchor1 --anchor2. "
+                "Two-list mode requires both --list1 and --list2. "
                 "Missing: %s" % ", ".join(missing)
             )
 
@@ -336,17 +328,14 @@ def main():
 
         species1 = read_species_list(args.list1)
         species2 = read_species_list(args.list2)
-        logger.info(
-            "List 1: %d species (anchor: %s)", len(species1), args.anchor1
-        )
-        logger.info(
-            "List 2: %d species (anchor: %s)", len(species2), args.anchor2
-        )
+        logger.info("List 1: %d species", len(species1))
+        logger.info("List 2: %d species", len(species2))
+        logger.info("Anchor: %s", parameters['anchor'])
 
         logger.info("--- Processing list 1 ---")
         tables_dir1 = _run_single_list(
             listdir=os.path.join(outdir, "list1"),
-            anchor=args.anchor1,
+            anchor=parameters['anchor'],
             require_anchor=False,
             species=species1,
             **common_kwargs,
@@ -355,7 +344,7 @@ def main():
         logger.info("--- Processing list 2 ---")
         tables_dir2 = _run_single_list(
             listdir=os.path.join(outdir, "list2"),
-            anchor=args.anchor2,
+            anchor=parameters['anchor'],
             require_anchor=False,
             species=species2,
             **common_kwargs,
