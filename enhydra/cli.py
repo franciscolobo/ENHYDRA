@@ -6,7 +6,7 @@ import multiprocessing
 
 from .io import read_config_file, read_species_list
 from .utils import check_parameters
-from .filtering import filter_length, filter_groups
+from .filtering import filter_length, filter_groups, subset_groups
 from .alignment import run_mafft, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
@@ -25,6 +25,114 @@ def _setup_logging(outdir: str):
             logging.StreamHandler(sys.stdout),
         ]
     )
+
+
+def _run_single_list(
+    inputdir: str,
+    listdir: str,
+    anchor: str,
+    min_species: int,
+    mafft_path: str,
+    trimal_path: str,
+    max_process: int,
+    paralog_mode: str,
+    require_anchor: bool,
+    resume: bool,
+    species: list[str] | None = None,
+):
+    """Run steps 1–5 (filter, align, identity, tables) for one species list.
+
+    Args:
+        inputdir:       Directory of input FASTA files (one per orthogroup).
+        listdir:        Output subdirectory for this list's intermediate files.
+        anchor:         Anchor species ID for table generation.
+        min_species:    Minimum species count for group retention.
+        mafft_path:     Path to MAFFT executable.
+        trimal_path:    Path to trimAl executable.
+        max_process:    Number of parallel processes.
+        paralog_mode:   Paralog handling strategy ('all', 'remove', 'longest').
+        require_anchor: Whether anchor presence is required in each group.
+        resume:         Skip steps whose output directories already exist.
+        species:        If provided, subset input groups to these species first.
+                        Used in two-list differential mode.
+    """
+    logger = logging.getLogger(__name__)
+
+    def _should_skip(step_dir: str, step_name: str) -> bool:
+        if resume and os.path.isdir(step_dir):
+            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
+            return True
+        return False
+
+    subset_dir       = os.path.join(listdir, "subset")
+    length_stats_dir = os.path.join(listdir, "length_stats")
+    length_filter_dir= os.path.join(listdir, "length_filter")
+    group_filter_dir = os.path.join(listdir, "group_filter")
+    alignment_dir    = os.path.join(listdir, "alignment")
+    ident_dir        = os.path.join(listdir, "ident_alignment")
+    tables_dir       = os.path.join(listdir, "tables")
+
+    os.makedirs(listdir, exist_ok=True)
+
+    # Step 0 (two-list mode only): subset groups to species list
+    if species is not None:
+        if not _should_skip(subset_dir, "subsetting"):
+            subset_groups(inputdir, subset_dir, species)
+        source_dir = subset_dir
+    else:
+        source_dir = inputdir
+
+    inputfiles = os.listdir(source_dir)
+
+    logger.info("Step 1: Length filtering")
+    if not _should_skip(length_filter_dir, "length filtering"):
+        os.makedirs(length_stats_dir, exist_ok=True)
+        os.makedirs(length_filter_dir, exist_ok=True)
+        args_list = [
+            (os.path.join(source_dir, f), length_stats_dir, length_filter_dir)
+            for f in inputfiles
+        ]
+        with multiprocessing.Pool(processes=max_process) as pool:
+            pool.starmap(filter_length, args_list)
+
+    logger.info("Step 2: Group filtering")
+    if not _should_skip(group_filter_dir, "group filtering"):
+        filter_groups(
+            length_filter_dir=length_filter_dir,
+            group_filter_dir=group_filter_dir,
+            anchor=anchor,
+            min_species=min_species,
+            paralog_mode=paralog_mode,
+            require_anchor=require_anchor,
+        )
+
+    logger.info("Step 3: Alignment with MAFFT")
+    if not _should_skip(alignment_dir, "alignment"):
+        run_mafft(
+            group_filter_dir=group_filter_dir,
+            alignment_dir=alignment_dir,
+            mafft_path=mafft_path,
+            threads=max_process,
+        )
+
+    logger.info("Step 4: Identity estimation with trimAl")
+    if not _should_skip(ident_dir, "identity estimation"):
+        run_trimal(
+            alignment_dir=alignment_dir,
+            ident_dir=ident_dir,
+            trimal_path=trimal_path,
+        )
+
+    logger.info("Step 5: Generating tables")
+    if not _should_skip(tables_dir, "table generation"):
+        make_tables(
+            alignment_dir=alignment_dir,
+            ident_dir=ident_dir,
+            tables_dir=tables_dir,
+            anchor=anchor,
+        )
+
+    return tables_dir
 
 
 def _build_arg_parser():
@@ -83,26 +191,25 @@ def _build_arg_parser():
     )
     diff_group.add_argument(
         "--anchor1",
-        help="Anchor species ID for list 1. Used for group filtering and "
-             "table generation. Does not need to be present in list 2."
+        help="Anchor species ID for list 1. Used for table generation."
     )
     diff_group.add_argument(
         "--anchor2",
-        help="Anchor species ID for list 2. Used for group filtering and "
-             "table generation. Does not need to be present in list 1."
+        help="Anchor species ID for list 2. Used for table generation."
     )
     diff_group.add_argument(
         "--metric",
         choices=["identity", "rank"],
         default="identity",
         help=(
-            "Metric used to compute the differential score between the two lists. "
-            "'identity' — difference in mean alignment identity (default). "
-            "'rank'     — difference in normalised rank position. "
-            "Both metrics produce signed scores: positive values indicate "
-            "higher conservation in list 1, negative in list 2."
+            "Metric for the differential score. "
+            "'identity' — mean identity difference (default). "
+            "'rank'     — normalised rank difference. "
+            "Positive scores indicate higher conservation in list 1."
         )
     )
+
+    # --- Gene set source (mutually exclusive, one required) ---
     gmt_group = parser.add_mutually_exclusive_group(required=True)
     gmt_group.add_argument(
         "--organism",
@@ -154,6 +261,17 @@ def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
 
+    # --- Validate two-list arguments ---
+    two_list_mode = args.list1 is not None or args.list2 is not None
+    if two_list_mode:
+        missing = [f for f in ["--list1", "--list2", "--anchor1", "--anchor2"]
+                   if getattr(args, f.lstrip("-").replace("-", "_")) is None]
+        if missing:
+            parser.error(
+                "Two-list mode requires all of: --list1 --list2 --anchor1 --anchor2. "
+                "Missing: %s" % ", ".join(missing)
+            )
+
     # --- Read and validate config ---
     try:
         with open(args.project_config, "r") as fh_project, \
@@ -180,23 +298,6 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info("Welcome to Enhydra")
 
-    # --- Define subdirectories ---
-    length_stats_dir  = os.path.join(outdir, "length_stats")
-    length_filter_dir = os.path.join(outdir, "length_filter")
-    group_filter_dir  = os.path.join(outdir, "group_filter")
-    alignment_dir     = os.path.join(outdir, "alignment")
-    ident_dir         = os.path.join(outdir, "ident_alignment")
-    tables_dir        = os.path.join(outdir, "tables")
-    results_dir       = os.path.join(outdir, "enrichment")
-
-    def _should_skip(step_dir: str, step_name: str) -> bool:
-        if args.resume and os.path.isdir(step_dir):
-            logger.info(
-                "Skipping %s (output already exists: %s)", step_name, step_dir
-            )
-            return True
-        return False
-
     # --- OrthoFinder preprocessing (optional) ---
     if args.orthofinder_dir:
         logger.info("OrthoFinder mode: preprocessing Orthogroup_Sequences/")
@@ -205,60 +306,76 @@ def main():
             inputdir=parameters['inputdir'],
         )
 
-    # --- Pipeline ---
-    inputfiles = os.listdir(parameters['inputdir'])
+    # --- Common kwargs for _run_single_list ---
+    common_kwargs = dict(
+        inputdir=parameters['inputdir'],
+        min_species=parameters['min_species'],
+        mafft_path=parameters['mafft'],
+        trimal_path=parameters['trimal'],
+        max_process=parameters['max_process'],
+        paralog_mode=args.paralogs,
+        resume=args.resume,
+    )
 
-    logger.info("Step 1: Length filtering")
-    if not _should_skip(length_filter_dir, "length filtering"):
-        os.makedirs(length_stats_dir, exist_ok=True)
-        os.makedirs(length_filter_dir, exist_ok=True)
-        args_list = [
-            (os.path.join(parameters['inputdir'], f), length_stats_dir, length_filter_dir)
-            for f in inputfiles
-        ]
-        with multiprocessing.Pool(processes=parameters['max_process']) as pool:
-            pool.starmap(filter_length, args_list)
-
-    logger.info("Step 2: Group filtering (anchor and min_species)")
-    if not _should_skip(group_filter_dir, "group filtering"):
-        filter_groups(
-            length_filter_dir=length_filter_dir,
-            group_filter_dir=group_filter_dir,
+    # --- Single-list mode ---
+    if not two_list_mode:
+        logger.info("Running in single-list mode.")
+        tables_dir = _run_single_list(
+            listdir=os.path.join(outdir),
             anchor=parameters['anchor'],
-            min_species=parameters['min_species'],
-            paralog_mode=args.paralogs,
+            require_anchor=True,
+            species=None,
+            **common_kwargs,
+        )
+        results_dir = os.path.join(outdir, "enrichment")
+
+    # --- Two-list differential mode ---
+    else:
+        logger.info("Running in two-list differential mode.")
+
+        species1 = read_species_list(args.list1)
+        species2 = read_species_list(args.list2)
+        logger.info(
+            "List 1: %d species (anchor: %s)", len(species1), args.anchor1
+        )
+        logger.info(
+            "List 2: %d species (anchor: %s)", len(species2), args.anchor2
         )
 
-    logger.info("Step 3: Alignment with MAFFT")
-    if not _should_skip(alignment_dir, "alignment"):
-        run_mafft(
-            group_filter_dir=group_filter_dir,
-            alignment_dir=alignment_dir,
-            mafft_path=parameters['mafft'],
-            threads=parameters['max_process']
+        logger.info("--- Processing list 1 ---")
+        tables_dir1 = _run_single_list(
+            listdir=os.path.join(outdir, "list1"),
+            anchor=args.anchor1,
+            require_anchor=False,
+            species=species1,
+            **common_kwargs,
         )
 
-    logger.info("Step 4: Identity estimation with trimAl")
-    if not _should_skip(ident_dir, "identity estimation"):
-        run_trimal(
-            alignment_dir=alignment_dir,
-            ident_dir=ident_dir,
-            trimal_path=parameters['trimal']
+        logger.info("--- Processing list 2 ---")
+        tables_dir2 = _run_single_list(
+            listdir=os.path.join(outdir, "list2"),
+            anchor=args.anchor2,
+            require_anchor=False,
+            species=species2,
+            **common_kwargs,
         )
 
-    logger.info("Step 5: Generating tables")
-    if not _should_skip(tables_dir, "table generation"):
-        make_tables(
-            alignment_dir=alignment_dir,
-            ident_dir=ident_dir,
-            tables_dir=tables_dir,
-            anchor=parameters['anchor']
-        )
+        # Differential ranking and GSEA wired in Commit 16
+        logger.info("Differential ranking will be implemented in the next commit.")
+        return
+
+    # --- GSEA (single-list mode) ---
+    def _should_skip_gsea():
+        if args.resume and os.path.isdir(results_dir):
+            logger.info("Skipping enrichment analysis (output already exists).")
+            return True
+        return False
 
     logger.info("Step 6: Enrichment analysis")
-    if not _should_skip(results_dir, "enrichment analysis"):
+    if not _should_skip_gsea():
         run_gsea(
-            anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+            anchor2mean_path=os.path.join(tables_dir, "tables", "anchor2mean.tsv")
+            if two_list_mode else os.path.join(tables_dir, "anchor2mean.tsv"),
             results_dir=results_dir,
             gene_sets=args.gene_sets,
             organism=args.organism,

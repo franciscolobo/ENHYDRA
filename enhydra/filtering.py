@@ -12,7 +12,43 @@ logger = logging.getLogger(__name__)
 PARALOG_MODES = ("all", "remove", "longest")
 
 
-def filter_length(input_path: str, length_stats_dir: str, length_filter_dir: str):
+def subset_groups(inputdir: str, subset_dir: str, species: list[str]):
+    """Subset orthogroup FASTAs to sequences from a given species list.
+
+    Reads each FASTA in inputdir and writes a new FASTA containing only
+    sequences whose speciesID (the part before '|') is in the species list.
+    Groups with no matching sequences are skipped.
+
+    Args:
+        inputdir:   Directory of input FASTA files (one per orthogroup).
+        subset_dir: Directory where subsetted FASTAs are written.
+        species:    List of species IDs to retain.
+    """
+    species_set = set(species)
+    os.makedirs(subset_dir, exist_ok=True)
+    n_written = 0
+    n_empty = 0
+    for filename in os.listdir(inputdir):
+        in_path = os.path.join(inputdir, filename)
+        out_path = os.path.join(subset_dir, filename)
+        records = [
+            r for r in SeqIO.parse(in_path, "fasta")
+            if r.id.split("|")[0] in species_set
+        ]
+        if not records:
+            n_empty += 1
+            continue
+        with open(out_path, "w") as fh:
+            for r in records:
+                fh.write(">%s\n%s\n" % (r.id, r.seq))
+        n_written += 1
+    logger.info(
+        "Subset complete: %d groups written, %d groups had no matching species.",
+        n_written, n_empty
+    )
+
+
+input_path: str, length_stats_dir: str, length_filter_dir: str):
     """Filter sequences in a single FASTA file by length (mean ± 2SD).
 
     Args:
