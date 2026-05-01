@@ -12,6 +12,7 @@ from .tables import make_tables
 from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
 from .differential import compute_differential
+from .plotting import make_single_list_plots, make_differential_plots
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
@@ -192,13 +193,20 @@ def _build_arg_parser():
     )
     diff_group.add_argument(
         "--metric",
-        choices=["identity", "rank"],
-        default="identity",
+        choices=["zscore", "identity", "rank"],
+        default="zscore",
         help=(
-            "Metric for the differential score. "
-            "'identity' — mean identity difference (default). "
-            "'rank'     — normalised rank difference. "
-            "Positive scores indicate higher conservation in list 1."
+            "Metric for the differential score between the two lists. "
+            "'zscore'   — z-score normalised identity difference (default). "
+            "            Removes the effect of overall divergence level, "
+            "            recommended when the two groups have different "
+            "            evolutionary depths. "
+            "'identity' — raw mean identity difference (identity_1 - identity_2). "
+            "            Only appropriate when both groups are evolutionarily "
+            "            comparable. "
+            "'rank'     — normalised rank difference (rank_1/N - rank_2/N). "
+            "            Most robust to non-normality in identity distributions. "
+            "Positive scores indicate higher relative conservation in list 1."
         )
     )
 
@@ -361,15 +369,14 @@ def main():
             return False
 
         logger.info("--- Computing differential scores ---")
+        anchor2mean_path = os.path.join(diff_dir, "anchor2mean.tsv")
         if not _should_skip_diff(diff_dir, "differential ranking"):
-            anchor2mean_path = compute_differential(
+            compute_differential(
                 tables_dir1=tables_dir1,
                 tables_dir2=tables_dir2,
                 diff_dir=diff_dir,
                 metric=args.metric,
             )
-        else:
-            anchor2mean_path = os.path.join(diff_dir, "anchor2mean.tsv")
 
         logger.info("Step 6: Enrichment analysis (differential)")
         if not _should_skip_diff(results_dir, "enrichment analysis"):
@@ -384,6 +391,15 @@ def main():
                 max_size=args.max_size,
                 seed=args.seed,
             )
+
+        logger.info("Generating differential plots")
+        make_differential_plots(
+            tables_dir1=tables_dir1,
+            tables_dir2=tables_dir2,
+            diff_dir=diff_dir,
+            plots_dir=os.path.join(diff_dir, "plots"),
+            metric=args.metric,
+        )
 
         logger.info("Enhydra finished successfully.")
         return
@@ -409,5 +425,12 @@ def main():
             max_size=args.max_size,
             seed=args.seed,
         )
+
+    logger.info("Generating plots")
+    make_single_list_plots(
+        anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+        results_dir=results_dir,
+        plots_dir=os.path.join(outdir, "plots"),
+    )
 
     logger.info("Enhydra finished successfully.")
