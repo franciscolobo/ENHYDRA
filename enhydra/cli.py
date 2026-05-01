@@ -428,7 +428,7 @@ def main():
 
     logger.info("Generating plots")
     make_single_list_plots(
-        anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+        anchor2mean_path=os.path.join(outdir, "tables", "anchor2mean.tsv"),
         results_dir=results_dir,
         plots_dir=os.path.join(outdir, "plots"),
     )

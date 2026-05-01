@@ -36,6 +36,14 @@ def _load_anchor2mean(anchor2mean_path: str) -> pd.DataFrame:
     )
 
 
+def _load_group2mean(tables_dir: str) -> pd.Series:
+    """Load group2mean.tsv as a Series indexed by group ID."""
+    path = os.path.join(tables_dir, "group2mean.tsv")
+    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "score"])
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    return df.dropna().set_index("group_id")["score"]
+
+
 def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
     """Load GSEApy prerank results CSV."""
     path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
@@ -60,11 +68,15 @@ def plot_identity_distribution(
         label:            X-axis label (adjust for differential mode).
     """
     df = _load_anchor2mean(anchor2mean_path)
-    df["score"] = pd.to_numeric(df["score"], errors="coerce").dropna()
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df = df.dropna(subset=["score"])
 
     with plt.style.context(FIGURE_STYLE):
         fig, ax = plt.subplots(figsize=(7, 4))
-        ax.hist(df["score"], bins=50, color=PALETTE["neutral"], edgecolor="white", linewidth=0.5)
+        ax.hist(
+            df["score"], bins=50,
+            color=PALETTE["neutral"], edgecolor="white", linewidth=0.5
+        )
         ax.set_xlabel(label, fontsize=12)
         ax.set_ylabel("Number of orthogroups", fontsize=12)
         ax.set_title("Distribution of %s" % label.lower(), fontsize=13)
@@ -118,8 +130,6 @@ def plot_gsea_barplot(
         ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
         ax.set_xlabel("Normalised Enrichment Score (NES)", fontsize=12)
         ax.set_title(title, fontsize=13)
-
-        # Annotate FDR
         for bar, (_, row) in zip(bars, plot_df.iterrows()):
             x = row["NES"] + (0.02 if row["NES"] > 0 else -0.02)
             ha = "left" if row["NES"] > 0 else "right"
@@ -136,42 +146,49 @@ def plot_gsea_barplot(
 # --- Two-list plots ---
 
 def plot_identity_scatter(
-    anchor2mean_path1: str,
-    anchor2mean_path2: str,
+    tables_dir1: str,
+    tables_dir2: str,
     diff_scores_path: str,
     plots_dir: str,
-    label1: str = "List 1 identity",
-    label2: str = "List 2 identity",
+    label1: str = "List 1 mean identity",
+    label2: str = "List 2 mean identity",
 ):
     """Scatter plot of list 1 vs list 2 identity for common groups.
 
     Points are coloured by differential score — blue for genes more conserved
-    in list 1, red for genes more conserved in list 2, grey near zero.
+    in list 1, red for genes more conserved in list 2.
 
     Args:
-        anchor2mean_path1: Path to list 1's anchor2mean.tsv.
-        anchor2mean_path2: Path to list 2's anchor2mean.tsv.
-        diff_scores_path:  Path to differential_scores.tsv.
-        plots_dir:         Output directory for plots.
-        label1:            X-axis label.
-        label2:            Y-axis label.
+        tables_dir1:      Path to list 1's tables/ directory.
+        tables_dir2:      Path to list 2's tables/ directory.
+        diff_scores_path: Path to differential_scores.tsv.
+        plots_dir:        Output directory for plots.
+        label1:           X-axis label.
+        label2:           Y-axis label.
     """
-    df1 = _load_anchor2mean(anchor2mean_path1).set_index("gene_id")["score"]
-    df2 = _load_anchor2mean(anchor2mean_path2).set_index("gene_id")["score"]
+    s1 = _load_group2mean(tables_dir1)
+    s2 = _load_group2mean(tables_dir2)
+    diff = pd.read_csv(diff_scores_path, sep="\t").set_index("group_id")["score"]
 
-    diff = pd.read_csv(diff_scores_path, sep="\t")
-    diff = diff.set_index("group_id")["score"]
-
-    common = df1.index.intersection(df2.index)
-    x = pd.to_numeric(df1.loc[common], errors="coerce")
-    y = pd.to_numeric(df2.loc[common], errors="coerce")
+    common = s1.index.intersection(s2.index)
+    x = s1.loc[common]
+    y = s2.loc[common]
     c = diff.reindex(common).fillna(0)
+
+    mask = x.notna() & y.notna()
+    x, y, c = x[mask], y[mask], c[mask]
+
+    if x.empty:
+        logger.warning("No common groups with valid identity scores for scatter plot.")
+        return
 
     with plt.style.context(FIGURE_STYLE):
         fig, ax = plt.subplots(figsize=(6, 6))
-        sc = ax.scatter(x, y, c=c, cmap="RdBu", alpha=0.5, s=8,
-                        vmin=-c.abs().quantile(0.95),
-                        vmax=c.abs().quantile(0.95))
+        vmax = c.abs().quantile(0.95)
+        sc = ax.scatter(
+            x, y, c=c, cmap="RdBu", alpha=0.5, s=8,
+            vmin=-vmax, vmax=vmax
+        )
         lims = [min(x.min(), y.min()) - 0.02, max(x.max(), y.max()) + 0.02]
         ax.plot(lims, lims, "k--", linewidth=0.8, alpha=0.5)
         ax.set_xlim(lims)
@@ -259,25 +276,23 @@ def make_differential_plots(
     """Generate all plots for two-list differential mode.
 
     Args:
-        tables_dir1:  Path to list 1's tables/ directory.
-        tables_dir2:  Path to list 2's tables/ directory.
-        diff_dir:     Path to the differential/ output directory.
-        plots_dir:    Output directory for plots.
-        metric:       Differential metric used ('zscore', 'identity', 'rank').
+        tables_dir1: Path to list 1's tables/ directory.
+        tables_dir2: Path to list 2's tables/ directory.
+        diff_dir:    Path to the differential/ output directory.
+        plots_dir:   Output directory for plots.
+        metric:      Differential metric used ('zscore', 'identity', 'rank').
     """
     os.makedirs(plots_dir, exist_ok=True)
 
-    anchor2mean1 = os.path.join(tables_dir1, "anchor2mean.tsv")
-    anchor2mean2 = os.path.join(tables_dir2, "anchor2mean.tsv")
-    diff_scores  = os.path.join(diff_dir, "differential_scores.tsv")
-    results_dir  = os.path.join(diff_dir, "enrichment")
+    diff_scores = os.path.join(diff_dir, "differential_scores.tsv")
+    results_dir = os.path.join(diff_dir, "enrichment")
 
     plot_identity_distribution(
         os.path.join(diff_dir, "anchor2mean.tsv"),
         plots_dir,
         label="Differential conservation score",
     )
-    plot_identity_scatter(anchor2mean1, anchor2mean2, diff_scores, plots_dir)
+    plot_identity_scatter(tables_dir1, tables_dir2, diff_scores, plots_dir)
     plot_differential_distribution(diff_scores, plots_dir, metric=metric)
     plot_gsea_barplot(
         results_dir, plots_dir,
