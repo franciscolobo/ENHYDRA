@@ -13,6 +13,7 @@ from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
 from .differential import compute_differential
 from .plotting import make_single_list_plots, make_differential_plots
+from .report import build_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
@@ -154,6 +155,14 @@ def _build_arg_parser():
         help="Path to an OrthoFinder 3 output directory. When provided, "
              "ENHYDRA will preprocess the Orthogroup_Sequences/ directory "
              "into inputdir before running the pipeline."
+    )
+
+    parser.add_argument(
+        "--obo-cache",
+        default=None,
+        help="Path to the directory containing the cached go-basic.obo file. "
+             "Used to add GO term names to the HTML report. "
+             "Same directory as used in build_gmt_interproscan.py."
     )
 
     # --- Run control ---
@@ -401,6 +410,18 @@ def main():
             metric=args.metric,
         )
 
+        logger.info("Building HTML report")
+        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
+            if args.obo_cache else None
+        build_report(
+            results_dir=results_dir,
+            plots_dir=os.path.join(diff_dir, "plots"),
+            report_path=os.path.join(diff_dir, "report.html"),
+            obo_path=obo_path,
+            mode="differential",
+            metric=args.metric,
+        )
+
         logger.info("Enhydra finished successfully.")
         return
 
@@ -431,6 +452,17 @@ def main():
         anchor2mean_path=os.path.join(outdir, "tables", "anchor2mean.tsv"),
         results_dir=results_dir,
         plots_dir=os.path.join(outdir, "plots"),
+    )
+
+    logger.info("Building HTML report")
+    obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
+        if args.obo_cache else None
+    build_report(
+        results_dir=results_dir,
+        plots_dir=os.path.join(outdir, "plots"),
+        report_path=os.path.join(outdir, "report.html"),
+        obo_path=obo_path,
+        mode="single",
     )
 
     logger.info("Enhydra finished successfully.")

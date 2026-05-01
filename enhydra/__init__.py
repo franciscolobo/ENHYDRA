@@ -11,4 +11,5 @@ from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
 from .differential import compute_differential
 from .plotting import make_single_list_plots, make_differential_plots
+from .report import build_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
