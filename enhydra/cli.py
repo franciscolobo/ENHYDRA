@@ -11,7 +11,7 @@ from .alignment import run_mafft, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
-from .differential import compute_differential
+from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
@@ -433,10 +433,27 @@ def main():
         return False
 
     logger.info("Step 6: Enrichment analysis")
+    raw_anchor2mean = os.path.join(outdir, "tables", "anchor2mean.tsv")
+
+    # Apply metric normalisation if requested
+    if args.metric == "identity":
+        gsea_anchor2mean = raw_anchor2mean
+    else:
+        import pandas as _pd
+        df = _pd.read_csv(raw_anchor2mean, sep="\t", header=None,
+                          names=["gene_id", "score"])
+        df["score"] = _pd.to_numeric(df["score"], errors="coerce")
+        df = df.dropna(subset=["score"])
+        df["score"] = normalise_scores(df.set_index("gene_id")["score"],
+                                       args.metric).values
+        gsea_anchor2mean = os.path.join(outdir, "tables",
+                                        "anchor2mean_%s.tsv" % args.metric)
+        df.to_csv(gsea_anchor2mean, sep="\t", index=False, header=False)
+        logger.info("Scores normalised using metric: %s", args.metric)
+
     if not _should_skip_gsea():
         run_gsea(
-            anchor2mean_path=os.path.join(tables_dir, "tables", "anchor2mean.tsv")
-            if two_list_mode else os.path.join(tables_dir, "anchor2mean.tsv"),
+            anchor2mean_path=gsea_anchor2mean,
             results_dir=results_dir,
             gene_sets=args.gene_sets,
             organism=args.organism,

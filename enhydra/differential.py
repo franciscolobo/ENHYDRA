@@ -9,7 +9,36 @@ from .exceptions import EnhydraIOError
 logger = logging.getLogger(__name__)
 
 
-def _load_group2mean(tables_dir: str) -> pd.Series:
+def normalise_scores(
+    scores: pd.Series,
+    metric: str,
+) -> pd.Series:
+    """Normalise a Series of identity scores according to the chosen metric.
+
+    Args:
+        scores: Series of raw mean alignment identity values.
+        metric: Normalisation method:
+                'identity' — no transformation, raw identity values.
+                'zscore'   — z-score normalisation: (x - mean) / sd.
+                'rank'     — normalised rank: rank / N (1 = most conserved).
+
+    Returns:
+        Normalised Series with the same index.
+    """
+    if metric == "identity":
+        return scores
+    elif metric == "zscore":
+        return (scores - scores.mean()) / scores.std()
+    elif metric == "rank":
+        n = len(scores)
+        return scores.rank(ascending=False) / n
+    else:
+        raise ValueError(
+            "Unknown metric '%s'. Choose 'identity', 'zscore', or 'rank'." % metric
+        )
+
+
+
     """Load group2mean.tsv as a Series indexed by group ID.
 
     Args:
@@ -99,16 +128,17 @@ def compute_differential(
     # Compute differential score
     if metric == "identity":
         scores = mean1 - mean2
-        logger.info("Metric: identity difference (identity_1 - identity_2).")
+        logger.info("Metric: raw identity difference (identity_1 - identity_2).")
+    elif metric == "zscore":
+        scores = normalise_scores(mean1, "zscore") - normalise_scores(mean2, "zscore")
+        logger.info("Metric: z-score normalised identity difference.")
     elif metric == "rank":
-        n = n_common
-        # Rank 1 = most conserved (highest identity), ascending=False
-        rank1 = mean1.rank(ascending=False) / n
-        rank2 = mean2.rank(ascending=False) / n
-        scores = rank1 - rank2
+        scores = normalise_scores(mean1, "rank") - normalise_scores(mean2, "rank")
         logger.info("Metric: normalised rank difference (rank_1/N - rank_2/N).")
     else:
-        raise ValueError("Unknown metric '%s'. Choose 'identity' or 'rank'." % metric)
+        raise ValueError(
+            "Unknown metric '%s'. Choose 'identity', 'zscore', or 'rank'." % metric
+        )
 
     scores.name = "differential_score"
 

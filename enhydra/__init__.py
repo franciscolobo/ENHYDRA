@@ -9,7 +9,7 @@ from .alignment import run_mafft, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
-from .differential import compute_differential
+from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
