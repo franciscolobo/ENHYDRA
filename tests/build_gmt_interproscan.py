@@ -79,43 +79,54 @@ def download_obo(cache_dir: str) -> str:
     return local_path
 
 
-def parse_obo(obo_path: str) -> dict[str, dict[str, str]]:
-    """Parse go-basic.obo into a lookup dict.
+def parse_obo(obo_path: str) -> tuple[dict[str, dict[str, str]], dict[str, set[str]]]:
+    """Parse go-basic.obo into a term lookup dict and a parent→children DAG.
 
     Args:
         obo_path: Path to the OBO file.
 
     Returns:
-        Dict mapping GO ID → {'name': str, 'namespace': str}.
-        Only includes Terms that are not obsolete.
+        Tuple of:
+            go_terms: GO ID → {'name': str, 'namespace': str}.
+            parents:  GO ID → set of direct parent GO IDs
+                      (via is_a and part_of relationships).
     """
     logger.info("Parsing OBO file: %s", obo_path)
     go_terms: dict[str, dict[str, str]] = {}
-    current_id = None
-    current_name = None
+    parents:  dict[str, set[str]] = {}
+
+    current_id        = None
+    current_name      = None
     current_namespace = None
-    is_obsolete = False
+    current_parents   = set()
+    is_obsolete       = False
 
     with open(obo_path) as fh:
         for line in fh:
             line = line.rstrip()
             if line == "[Term]":
-                # Save previous term
                 if current_id and not is_obsolete:
                     go_terms[current_id] = {
                         "name":      current_name or "",
                         "namespace": current_namespace or "",
                     }
-                current_id = None
-                current_name = None
+                    parents[current_id] = current_parents
+                current_id        = None
+                current_name      = None
                 current_namespace = None
-                is_obsolete = False
+                current_parents   = set()
+                is_obsolete       = False
             elif line.startswith("id: GO:"):
                 current_id = line[4:]
             elif line.startswith("name: "):
                 current_name = line[6:]
             elif line.startswith("namespace: "):
                 current_namespace = line[11:]
+            elif line.startswith("is_a:") or line.startswith("part_of:"):
+                # Extract parent GO ID: "is_a: GO:0008150 ! ..." → "GO:0008150"
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].startswith("GO:"):
+                    current_parents.add(parts[1])
             elif line == "is_obsolete: true":
                 is_obsolete = True
 
@@ -125,9 +136,35 @@ def parse_obo(obo_path: str) -> dict[str, dict[str, str]]:
             "name":      current_name or "",
             "namespace": current_namespace or "",
         }
+        parents[current_id] = current_parents
 
-    logger.info("Parsed %d non-obsolete GO terms.", len(go_terms))
-    return go_terms
+    logger.info(
+        "Parsed %d non-obsolete GO terms with parent relationships.",
+        len(go_terms)
+    )
+    return go_terms, parents
+
+
+def get_ancestors(go_id: str, parents: dict[str, set[str]]) -> set[str]:
+    """Return all ancestor GO IDs for a given term (transitive closure).
+
+    Walks up the DAG via is_a and part_of relationships until the root.
+
+    Args:
+        go_id:   Starting GO term ID.
+        parents: Dict mapping GO ID → set of direct parent GO IDs.
+
+    Returns:
+        Set of all ancestor GO IDs (excluding the term itself).
+    """
+    ancestors = set()
+    queue = list(parents.get(go_id, []))
+    while queue:
+        parent = queue.pop()
+        if parent not in ancestors:
+            ancestors.add(parent)
+            queue.extend(parents.get(parent, []))
+    return ancestors
 
 
 # --- Step 2: Parse InterProScan TSV ---
@@ -209,36 +246,49 @@ def parse_interproscan_tsv(
 def build_and_write_gmt(
     protein_to_go: dict[str, set[str]],
     go_terms: dict[str, dict[str, str]],
+    parents: dict[str, set[str]],
     namespace: str,
     out_path: str,
 ):
     """Build and write a GMT file for a single GO namespace.
 
+    Annotations are propagated up the GO DAG — if a protein is annotated
+    to a term, it is also added to all ancestor terms (true path rule).
+
     Args:
-        protein_to_go: protein_id → set of GO IDs.
+        protein_to_go: protein_id → set of directly annotated GO IDs.
         go_terms:      GO ID → {'name': str, 'namespace': str}.
+        parents:       GO ID → set of direct parent GO IDs.
         namespace:     Namespace key to write (e.g. 'GO_BP').
         out_path:      Output GMT file path.
     """
     target_namespace = NAMESPACE_MAP[namespace]
-    go_to_proteins: dict[str, tuple[str, set[str]]] = defaultdict(
-        lambda: ("", set())
-    )
+    go_to_proteins: dict[str, tuple[str, set[str]]] = {}
 
-    n_skipped = 0
+    n_direct   = 0
+    n_propagated = 0
+    n_skipped  = 0
+
     for protein_id, go_ids in protein_to_go.items():
+        # Expand direct annotations to include all ancestors
+        expanded = set(go_ids)
         for go_id in go_ids:
+            if go_id in go_terms:
+                expanded.update(get_ancestors(go_id, parents))
+
+        for go_id in expanded:
             term = go_terms.get(go_id)
             if term is None:
                 n_skipped += 1
                 continue
             if term["namespace"] != target_namespace:
                 continue
-            name, proteins = go_to_proteins[go_id]
-            if not name:
-                go_to_proteins[go_id] = (term["name"], proteins | {protein_id})
-            else:
-                go_to_proteins[go_id] = (name, proteins | {protein_id})
+            if go_id not in go_to_proteins:
+                go_to_proteins[go_id] = (term["name"], set())
+            go_to_proteins[go_id][1].add(protein_id)
+
+        n_direct     += len(go_ids)
+        n_propagated += len(expanded) - len(go_ids)
 
     if n_skipped:
         logger.warning(
@@ -246,9 +296,13 @@ def build_and_write_gmt(
         )
 
     logger.info(
-        "Namespace %s: %d GO terms covering %d unique proteins.",
+        "Namespace %s: %d GO terms after propagation "
+        "(%d direct annotations, %d propagated), "
+        "%d unique proteins.",
         namespace,
         len(go_to_proteins),
+        n_direct,
+        n_propagated,
         len({p for _, proteins in go_to_proteins.values() for p in proteins}),
     )
 
@@ -296,7 +350,7 @@ def main():
 
     # Step 1: Download and parse OBO
     obo_path = download_obo(args.cache)
-    go_terms = parse_obo(obo_path)
+    go_terms, parents = parse_obo(obo_path)
 
     # Step 2: Parse InterProScan TSV
     protein_to_go = parse_interproscan_tsv(args.interproscan)
@@ -306,7 +360,7 @@ def main():
         out_path = os.path.join(
             args.outdir, "%s_%s.gmt" % (args.anchor, namespace)
         )
-        build_and_write_gmt(protein_to_go, go_terms, namespace, out_path)
+        build_and_write_gmt(protein_to_go, go_terms, parents, namespace, out_path)
 
     logger.info("Done.")
 
