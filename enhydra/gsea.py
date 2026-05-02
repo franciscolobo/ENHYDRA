@@ -87,7 +87,51 @@ def build_gmt_from_gprofiler(
     return gmt_path
 
 
-def run_gsea(
+def _convert_gsea_plots_to_png(results_dir: str):
+    """Convert GSEApy-generated PDFs to PNGs for HTML embedding.
+
+    Requires pdf2image and poppler:
+        pip install pdf2image
+        brew install poppler  # macOS
+        apt install poppler-utils  # Linux
+
+    Args:
+        results_dir: Directory containing the GSEApy prerank/ subdirectory.
+    """
+    prerank_dir = os.path.join(results_dir, "prerank")
+    if not os.path.isdir(prerank_dir):
+        return
+
+    pdfs = [f for f in os.listdir(prerank_dir) if f.endswith(".pdf")]
+    if not pdfs:
+        return
+
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        logger.warning(
+            "pdf2image not installed — enrichment plots will not be embedded "
+            "in the HTML report. Install with: pip install pdf2image\n"
+            "Also requires poppler: brew install poppler (macOS) or "
+            "apt install poppler-utils (Linux)."
+        )
+        return
+
+    logger.info("Converting %d GSEApy PDF plots to PNG...", len(pdfs))
+    for pdf_file in pdfs:
+        pdf_path = os.path.join(prerank_dir, pdf_file)
+        png_path = pdf_path.replace(".pdf", ".png")
+        if os.path.isfile(png_path):
+            continue
+        try:
+            images = convert_from_path(pdf_path, dpi=150)
+            if images:
+                images[0].save(png_path, "PNG")
+        except Exception as e:
+            logger.warning("Failed to convert %s: %s", pdf_file, e)
+
+
+
     anchor2mean_path: str,
     results_dir: str,
     gene_sets: str,
@@ -151,6 +195,11 @@ def run_gsea(
         seed=seed,
         verbose=False,
     )
+
+    # GSEApy only generates PDFs — convert significant term plots to PNG
+    # for embedding in the HTML report
+    _convert_gsea_plots_to_png(results_dir)
+
 
     n_sig = (results.res2d["FDR q-val"] < 0.25).sum()
     logger.info("GSEA complete. %d significant gene sets (FDR < 0.25).", n_sig)
