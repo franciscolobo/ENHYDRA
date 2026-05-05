@@ -30,6 +30,15 @@ def _setup_logging(outdir: str):
     )
 
 
+def _resolve(cli_val, config_val, default=None):
+    """Return CLI value if explicitly set, otherwise config value, then default."""
+    if cli_val is not None:
+        return cli_val
+    if config_val not in (None, ''):
+        return config_val
+    return default
+
+
 def _run_single_list(
     inputdir: str,
     listdir: str,
@@ -43,37 +52,24 @@ def _run_single_list(
     resume: bool,
     species: list[str] | None = None,
 ):
-    """Run steps 1–5 (filter, align, identity, tables) for one species list.
-
-    Args:
-        inputdir:       Directory of input FASTA files (one per orthogroup).
-        listdir:        Output subdirectory for this list's intermediate files.
-        anchor:         Anchor species ID for table generation.
-        min_species:    Minimum species count for group retention.
-        mafft_path:     Path to MAFFT executable.
-        trimal_path:    Path to trimAl executable.
-        max_process:    Number of parallel processes.
-        paralog_mode:   Paralog handling strategy ('all', 'remove', 'longest').
-        require_anchor: Whether anchor presence is required in each group.
-        resume:         Skip steps whose output directories already exist.
-        species:        If provided, subset input groups to these species first.
-                        Used in two-list differential mode.
-    """
+    """Run steps 1–5 (filter, align, identity, tables) for one species list."""
     logger = logging.getLogger(__name__)
 
     def _should_skip(step_dir: str, step_name: str) -> bool:
         if resume and os.path.isdir(step_dir):
-            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
+            logger.info(
+                "Skipping %s (output already exists: %s)", step_name, step_dir
+            )
             return True
         return False
 
-    subset_dir       = os.path.join(listdir, "subset")
-    length_stats_dir = os.path.join(listdir, "length_stats")
-    length_filter_dir= os.path.join(listdir, "length_filter")
-    group_filter_dir = os.path.join(listdir, "group_filter")
-    alignment_dir    = os.path.join(listdir, "alignment")
-    ident_dir        = os.path.join(listdir, "ident_alignment")
-    tables_dir       = os.path.join(listdir, "tables")
+    subset_dir        = os.path.join(listdir, "subset")
+    length_stats_dir  = os.path.join(listdir, "length_stats")
+    length_filter_dir = os.path.join(listdir, "length_filter")
+    group_filter_dir  = os.path.join(listdir, "group_filter")
+    alignment_dir     = os.path.join(listdir, "alignment")
+    ident_dir         = os.path.join(listdir, "ident_alignment")
+    tables_dir        = os.path.join(listdir, "tables")
 
     os.makedirs(listdir, exist_ok=True)
 
@@ -152,116 +148,81 @@ def _build_arg_parser():
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--orthofinder-dir",
-        help="Path to an OrthoFinder 3 output directory. When provided, "
-             "ENHYDRA will preprocess the Orthogroup_Sequences/ directory "
-             "into inputdir before running the pipeline."
-    )
-
-    parser.add_argument(
-        "--obo-cache",
-        default=None,
-        help="Path to the directory containing the cached go-basic.obo file. "
-             "Used to add GO term names to the HTML report. "
-             "Same directory as used in build_gmt_interproscan.py."
+        help="Path to an OrthoFinder 3 output directory."
     )
 
     # --- Run control ---
     parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help="Resume a previously interrupted run. Skips steps whose output "
-             "directories already exist. The outdir must already exist."
+        "--resume", action="store_true", default=False,
+        help="Resume a previously interrupted run."
     )
 
-    # --- Paralog handling ---
+    # --- Filtering (override config) ---
     parser.add_argument(
-        "--paralogs",
-        choices=["all", "remove", "longest"],
-        default="all",
-        help=(
-            "How to handle paralogs (multiple sequences per species per group). "
-            "'all' keeps all sequences (default). "
-            "'remove' discards any group that contains paralogs. "
-            "'longest' keeps only the longest sequence per species, "
-            "breaking ties at random."
-        )
+        "--paralogs", choices=["all", "remove", "longest"], default=None,
+        help="Paralog handling strategy. Overrides config 'paralogs'."
+    )
+    parser.add_argument(
+        "--min-species", type=int, default=None,
+        help="Minimum species per group. Overrides config 'min_species'."
     )
 
     # --- Two-list differential mode ---
     diff_group = parser.add_argument_group("two-list differential mode")
     diff_group.add_argument(
-        "--list1",
-        help="Path to a text file listing species IDs for list 1 "
-             "(one species ID per line, '#' lines ignored)."
+        "--list1", default=None,
+        help="Path to species list file for list 1. Overrides config 'list1'."
     )
     diff_group.add_argument(
-        "--list2",
-        help="Path to a text file listing species IDs for list 2 "
-             "(one species ID per line, '#' lines ignored)."
+        "--list2", default=None,
+        help="Path to species list file for list 2. Overrides config 'list2'."
     )
     diff_group.add_argument(
-        "--metric",
-        choices=["zscore", "identity", "rank"],
-        default="zscore",
-        help=(
-            "Metric for the differential score between the two lists. "
-            "'zscore'   — z-score normalised identity difference (default). "
-            "            Removes the effect of overall divergence level, "
-            "            recommended when the two groups have different "
-            "            evolutionary depths. "
-            "'identity' — raw mean identity difference (identity_1 - identity_2). "
-            "            Only appropriate when both groups are evolutionarily "
-            "            comparable. "
-            "'rank'     — normalised rank difference (rank_1/N - rank_2/N). "
-            "            Most robust to non-normality in identity distributions. "
-            "Positive scores indicate higher relative conservation in list 1."
-        )
+        "--metric", choices=["zscore", "identity", "rank"], default=None,
+        help="Differential/ranking metric. Overrides config 'metric'."
     )
 
-    # --- Gene set source (mutually exclusive, one required) ---
-    gmt_group = parser.add_mutually_exclusive_group(required=True)
+    # --- Gene set source (override config) ---
+    gmt_group = parser.add_mutually_exclusive_group()
     gmt_group.add_argument(
-        "--organism",
-        help=(
-            "g:Profiler organism name (e.g. 'hsapiens', 'athaliana'). "
-            "Fetches annotations via the g:Profiler API. "
-            "See https://biit.cs.ut.ee/gprofiler for supported organisms."
-        )
+        "--organism", default=None,
+        help="g:Profiler organism name. Overrides config 'organism'."
     )
     gmt_group.add_argument(
-        "--gene-sets",
-        help=(
-            "Path to a local .gmt file for GSEApy prerank. "
-            "Use for species not supported by g:Profiler or custom annotations."
-        )
+        "--gene-sets", default=None,
+        help="Path to a local .gmt file. Overrides config 'gene_sets'."
     )
 
-    # --- g:Profiler options ---
+    # --- GSEA options (override config) ---
     parser.add_argument(
-        "--sources",
-        nargs="+",
-        default=["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"],
-        help="g:Profiler data sources to query. Only used with --organism. "
-             "Default: GO:BP GO:MF GO:CC KEGG REAC."
+        "--sources", nargs="+", default=None,
+        help="g:Profiler data sources. Overrides config 'sources'."
+    )
+    parser.add_argument(
+        "--permutations", type=int, default=None,
+        help="Number of GSEA permutations. Overrides config 'permutations'."
+    )
+    parser.add_argument(
+        "--min-size", type=int, default=None,
+        help="Minimum gene set size. Overrides config 'min_size'."
+    )
+    parser.add_argument(
+        "--max-size", type=int, default=None,
+        help="Maximum gene set size. Overrides config 'max_size'."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed. Overrides config 'seed'."
+    )
+    parser.add_argument(
+        "--fdr-threshold", type=float, default=None,
+        help="FDR significance threshold. Overrides config 'fdr_threshold'."
     )
 
-    # --- GSEA options ---
+    # --- Report ---
     parser.add_argument(
-        "--permutations", type=int, default=1000,
-        help="Number of GSEA permutations (default: 1000)."
-    )
-    parser.add_argument(
-        "--min-size", type=int, default=5,
-        help="Minimum gene set size to test (default: 5)."
-    )
-    parser.add_argument(
-        "--max-size", type=int, default=500,
-        help="Maximum gene set size to test (default: 500)."
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducibility (default: 42)."
+        "--obo-cache", default=None,
+        help="Directory containing cached go-basic.obo file."
     )
 
     return parser
@@ -271,18 +232,7 @@ def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    # --- Validate two-list arguments ---
-    two_list_mode = args.list1 is not None or args.list2 is not None
-    if two_list_mode:
-        missing = [f for f in ["--list1", "--list2"]
-                   if getattr(args, f.lstrip("-").replace("-", "_")) is None]
-        if missing:
-            parser.error(
-                "Two-list mode requires both --list1 and --list2. "
-                "Missing: %s" % ", ".join(missing)
-            )
-
-    # --- Read and validate config ---
+    # --- Read config ---
     try:
         with open(args.project_config, "r") as fh_project, \
              open(args.code_config, "r") as fh_code:
@@ -294,6 +244,39 @@ def main():
         check_parameters(parameters, args.code_config)
     except (EnhydraConfigError, EnhydraIOError, EnhydraToolError) as e:
         sys.exit("Configuration error: %s" % e)
+
+    # --- Resolve parameters: CLI overrides config ---
+    min_species   = _resolve(args.min_species,   parameters['min_species'],   4)
+    paralogs      = _resolve(args.paralogs,      parameters['paralogs'],      'all')
+    metric        = _resolve(args.metric,        parameters['metric'],        'zscore')
+    gene_sets     = _resolve(args.gene_sets,     parameters['gene_sets'],     None)
+    organism      = _resolve(args.organism,      parameters['organism'],      None)
+    permutations  = _resolve(args.permutations,  parameters['permutations'],  1000)
+    min_size      = _resolve(args.min_size,      parameters['min_size'],      5)
+    max_size      = _resolve(args.max_size,      parameters['max_size'],      500)
+    seed          = _resolve(args.seed,          parameters['seed'],          42)
+    fdr_threshold = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
+    list1_path    = _resolve(args.list1,         parameters['list1'],         None)
+    list2_path    = _resolve(args.list2,         parameters['list2'],         None)
+    sources_raw   = _resolve(args.sources,       parameters['sources'],
+                             'GO:BP GO:MF GO:CC KEGG REAC')
+    sources = sources_raw if isinstance(sources_raw, list) \
+              else sources_raw.split()
+
+    # Validate gene set source
+    if not gene_sets and not organism:
+        parser.error(
+            "A gene set source is required. Set 'gene_sets' or 'organism' "
+            "in your project config, or use --gene-sets / --organism."
+        )
+
+    # Validate two-list mode
+    two_list_mode = bool(list1_path or list2_path)
+    if two_list_mode and not (list1_path and list2_path):
+        parser.error(
+            "Two-list mode requires both list1 and list2 to be specified "
+            "(in config or via --list1/--list2)."
+        )
 
     # --- Set up output directory and logging ---
     outdir = parameters['outdir']
@@ -307,6 +290,10 @@ def main():
     _setup_logging(outdir)
     logger = logging.getLogger(__name__)
     logger.info("Welcome to Enhydra")
+    logger.info("Resolved parameters: metric=%s, paralogs=%s, min_species=%d, "
+                "permutations=%d, min_size=%d, max_size=%d, fdr_threshold=%.2f",
+                metric, paralogs, min_species, permutations,
+                min_size, max_size, fdr_threshold)
 
     # --- OrthoFinder preprocessing (optional) ---
     if args.orthofinder_dir:
@@ -319,11 +306,11 @@ def main():
     # --- Common kwargs for _run_single_list ---
     common_kwargs = dict(
         inputdir=parameters['inputdir'],
-        min_species=parameters['min_species'],
+        min_species=min_species,
         mafft_path=parameters['mafft'],
         trimal_path=parameters['trimal'],
         max_process=parameters['max_process'],
-        paralog_mode=args.paralogs,
+        paralog_mode=paralogs,
         resume=args.resume,
     )
 
@@ -331,7 +318,7 @@ def main():
     if not two_list_mode:
         logger.info("Running in single-list mode.")
         tables_dir = _run_single_list(
-            listdir=os.path.join(outdir),
+            listdir=outdir,
             anchor=parameters['anchor'],
             require_anchor=True,
             species=None,
@@ -339,12 +326,70 @@ def main():
         )
         results_dir = os.path.join(outdir, "enrichment")
 
+        def _should_skip_gsea():
+            if args.resume and os.path.isdir(results_dir):
+                logger.info("Skipping enrichment analysis (output already exists).")
+                return True
+            return False
+
+        # Apply metric normalisation
+        raw_anchor2mean = os.path.join(outdir, "tables", "anchor2mean.tsv")
+        if metric == "identity":
+            gsea_anchor2mean = raw_anchor2mean
+        else:
+            import pandas as _pd
+            df = _pd.read_csv(raw_anchor2mean, sep="\t", header=None,
+                              names=["gene_id", "score"])
+            df["score"] = _pd.to_numeric(df["score"], errors="coerce")
+            df = df.dropna(subset=["score"])
+            df["score"] = normalise_scores(
+                df.set_index("gene_id")["score"], metric
+            ).values
+            gsea_anchor2mean = os.path.join(
+                outdir, "tables", "anchor2mean_%s.tsv" % metric
+            )
+            df.to_csv(gsea_anchor2mean, sep="\t", index=False, header=False)
+            logger.info("Scores normalised using metric: %s", metric)
+
+        logger.info("Step 6: Enrichment analysis")
+        if not _should_skip_gsea():
+            run_gsea(
+                anchor2mean_path=gsea_anchor2mean,
+                results_dir=results_dir,
+                gene_sets=gene_sets,
+                organism=organism,
+                sources=sources,
+                permutations=permutations,
+                min_size=min_size,
+                max_size=max_size,
+                seed=seed,
+                fdr_threshold=fdr_threshold,
+            )
+
+        logger.info("Generating plots")
+        make_single_list_plots(
+            anchor2mean_path=raw_anchor2mean,
+            results_dir=results_dir,
+            plots_dir=os.path.join(outdir, "plots"),
+        )
+
+        logger.info("Building HTML report")
+        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
+            if args.obo_cache else None
+        build_report(
+            results_dir=results_dir,
+            plots_dir=os.path.join(outdir, "plots"),
+            report_path=os.path.join(outdir, "report.html"),
+            obo_path=obo_path,
+            mode="single",
+            fdr_threshold=fdr_threshold,
+        )
+
     # --- Two-list differential mode ---
     else:
         logger.info("Running in two-list differential mode.")
-
-        species1 = read_species_list(args.list1)
-        species2 = read_species_list(args.list2)
+        species1 = read_species_list(list1_path)
+        species2 = read_species_list(list2_path)
         logger.info("List 1: %d species", len(species1))
         logger.info("List 2: %d species", len(species2))
         logger.info("Anchor: %s", parameters['anchor'])
@@ -367,8 +412,7 @@ def main():
             **common_kwargs,
         )
 
-        # --- Differential ranking ---
-        diff_dir = os.path.join(outdir, "differential")
+        diff_dir    = os.path.join(outdir, "differential")
         results_dir = os.path.join(diff_dir, "enrichment")
 
         def _should_skip_diff(step_dir, step_name):
@@ -384,7 +428,7 @@ def main():
                 tables_dir1=tables_dir1,
                 tables_dir2=tables_dir2,
                 diff_dir=diff_dir,
-                metric=args.metric,
+                metric=metric,
             )
 
         logger.info("Step 6: Enrichment analysis (differential)")
@@ -392,13 +436,14 @@ def main():
             run_gsea(
                 anchor2mean_path=anchor2mean_path,
                 results_dir=results_dir,
-                gene_sets=args.gene_sets,
-                organism=args.organism,
-                sources=args.sources,
-                permutations=args.permutations,
-                min_size=args.min_size,
-                max_size=args.max_size,
-                seed=args.seed,
+                gene_sets=gene_sets,
+                organism=organism,
+                sources=sources,
+                permutations=permutations,
+                min_size=min_size,
+                max_size=max_size,
+                seed=seed,
+                fdr_threshold=fdr_threshold,
             )
 
         logger.info("Generating differential plots")
@@ -407,7 +452,7 @@ def main():
             tables_dir2=tables_dir2,
             diff_dir=diff_dir,
             plots_dir=os.path.join(diff_dir, "plots"),
-            metric=args.metric,
+            metric=metric,
         )
 
         logger.info("Building HTML report")
@@ -419,67 +464,8 @@ def main():
             report_path=os.path.join(diff_dir, "report.html"),
             obo_path=obo_path,
             mode="differential",
-            metric=args.metric,
+            metric=metric,
+            fdr_threshold=fdr_threshold,
         )
-
-        logger.info("Enhydra finished successfully.")
-        return
-
-    # --- GSEA (single-list mode) ---
-    def _should_skip_gsea():
-        if args.resume and os.path.isdir(results_dir):
-            logger.info("Skipping enrichment analysis (output already exists).")
-            return True
-        return False
-
-    logger.info("Step 6: Enrichment analysis")
-    raw_anchor2mean = os.path.join(outdir, "tables", "anchor2mean.tsv")
-
-    # Apply metric normalisation if requested
-    if args.metric == "identity":
-        gsea_anchor2mean = raw_anchor2mean
-    else:
-        import pandas as _pd
-        df = _pd.read_csv(raw_anchor2mean, sep="\t", header=None,
-                          names=["gene_id", "score"])
-        df["score"] = _pd.to_numeric(df["score"], errors="coerce")
-        df = df.dropna(subset=["score"])
-        df["score"] = normalise_scores(df.set_index("gene_id")["score"],
-                                       args.metric).values
-        gsea_anchor2mean = os.path.join(outdir, "tables",
-                                        "anchor2mean_%s.tsv" % args.metric)
-        df.to_csv(gsea_anchor2mean, sep="\t", index=False, header=False)
-        logger.info("Scores normalised using metric: %s", args.metric)
-
-    if not _should_skip_gsea():
-        run_gsea(
-            anchor2mean_path=gsea_anchor2mean,
-            results_dir=results_dir,
-            gene_sets=args.gene_sets,
-            organism=args.organism,
-            sources=args.sources,
-            permutations=args.permutations,
-            min_size=args.min_size,
-            max_size=args.max_size,
-            seed=args.seed,
-        )
-
-    logger.info("Generating plots")
-    make_single_list_plots(
-        anchor2mean_path=os.path.join(outdir, "tables", "anchor2mean.tsv"),
-        results_dir=results_dir,
-        plots_dir=os.path.join(outdir, "plots"),
-    )
-
-    logger.info("Building HTML report")
-    obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
-        if args.obo_cache else None
-    build_report(
-        results_dir=results_dir,
-        plots_dir=os.path.join(outdir, "plots"),
-        report_path=os.path.join(outdir, "report.html"),
-        obo_path=obo_path,
-        mode="single",
-    )
 
     logger.info("Enhydra finished successfully.")

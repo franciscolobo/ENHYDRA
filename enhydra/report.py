@@ -47,10 +47,6 @@ def _img_to_base64(img_path: str) -> str:
     with open(img_path, "rb") as fh:
         data = base64.b64encode(fh.read()).decode("utf-8")
     return "data:image/png;base64,%s" % data
-    """Encode a PNG file as a base64 data URI."""
-    with open(img_path, "rb") as fh:
-        data = base64.b64encode(fh.read()).decode("utf-8")
-    return "data:image/png;base64,%s" % data
 
 
 def _parse_obo_names(obo_path: str) -> dict[str, str]:
@@ -79,6 +75,15 @@ def _parse_obo_names(obo_path: str) -> dict[str, str]:
     return names
 
 
+def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
+    """Load GSEApy prerank results CSV."""
+    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if not os.path.isfile(path):
+        logger.warning("GSEA results not found: %s", path)
+        return None
+    return pd.read_csv(path)
+
+
 def _build_enrichment_plot_index(results_dir: str) -> dict[str, str]:
     """Build a mapping from GO ID to base64-encoded PNG enrichment plot.
 
@@ -103,23 +108,17 @@ def _build_enrichment_plot_index(results_dir: str) -> dict[str, str]:
 
     logger.info("Indexed %d enrichment plot(s).", len(index))
     return index
-    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
-    if not os.path.isfile(path):
-        logger.warning("GSEA results not found: %s", path)
-        return None
-    return pd.read_csv(path)
 
 
 def _results_table_html(
     df: pd.DataFrame,
     obo_names: dict[str, str],
     plot_index: dict[str, str],
+    fdr_threshold: float = 0.25,
 ) -> str:
     """Build the HTML for the results DataTable."""
     df = df.copy()
 
-    # GSEApy prerank results columns:
-    # 'Name' = run name (e.g. 'prerank'), 'Term' = GO ID, 'ES', 'NES', etc.
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
         return "<p>No results to display.</p>"
@@ -136,7 +135,7 @@ def _results_table_html(
 
     # Significance flag
     df["Significant"] = df["FDR q-val"].apply(
-        lambda x: "✓" if x != "" and float(x) < 0.25 else ""
+        lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
 
     display_cols = {
@@ -198,7 +197,6 @@ def _html_template(
     mode: str,
     plot_index: dict[str, str],
 ) -> str:
-    # Build JS plot data object
     plot_data_js = "var enrichmentPlots = {%s};" % ",".join(
         '"%s": "%s"' % (go_id, uri)
         for go_id, uri in plot_index.items()
@@ -229,7 +227,6 @@ h2 { margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
 .plot-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 tr.sig-row { background-color: #eaf3fb !important; font-weight: bold; }
 a.go-link { color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }
-/* Modal */
 #modal-overlay { display: none; position: fixed; top: 0; left: 0;
                  width: 100%%; height: 100%%; background: rgba(0,0,0,0.6);
                  z-index: 1000; justify-content: center; align-items: center; }
@@ -315,6 +312,7 @@ def build_report(
     obo_path: str | None = None,
     mode: str = "single",
     metric: str = "zscore",
+    fdr_threshold: float = 0.25,
 ):
     """Build a self-contained HTML report for ENHYDRA results.
 
@@ -342,14 +340,17 @@ def build_report(
         logger.warning("Cannot build report: no GSEA results found.")
         return
 
-    # Download JS/CSS (cached in obo_cache dir if available)
+    # Fetch and cache JS/CSS assets
     cache_dir = os.path.dirname(obo_path) if obo_path else None
     logger.info("Fetching DataTables assets (cached after first download)...")
     jquery_js = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
     dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
     dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
 
-    # Build plots section
+    # Build enrichment plot index
+    plot_index = _build_enrichment_plot_index(results_dir)
+
+    # Set up plot names and title
     if mode == "single":
         plot_names = [
             ("identity_distribution", "Distribution of mean alignment identity"),
@@ -365,11 +366,8 @@ def build_report(
         ]
         title = "ENHYDRA Differential Enrichment Report"
 
-    # Build enrichment plot index
-    plot_index = _build_enrichment_plot_index(results_dir)
-
     plots_html = _plot_section(plots_dir, plot_names)
-    table_html = _results_table_html(df, obo_names, plot_index)
+    table_html = _results_table_html(df, obo_names, plot_index, fdr_threshold)
 
     html = _html_template(
         title=title,

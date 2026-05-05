@@ -26,67 +26,6 @@ def _load_ranked(anchor2mean_path: str) -> pd.DataFrame:
     return ranked.sort_values("identity", ascending=False)
 
 
-def build_gmt_from_gprofiler(
-    gene_ids: list[str],
-    organism: str,
-    gmt_path: str,
-    sources: list[str] | None = None,
-) -> str:
-    """Fetch annotations from g:Profiler and write a GMT file.
-
-    Queries the g:Profiler API with the full list of anchor gene IDs to
-    retrieve all annotated terms and their gene members. The result is
-    written as a GMT file for use with GSEApy prerank.
-
-    Args:
-        gene_ids: List of anchor gene IDs (Ensembl format).
-        organism: g:Profiler organism name (e.g. 'hsapiens', 'athaliana').
-        gmt_path: Path where the GMT file will be written.
-        sources:  Data sources to query. Defaults to GO:BP, GO:MF, GO:CC,
-                  KEGG, and Reactome.
-
-    Returns:
-        Path to the written GMT file.
-    """
-    if sources is None:
-        sources = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]
-
-    logger.info(
-        "Fetching annotations from g:Profiler for %d genes, organism: %s, sources: %s",
-        len(gene_ids), organism, sources,
-    )
-
-    gprofiler = GProfiler(user_agent="ENHYDRA", return_dataframe=True)
-    results = gprofiler.profile(
-        organism=organism,
-        query=gene_ids,
-        sources=sources,
-        user_threshold=1.0,     # return all terms regardless of significance
-        no_evidences=False,     # include intersections column (gene members)
-    )
-
-    if results.empty:
-        raise EnhydraIOError(
-            "g:Profiler returned no annotations for organism '%s'. "
-            "Please check the organism name at https://biit.cs.ut.ee/gprofiler."
-            % organism
-        )
-
-    # Build GMT: each line is term_id <TAB> term_name <TAB> gene1 <TAB> gene2 ...
-    n_terms = 0
-    with open(gmt_path, "w") as fh:
-        for _, row in results.iterrows():
-            genes = row.get("intersections")
-            if not genes:
-                continue
-            gene_str = "\t".join(genes)
-            fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], gene_str))
-            n_terms += 1
-
-    logger.info("GMT file written: %d terms, path: %s", n_terms, gmt_path)
-    return gmt_path
-
-
 def _convert_gsea_plots_to_png(results_dir: str):
     """Convert GSEApy-generated PDFs to PNGs for HTML embedding.
 
@@ -131,7 +70,63 @@ def _convert_gsea_plots_to_png(results_dir: str):
             logger.warning("Failed to convert %s: %s", pdf_file, e)
 
 
+def build_gmt_from_gprofiler(
+    gene_ids: list[str],
+    organism: str,
+    gmt_path: str,
+    sources: list[str] | None = None,
+) -> str:
+    """Fetch annotations from g:Profiler and write a GMT file.
 
+    Args:
+        gene_ids: List of anchor gene IDs (Ensembl format).
+        organism: g:Profiler organism name (e.g. 'hsapiens', 'athaliana').
+        gmt_path: Path where the GMT file will be written.
+        sources:  Data sources to query. Defaults to GO:BP, GO:MF, GO:CC,
+                  KEGG, and Reactome.
+
+    Returns:
+        Path to the written GMT file.
+    """
+    if sources is None:
+        sources = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]
+
+    logger.info(
+        "Fetching annotations from g:Profiler for %d genes, organism: %s, sources: %s",
+        len(gene_ids), organism, sources,
+    )
+
+    gprofiler = GProfiler(user_agent="ENHYDRA", return_dataframe=True)
+    results = gprofiler.profile(
+        organism=organism,
+        query=gene_ids,
+        sources=sources,
+        user_threshold=1.0,
+        no_evidences=False,
+    )
+
+    if results.empty:
+        raise EnhydraIOError(
+            "g:Profiler returned no annotations for organism '%s'. "
+            "Please check the organism name at https://biit.cs.ut.ee/gprofiler."
+            % organism
+        )
+
+    n_terms = 0
+    with open(gmt_path, "w") as fh:
+        for _, row in results.iterrows():
+            genes = row.get("intersections")
+            if not genes:
+                continue
+            gene_str = "\t".join(genes)
+            fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], gene_str))
+            n_terms += 1
+
+    logger.info("GMT file written: %d terms, path: %s", n_terms, gmt_path)
+    return gmt_path
+
+
+def run_gsea(
     anchor2mean_path: str,
     results_dir: str,
     gene_sets: str,
@@ -141,17 +136,13 @@ def _convert_gsea_plots_to_png(results_dir: str):
     min_size: int = 5,
     max_size: int = 500,
     seed: int = 42,
+    fdr_threshold: float = 0.25,
 ) -> gp.Prerank:
     """Run GSEApy prerank, optionally fetching annotations from g:Profiler.
 
-    If organism is provided, annotations are fetched automatically from the
-    g:Profiler API and a GMT file is generated in results_dir — no manual
-    download required. If gene_sets is provided instead, that local GMT file
-    is used directly.
-
     Args:
         anchor2mean_path: Path to anchor2mean.tsv (gene_id, mean_identity).
-        results_dir:      Directory where results and GMT are written.
+        results_dir:      Directory where results are written.
         gene_sets:        Path to a local GMT file. Used when organism is None.
         organism:         g:Profiler organism name. When provided, annotations
                           are fetched via the API and gene_sets is ignored.
@@ -193,15 +184,26 @@ def _convert_gsea_plots_to_png(results_dir: str):
         min_size=min_size,
         max_size=max_size,
         seed=seed,
+        graph_num=0,   # no plots on first pass — we count significant terms first
         verbose=False,
     )
 
-    # GSEApy only generates PDFs — convert significant term plots to PNG
-    # for embedding in the HTML report
-    _convert_gsea_plots_to_png(results_dir)
+    n_sig = (results.res2d["FDR q-val"] < fdr_threshold).sum()
+    logger.info("GSEA complete. %d significant gene sets (FDR < %s).", n_sig, fdr_threshold)
 
-
-    n_sig = (results.res2d["FDR q-val"] < 0.25).sum()
-    logger.info("GSEA complete. %d significant gene sets (FDR < 0.25).", n_sig)
+    if n_sig > 0:
+        logger.info("Generating enrichment plots for %d significant gene sets...", n_sig)
+        gp.prerank(
+            rnk=ranked,
+            gene_sets=gene_sets,
+            outdir=results_dir,
+            permutation_num=permutations,
+            min_size=min_size,
+            max_size=max_size,
+            seed=seed,
+            graph_num=int(n_sig),
+            verbose=False,
+        )
+        _convert_gsea_plots_to_png(results_dir)
 
     return results
