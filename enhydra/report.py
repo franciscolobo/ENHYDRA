@@ -123,52 +123,93 @@ def _results_table_html(
         logger.warning("'Term' column not found in GSEA results.")
         return "<p>No results to display.</p>"
 
-    # Look up term name from OBO using the GO ID in the 'Term' column
     df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
 
-    # Format numeric columns
     for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").apply(
                 lambda x: "%.4f" % x if pd.notna(x) else ""
             )
 
-    # Significance flag
     df["Significant"] = df["FDR q-val"].apply(
         lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
 
-    display_cols = {
-        "Term":        "GO ID",
-        "GO Term":     "Term name",
-        "NES":         "NES",
-        "NOM p-val":   "p-value",
-        "FDR q-val":   "FDR",
-        "Significant": "Significant",
-    }
-    table_df = df[[c for c in display_cols if c in df.columns
-                   or c in ("GO Term", "Significant")]].copy()
-    table_df = table_df.rename(columns=display_cols)
+    # Column definitions: (source_col, display_name, tooltip)
+    col_defs = [
+        ("Term",        "GO ID",
+         "Gene Ontology term identifier."),
+        ("GO Term",     "Term name",
+         "Human-readable name of the GO term."),
+        ("NES",         "NES",
+         "Normalised Enrichment Score. Positive values indicate enrichment "
+         "at the top of the ranking (more conserved); negative values at "
+         "the bottom (faster evolving)."),
+        ("NOM p-val",   "p-value",
+         "Nominal p-value from permutation testing. Not corrected for "
+         "multiple testing."),
+        ("FDR q-val",   "FDR",
+         "False Discovery Rate q-value (Benjamini-Hochberg). Gene sets with "
+         "FDR below the threshold (%.2f) are considered significant." % fdr_threshold),
+        ("Tag %%",       "Tag %%",
+         "Percentage of genes in the leading edge subset out of the total "
+         "genes in the gene set."),
+        ("Gene %%",      "Gene %%",
+         "Percentage of genes in the leading edge subset out of all genes "
+         "in the ranked list."),
+        ("Lead_genes",  "Leading edge genes",
+         "Genes in the leading edge subset — those that contribute most to "
+         "the enrichment score."),
+        ("Significant", "Sig.",
+         "Whether this gene set is statistically significant at the "
+         "configured FDR threshold (%.2f)." % fdr_threshold),
+    ]
+
+    # Keep only columns present in df or computed above
+    available = set(df.columns)
+    col_defs = [(s, d, t) for s, d, t in col_defs
+                if s in available or s in ("GO Term", "Significant")]
+
+    table_df = df[[s for s, _, _ in col_defs]].copy()
+    display_names = [d for _, d, _ in col_defs]
+    tooltips      = [t for _, _, t in col_defs]
+    table_df.columns = display_names
+
+    # Build header with tooltips
+    header_cells = ""
+    for name, tip in zip(display_names, tooltips):
+        header_cells += (
+            '<th>%s <span class="col-tip" title="%s">?</span></th>' % (name, tip)
+        )
 
     rows = ""
     for _, row in table_df.iterrows():
-        sig_class = ' class="sig-row"' if row.get("Significant") == "✓" else ""
+        sig_class = ' class="sig-row"' if row.get("Sig.") == "✓" else ""
         go_id = row.get("GO ID", "")
         has_plot = go_id in plot_index
         cells = ""
         for col, val in row.items():
             if col == "GO ID" and has_plot:
-                cells += '<td><a href="#" class="go-link" data-goid="%s">%s</a></td>' % (go_id, val)
+                cells += (
+                    '<td><a href="#" class="go-link" data-goid="%s">%s</a></td>'
+                    % (go_id, val)
+                )
             else:
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
 
-    headers = "".join("<th>%s</th>" % c for c in table_df.columns)
     return """
     <table id="results-table" class="display compact" style="width:100%%">
-        <thead><tr>%s</tr></thead>
+        <thead>
+            <tr>%s</tr>
+            <tr class="filter-row">%s</tr>
+        </thead>
         <tbody>%s</tbody>
-    </table>""" % (headers, rows)
+    </table>""" % (
+        header_cells,
+        "".join("<th></th>" for _ in display_names),
+        rows,
+    )
 
 
 def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
@@ -227,6 +268,14 @@ h2 { margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
 .plot-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 tr.sig-row { background-color: #eaf3fb !important; font-weight: bold; }
 a.go-link { color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }
+.col-tip { display: inline-block; width: 14px; height: 14px; line-height: 14px;
+           font-size: 10px; text-align: center; border-radius: 50%;
+           background: #aaa; color: white; cursor: help; margin-left: 3px;
+           font-style: normal; }
+tfoot input, thead tr.filter-row th input {
+    width: 100%%; box-sizing: border-box; font-size: 11px;
+    padding: 3px; border: 1px solid #ccc; border-radius: 3px; }
+thead tr.filter-row th { padding: 4px 8px; }
 #modal-overlay { display: none; position: fixed; top: 0; left: 0;
                  width: 100%%; height: 100%%; background: rgba(0,0,0,0.6);
                  z-index: 1000; justify-content: center; align-items: center; }
@@ -277,11 +326,22 @@ footer { text-align: center; padding: 20px; font-size: 0.85em; color: #888; }
 <script>
 %s
 $(document).ready(function() {
-    $('#results-table').DataTable({
+    // Per-column filter inputs in the second header row
+    $('#results-table thead tr.filter-row th').each(function(i) {
+        var input = $('<input type="text" placeholder="Filter..."/>');
+        $(this).html(input);
+        input.on('keyup change', function() {
+            table.column(i).search(this.value).draw();
+        });
+    });
+
+    var table = $('#results-table').DataTable({
         pageLength: 25,
+        orderCellsTop: true,
         order: [[4, 'asc']],
         columnDefs: [{ targets: [2,3,4], type: 'num' }]
     });
+
     $(document).on('click', '.go-link', function(e) {
         e.preventDefault();
         var goId = $(this).data('goid');
