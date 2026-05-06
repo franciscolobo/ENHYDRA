@@ -367,15 +367,19 @@ def main():
             )
 
         logger.info("Generating plots")
+        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
+            if args.obo_cache else None
+        from .report import _parse_obo_names
+        obo_names = _parse_obo_names(obo_path) if obo_path and os.path.isfile(obo_path) else {}
         make_single_list_plots(
             anchor2mean_path=raw_anchor2mean,
             results_dir=results_dir,
             plots_dir=os.path.join(outdir, "plots"),
+            obo_names=obo_names,
+            fdr_threshold=fdr_threshold,
         )
 
         logger.info("Building HTML report")
-        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
-            if args.obo_cache else None
         build_report(
             results_dir=results_dir,
             plots_dir=os.path.join(outdir, "plots"),
@@ -447,17 +451,21 @@ def main():
             )
 
         logger.info("Generating differential plots")
+        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
+            if args.obo_cache else None
+        from .report import _parse_obo_names
+        obo_names = _parse_obo_names(obo_path) if obo_path and os.path.isfile(obo_path) else {}
         make_differential_plots(
             tables_dir1=tables_dir1,
             tables_dir2=tables_dir2,
             diff_dir=diff_dir,
             plots_dir=os.path.join(diff_dir, "plots"),
             metric=metric,
+            obo_names=obo_names,
+            fdr_threshold=fdr_threshold,
         )
 
         logger.info("Building HTML report")
-        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
-            if args.obo_cache else None
         build_report(
             results_dir=results_dir,
             plots_dir=os.path.join(diff_dir, "plots"),

@@ -89,25 +89,29 @@ def plot_identity_distribution(
 def plot_gsea_barplot(
     results_dir: str,
     plots_dir: str,
+    obo_names: dict[str, str] | None = None,
     fdr_threshold: float = 0.25,
     top_n: int = 20,
     title: str = "Top enriched gene sets",
 ):
     """Horizontal bar plot of NES scores for significant gene sets.
 
-    Positive NES (more conserved) shown in blue, negative (faster evolving)
-    in red. Up to top_n gene sets per direction are shown.
+    Generates PNG and PDF for publication and an SVG with GO definition
+    tooltips for the HTML report.
 
     Args:
         results_dir:   Directory containing GSEApy results CSV.
         plots_dir:     Output directory for plots.
+        obo_names:     GO ID → term name dict for SVG tooltips (optional).
         fdr_threshold: FDR threshold for significance (default: 0.25).
         top_n:         Maximum number of gene sets to show per direction.
         title:         Plot title.
     """
-    df = _load_gsea_results(results_dir)
-    if df is None:
+    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if not os.path.isfile(path):
+        logger.warning("GSEA results not found: %s", path)
         return
+    df = pd.read_csv(path)
 
     sig = df[df["FDR q-val"] < fdr_threshold].copy()
     if sig.empty:
@@ -116,7 +120,7 @@ def plot_gsea_barplot(
 
     pos = sig[sig["NES"] > 0].nlargest(top_n, "NES")
     neg = sig[sig["NES"] < 0].nsmallest(top_n, "NES")
-    plot_df = pd.concat([pos, neg]).sort_values("NES")
+    plot_df = pd.concat([pos, neg]).sort_values("NES").reset_index(drop=True)
 
     colors = [
         PALETTE["positive"] if nes > 0 else PALETTE["negative"]
@@ -124,23 +128,153 @@ def plot_gsea_barplot(
     ]
 
     with plt.style.context(FIGURE_STYLE):
-        fig_height = max(4, len(plot_df) * 0.35)
-        fig, ax = plt.subplots(figsize=(9, fig_height))
+        fig_height = max(4, len(plot_df) * 0.45)
+        fig, ax = plt.subplots(figsize=(10, fig_height))
         bars = ax.barh(plot_df["Term"], plot_df["NES"], color=colors, edgecolor="none")
         ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
         ax.set_xlabel("Normalised Enrichment Score (NES)", fontsize=12)
         ax.set_title(title, fontsize=13)
+
+        # Fixed offset for FDR labels — always outside the bar
+        x_range = max(abs(plot_df["NES"].max()), abs(plot_df["NES"].min()))
+        offset = x_range * 0.03
+
         for bar, (_, row) in zip(bars, plot_df.iterrows()):
-            x = row["NES"] + (0.02 if row["NES"] > 0 else -0.02)
-            ha = "left" if row["NES"] > 0 else "right"
+            if row["NES"] > 0:
+                x = bar.get_width() + offset
+                ha = "left"
+            else:
+                x = bar.get_width() - offset
+                ha = "right"
             ax.text(
                 x, bar.get_y() + bar.get_height() / 2,
                 "FDR=%.3f" % row["FDR q-val"],
-                va="center", ha=ha, fontsize=7, color="black"
+                va="center", ha=ha, fontsize=7, color="#333"
             )
+
+        # Add extra margin so labels don't get clipped
+        ax.set_xlim(
+            ax.get_xlim()[0] - offset * 8,
+            ax.get_xlim()[1] + offset * 8
+        )
         fig.tight_layout()
 
     _save(fig, plots_dir, "gsea_barplot")
+
+    # --- SVG version with GO definition tooltips ---
+    _save_gsea_barplot_svg(plot_df, colors, offset, title, plots_dir, obo_names or {})
+
+
+def _save_gsea_barplot_svg(
+    plot_df: pd.DataFrame,
+    colors: list[str],
+    offset: float,
+    title: str,
+    plots_dir: str,
+    obo_names: dict[str, str],
+):
+    """Save an SVG version of the barplot with browser-native hover tooltips."""
+    import xml.etree.ElementTree as ET
+
+    n = len(plot_df)
+    bar_h = 22
+    margin_left = 260
+    margin_right = 130
+    margin_top = 50
+    margin_bottom = 40
+    plot_w = 500
+    svg_w = margin_left + plot_w + margin_right
+    svg_h = margin_top + n * bar_h + margin_bottom
+
+    x_min = plot_df["NES"].min()
+    x_max = plot_df["NES"].max()
+    pad = max(abs(x_min), abs(x_max)) * 0.25
+    x_min -= pad
+    x_max += pad
+
+    def to_px(nes):
+        return margin_left + (nes - x_min) / (x_max - x_min) * plot_w
+
+    zero_px = to_px(0)
+
+    svg = ET.Element("svg", {
+        "xmlns": "http://www.w3.org/2000/svg",
+        "width": str(svg_w), "height": str(svg_h),
+        "font-family": "Arial, sans-serif", "font-size": "11",
+    })
+
+    # Title
+    ET.SubElement(svg, "text", {
+        "x": str(svg_w // 2), "y": "30",
+        "text-anchor": "middle", "font-size": "13", "font-weight": "bold",
+        "fill": "#1a3a5c",
+    }).text = title
+
+    # Zero line
+    ET.SubElement(svg, "line", {
+        "x1": str(zero_px), "y1": str(margin_top),
+        "x2": str(zero_px), "y2": str(margin_top + n * bar_h),
+        "stroke": "#333", "stroke-width": "1", "stroke-dasharray": "4,3",
+    })
+
+    # Bars
+    for idx, (_, row) in enumerate(plot_df.iterrows()):
+        y = margin_top + idx * bar_h
+        nes = row["NES"]
+        bar_x = min(zero_px, to_px(nes))
+        bar_w = abs(to_px(nes) - zero_px)
+        color = PALETTE["positive"] if nes > 0 else PALETTE["negative"]
+
+        go_id = row["Term"]
+        definition = obo_names.get(go_id, "")
+        tooltip_text = "%s: %s | NES=%.3f FDR=%.3f" % (
+            go_id, definition, nes, row["FDR q-val"]
+        )
+
+        g = ET.SubElement(svg, "g")
+        rect = ET.SubElement(g, "rect", {
+            "x": str(bar_x), "y": str(y + 3),
+            "width": str(max(bar_w, 1)), "height": str(bar_h - 6),
+            "fill": color, "opacity": "0.85",
+            "rx": "2",
+        })
+        ET.SubElement(rect, "title").text = tooltip_text
+
+        # Term label
+        label_x = margin_left - 5
+        label = ET.SubElement(g, "text", {
+            "x": str(label_x), "y": str(y + bar_h // 2 + 4),
+            "text-anchor": "end", "fill": "#222", "font-size": "10",
+        })
+        label.text = go_id
+        ET.SubElement(label, "title").text = tooltip_text
+
+        # FDR label
+        fdr_x = (to_px(nes) + offset * plot_w * 1.5) if nes > 0 \
+                else (to_px(nes) - offset * plot_w * 1.5)
+        fdr_anchor = "start" if nes > 0 else "end"
+        fdr_el = ET.SubElement(g, "text", {
+            "x": str(fdr_x), "y": str(y + bar_h // 2 + 4),
+            "text-anchor": fdr_anchor, "fill": "#555", "font-size": "9",
+        })
+        fdr_el.text = "FDR=%.3f" % row["FDR q-val"]
+
+    # X-axis
+    ax_y = margin_top + n * bar_h + 15
+    ET.SubElement(svg, "line", {
+        "x1": str(margin_left), "y1": str(ax_y),
+        "x2": str(margin_left + plot_w), "y2": str(ax_y),
+        "stroke": "#333", "stroke-width": "1",
+    })
+    ET.SubElement(svg, "text", {
+        "x": str(margin_left + plot_w // 2),
+        "y": str(ax_y + 20),
+        "text-anchor": "middle", "fill": "#333",
+    }).text = "Normalised Enrichment Score (NES)"
+
+    svg_path = os.path.join(plots_dir, "gsea_barplot.svg")
+    ET.ElementTree(svg).write(svg_path, encoding="unicode", xml_declaration=False)
+    logger.info("SVG barplot written to: %s", svg_path)
 
 
 # --- Two-list plots ---
@@ -253,17 +387,13 @@ def make_single_list_plots(
     anchor2mean_path: str,
     results_dir: str,
     plots_dir: str,
+    obo_names: dict[str, str] | None = None,
+    fdr_threshold: float = 0.25,
 ):
-    """Generate all plots for single-list mode.
-
-    Args:
-        anchor2mean_path: Path to anchor2mean.tsv.
-        results_dir:      Directory containing GSEApy results.
-        plots_dir:        Output directory for plots.
-    """
     os.makedirs(plots_dir, exist_ok=True)
     plot_identity_distribution(anchor2mean_path, plots_dir)
-    plot_gsea_barplot(results_dir, plots_dir)
+    plot_gsea_barplot(results_dir, plots_dir,
+                      obo_names=obo_names, fdr_threshold=fdr_threshold)
 
 
 def make_differential_plots(
@@ -272,21 +402,12 @@ def make_differential_plots(
     diff_dir: str,
     plots_dir: str,
     metric: str,
+    obo_names: dict[str, str] | None = None,
+    fdr_threshold: float = 0.25,
 ):
-    """Generate all plots for two-list differential mode.
-
-    Args:
-        tables_dir1: Path to list 1's tables/ directory.
-        tables_dir2: Path to list 2's tables/ directory.
-        diff_dir:    Path to the differential/ output directory.
-        plots_dir:   Output directory for plots.
-        metric:      Differential metric used ('zscore', 'identity', 'rank').
-    """
     os.makedirs(plots_dir, exist_ok=True)
-
     diff_scores = os.path.join(diff_dir, "differential_scores.tsv")
     results_dir = os.path.join(diff_dir, "enrichment")
-
     plot_identity_distribution(
         os.path.join(diff_dir, "anchor2mean.tsv"),
         plots_dir,
@@ -296,5 +417,6 @@ def make_differential_plots(
     plot_differential_distribution(diff_scores, plots_dir, metric=metric)
     plot_gsea_barplot(
         results_dir, plots_dir,
+        obo_names=obo_names, fdr_threshold=fdr_threshold,
         title="Top differentially enriched gene sets"
     )
