@@ -49,13 +49,20 @@ def subset_groups(inputdir: str, subset_dir: str, species: list[str]):
     )
 
 
-def filter_length(input_path: str, length_stats_dir: str, length_filter_dir: str):
-    """Filter sequences in a single FASTA file by length (mean ± 2SD).
+def filter_length(
+    input_path: str,
+    length_stats_dir: str,
+    length_filter_dir: str,
+    sd_multiplier: float = 2.0,
+):
+    """Filter sequences in a single FASTA file by length (mean ± sd_multiplier * SD).
 
     Args:
         input_path:        Path to the input FASTA file.
         length_stats_dir:  Directory where per-group length stats are written.
         length_filter_dir: Directory where filtered FASTA files are written.
+        sd_multiplier:     Number of SDs from the mean beyond which sequences
+                           are removed (default: 2.0).
     """
     if os.stat(input_path).st_size == 0:
         return
@@ -85,7 +92,8 @@ def filter_length(input_path: str, length_stats_dir: str, length_filter_dir: str
     with open(outfile_f_path, "a") as outfile:
         for seq_record in SeqIO.parse(input_path, "fasta"):
             seq = seq_record.seq
-            if (len(seq) < mean - 2 * stddev) or (len(seq) > mean + 2 * stddev):
+            if (len(seq) < mean - sd_multiplier * stddev) or \
+               (len(seq) > mean + sd_multiplier * stddev):
                 logger.warning(
                     "Sequence %s in group %s removed by length filter",
                     seq_record.id, file
@@ -154,9 +162,10 @@ def filter_groups(
         outfile_path = os.path.join(group_filter_dir, file)
 
         records = list(SeqIO.parse(path_to_file, "fasta"))
-        if len(records) < 2:
+        if len(records) < min_sequences:
             logger.warning(
-                "Group %s has fewer than 2 sequences. Group removed.", group_name
+                "Group %s has fewer than %d sequences. Group removed.",
+                group_name, min_sequences
             )
             continue
 

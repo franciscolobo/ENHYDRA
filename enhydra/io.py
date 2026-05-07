@@ -41,29 +41,40 @@ def read_config_file(fh_project, fh_code) -> dict:
 
     parameters = {
         # Required
-        'inputdir':     project.get('inputdir', ''),
-        'outdir':       project.get('outdir', ''),
-        'anchor':       project.get('anchor', ''),
-        'max_process':  int(project.get('max_process', 1)),
-        'mafft':        code.get('mafft', ''),
-        'trimal':       code.get('trimal', ''),
+        'inputdir':        project.get('inputdir', ''),
+        'outdir':          project.get('outdir', ''),
+        'anchor':          project.get('anchor', ''),
+        'max_process':     int(project.get('max_process', 1)),
+        'mafft':           code.get('mafft', ''),
+        'trimal':          code.get('trimal', ''),
+        # Optional tool paths
+        'muscle':          code.get('muscle', ''),
+        'prank':           code.get('prank', ''),
         # Filtering
-        'min_species':  int(project.get('min_species', 4)),
-        'paralogs':     project.get('paralogs', 'all'),
+        'min_species':     int(project.get('min_species', 4)),
+        'min_sequences':   int(project.get('min_sequences', 2)),
+        'paralogs':        project.get('paralogs', 'all'),
+        'length_filter_sd': float(project.get('length_filter_sd', 2.0)),
+        # Alignment
+        'aligner':         project.get('aligner', 'mafft'),
+        'mafft_mode':      project.get('mafft_mode', 'auto'),
         # Ranking
-        'metric':       project.get('metric', 'zscore'),
+        'metric':          project.get('metric', 'zscore'),
         # Gene sets
-        'gene_sets':    project.get('gene_sets', ''),
-        'organism':     project.get('organism', ''),
-        'min_size':     int(project.get('min_size', 5)),
-        'max_size':     int(project.get('max_size', 500)),
-        'permutations': int(project.get('permutations', 1000)),
-        'seed':         int(project.get('seed', 42)),
-        'fdr_threshold': float(project.get('fdr_threshold', 0.25)),
+        'gene_sets':       project.get('gene_sets', ''),
+        'organism':        project.get('organism', ''),
+        'min_size':        int(project.get('min_size', 5)),
+        'max_size':        int(project.get('max_size', 500)),
+        'permutations':    int(project.get('permutations', 1000)),
+        'seed':            int(project.get('seed', 42)),
+        'fdr_threshold':   float(project.get('fdr_threshold', 0.25)),
+        # Report
+        'top_n':           int(project.get('top_n', 20)),
+        'obo_cache':       project.get('obo_cache', ''),
         # Two-list mode
-        'list1':        project.get('list1', ''),
-        'list2':        project.get('list2', ''),
-        'sources':      project.get('sources', 'GO:BP GO:MF GO:CC KEGG REAC'),
+        'list1':           project.get('list1', ''),
+        'list2':           project.get('list2', ''),
+        'sources':         project.get('sources', 'GO:BP GO:MF GO:CC KEGG REAC'),
     }
     return parameters
 

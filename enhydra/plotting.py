@@ -408,11 +408,13 @@ def make_single_list_plots(
     plots_dir: str,
     obo_names: dict[str, str] | None = None,
     fdr_threshold: float = 0.25,
+    top_n: int = 20,
 ):
     os.makedirs(plots_dir, exist_ok=True)
     plot_identity_distribution(anchor2mean_path, plots_dir)
     plot_gsea_barplot(results_dir, plots_dir,
-                      obo_names=obo_names, fdr_threshold=fdr_threshold)
+                      obo_names=obo_names, fdr_threshold=fdr_threshold,
+                      top_n=top_n)
 
 
 def make_differential_plots(
@@ -423,6 +425,7 @@ def make_differential_plots(
     metric: str,
     obo_names: dict[str, str] | None = None,
     fdr_threshold: float = 0.25,
+    top_n: int = 20,
 ):
     os.makedirs(plots_dir, exist_ok=True)
     diff_scores = os.path.join(diff_dir, "differential_scores.tsv")
@@ -437,5 +440,6 @@ def make_differential_plots(
     plot_gsea_barplot(
         results_dir, plots_dir,
         obo_names=obo_names, fdr_threshold=fdr_threshold,
+        top_n=top_n,
         title="Top differentially enriched gene sets"
     )

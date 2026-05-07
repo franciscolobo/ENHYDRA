@@ -7,7 +7,7 @@ import multiprocessing
 from .io import read_config_file, read_species_list
 from .utils import check_parameters
 from .filtering import filter_length, filter_groups, subset_groups
-from .alignment import run_mafft, run_trimal
+from .alignment import run_aligner, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
@@ -44,12 +44,17 @@ def _run_single_list(
     listdir: str,
     anchor: str,
     min_species: int,
+    min_sequences: int,
     mafft_path: str,
     trimal_path: str,
     max_process: int,
     paralog_mode: str,
     require_anchor: bool,
     resume: bool,
+    sd_multiplier: float = 2.0,
+    aligner: str = "mafft",
+    mafft_mode: str = "auto",
+    parameters: dict = None,
     species: list[str] | None = None,
 ):
     """Run steps 1–5 (filter, align, identity, tables) for one species list."""
@@ -88,7 +93,8 @@ def _run_single_list(
         os.makedirs(length_stats_dir, exist_ok=True)
         os.makedirs(length_filter_dir, exist_ok=True)
         args_list = [
-            (os.path.join(source_dir, f), length_stats_dir, length_filter_dir)
+            (os.path.join(source_dir, f), length_stats_dir,
+             length_filter_dir, sd_multiplier)
             for f in inputfiles
         ]
         with multiprocessing.Pool(processes=max_process) as pool:
@@ -101,17 +107,18 @@ def _run_single_list(
             group_filter_dir=group_filter_dir,
             anchor=anchor,
             min_species=min_species,
+            min_sequences=min_sequences,
             paralog_mode=paralog_mode,
             require_anchor=require_anchor,
         )
 
-    logger.info("Step 3: Alignment with MAFFT")
+    logger.info("Step 3: Alignment with %s", aligner.upper())
     if not _should_skip(alignment_dir, "alignment"):
-        run_mafft(
+        run_aligner(
             group_filter_dir=group_filter_dir,
             alignment_dir=alignment_dir,
-            mafft_path=mafft_path,
-            threads=max_process,
+            aligner=aligner,
+            parameters=parameters,
         )
 
     logger.info("Step 4: Identity estimation with trimAl")
@@ -246,22 +253,28 @@ def main():
         sys.exit("Configuration error: %s" % e)
 
     # --- Resolve parameters: CLI overrides config ---
-    min_species   = _resolve(args.min_species,   parameters['min_species'],   4)
-    paralogs      = _resolve(args.paralogs,      parameters['paralogs'],      'all')
-    metric        = _resolve(args.metric,        parameters['metric'],        'zscore')
-    gene_sets     = _resolve(args.gene_sets,     parameters['gene_sets'],     None)
-    organism      = _resolve(args.organism,      parameters['organism'],      None)
-    permutations  = _resolve(args.permutations,  parameters['permutations'],  1000)
-    min_size      = _resolve(args.min_size,      parameters['min_size'],      5)
-    max_size      = _resolve(args.max_size,      parameters['max_size'],      500)
-    seed          = _resolve(args.seed,          parameters['seed'],          42)
-    fdr_threshold = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
-    list1_path    = _resolve(args.list1,         parameters['list1'],         None)
-    list2_path    = _resolve(args.list2,         parameters['list2'],         None)
-    sources_raw   = _resolve(args.sources,       parameters['sources'],
-                             'GO:BP GO:MF GO:CC KEGG REAC')
-    sources = sources_raw if isinstance(sources_raw, list) \
-              else sources_raw.split()
+    min_species    = _resolve(args.min_species,   parameters['min_species'],   4)
+    min_sequences  = parameters['min_sequences']
+    paralogs       = _resolve(args.paralogs,      parameters['paralogs'],      'all')
+    metric         = _resolve(args.metric,        parameters['metric'],        'zscore')
+    gene_sets      = _resolve(args.gene_sets,     parameters['gene_sets'],     None)
+    organism       = _resolve(args.organism,      parameters['organism'],      None)
+    permutations   = _resolve(args.permutations,  parameters['permutations'],  1000)
+    min_size       = _resolve(args.min_size,      parameters['min_size'],      5)
+    max_size       = _resolve(args.max_size,      parameters['max_size'],      500)
+    seed           = _resolve(args.seed,          parameters['seed'],          42)
+    fdr_threshold  = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
+    list1_path     = _resolve(args.list1,         parameters['list1'],         None)
+    list2_path     = _resolve(args.list2,         parameters['list2'],         None)
+    sources_raw    = _resolve(args.sources,       parameters['sources'],
+                              'GO:BP GO:MF GO:CC KEGG REAC')
+    sources        = sources_raw if isinstance(sources_raw, list) \
+                     else sources_raw.split()
+    sd_multiplier  = parameters['length_filter_sd']
+    aligner        = parameters['aligner']
+    mafft_mode     = parameters['mafft_mode']
+    top_n          = parameters['top_n']
+    obo_cache      = _resolve(args.obo_cache, parameters['obo_cache'], None)
 
     # Validate gene set source
     if not gene_sets and not organism:
@@ -307,10 +320,15 @@ def main():
     common_kwargs = dict(
         inputdir=parameters['inputdir'],
         min_species=min_species,
+        min_sequences=min_sequences,
         mafft_path=parameters['mafft'],
         trimal_path=parameters['trimal'],
         max_process=parameters['max_process'],
         paralog_mode=paralogs,
+        sd_multiplier=sd_multiplier,
+        aligner=aligner,
+        mafft_mode=mafft_mode,
+        parameters=parameters,
         resume=args.resume,
     )
 
@@ -367,16 +385,18 @@ def main():
             )
 
         logger.info("Generating plots")
-        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
-            if args.obo_cache else None
+        obo_path = os.path.join(obo_cache, "go-basic.obo") \
+            if obo_cache else None
         from .report import _parse_obo_names
-        obo_names = _parse_obo_names(obo_path) if obo_path and os.path.isfile(obo_path) else {}
+        obo_names = _parse_obo_names(obo_path) \
+            if obo_path and os.path.isfile(obo_path) else {}
         make_single_list_plots(
             anchor2mean_path=raw_anchor2mean,
             results_dir=results_dir,
             plots_dir=os.path.join(outdir, "plots"),
             obo_names=obo_names,
             fdr_threshold=fdr_threshold,
+            top_n=top_n,
         )
 
         logger.info("Building HTML report")
@@ -451,10 +471,11 @@ def main():
             )
 
         logger.info("Generating differential plots")
-        obo_path = os.path.join(args.obo_cache, "go-basic.obo") \
-            if args.obo_cache else None
+        obo_path = os.path.join(obo_cache, "go-basic.obo") \
+            if obo_cache else None
         from .report import _parse_obo_names
-        obo_names = _parse_obo_names(obo_path) if obo_path and os.path.isfile(obo_path) else {}
+        obo_names = _parse_obo_names(obo_path) \
+            if obo_path and os.path.isfile(obo_path) else {}
         make_differential_plots(
             tables_dir1=tables_dir1,
             tables_dir2=tables_dir2,
@@ -463,6 +484,7 @@ def main():
             metric=metric,
             obo_names=obo_names,
             fdr_threshold=fdr_threshold,
+            top_n=top_n,
         )
 
         logger.info("Building HTML report")
