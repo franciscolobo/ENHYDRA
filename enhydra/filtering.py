@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import random
 import shutil
@@ -5,7 +7,6 @@ import logging
 import statistics
 import numpy as np
 from Bio import SeqIO
-from Bio.Seq import Seq
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ def subset_groups(inputdir: str, subset_dir: str, species: list[str]):
     )
 
 
-input_path: str, length_stats_dir: str, length_filter_dir: str):
+def filter_length(input_path: str, length_stats_dir: str, length_filter_dir: str):
     """Filter sequences in a single FASTA file by length (mean ± 2SD).
 
     Args:
@@ -75,7 +76,8 @@ input_path: str, length_stats_dir: str, length_filter_dir: str):
     length_data_sorted = {keys[i]: values[i] for i in sorted_idx}
     with open(outfile_s_path, "a") as outstats:
         outstats.write("##Overall sequence length stats\n")
-        outstats.write("Total seqs: %s\nAverage: %s\nMedian: %s\nSD: %s\n" % (len(lengths), mean, median, stddev))
+        outstats.write("Total seqs: %s\nAverage: %s\nMedian: %s\nSD: %s\n" % (
+            len(lengths), mean, median, stddev))
         outstats.write("##Sequence lengths (sorted from smallest to largest)\n")
         outstats.write("#SequenceID\tLength\tPercentageDifFromAvg\n")
         for key, value in length_data_sorted.items():
@@ -84,7 +86,10 @@ input_path: str, length_stats_dir: str, length_filter_dir: str):
         for seq_record in SeqIO.parse(input_path, "fasta"):
             seq = seq_record.seq
             if (len(seq) < mean - 2 * stddev) or (len(seq) > mean + 2 * stddev):
-                logger.warning("Sequence %s in group %s removed by length filter", seq_record.id, file)
+                logger.warning(
+                    "Sequence %s in group %s removed by length filter",
+                    seq_record.id, file
+                )
             else:
                 outfile.write(">%s\n%s\n" % (seq_record.id, seq))
 
@@ -98,7 +103,7 @@ def _resolve_paralogs_longest(records: list) -> list:
     Returns:
         Filtered list with at most one record per species.
     """
-    best: dict[str, object] = {}  # species_id → SeqRecord
+    best: dict[str, object] = {}
     for record in records:
         species_id = record.id.split("|")[0]
         current = best.get(species_id)
@@ -107,7 +112,9 @@ def _resolve_paralogs_longest(records: list) -> list:
         else:
             current_len = len(current.seq)
             new_len = len(record.seq)
-            if new_len > current_len or (new_len == current_len and random.random() < 0.5):
+            if new_len > current_len or (
+                new_len == current_len and random.random() < 0.5
+            ):
                 best[species_id] = record
     return list(best.values())
 
@@ -127,15 +134,13 @@ def filter_groups(
         group_filter_dir:  Directory where passing groups are written.
         anchor:            Species ID used for annotation mapping.
         min_species:       Minimum number of distinct species required.
-        paralog_mode:      How to handle paralogs (multiple sequences per species):
+        paralog_mode:      How to handle paralogs:
                            'all'     — keep all sequences (default).
                            'remove'  — discard any group containing paralogs.
-                           'longest' — keep only the longest sequence per species,
-                                       breaking ties at random.
-        require_anchor:    If True (default, single-list mode), discard groups
-                           that do not contain the anchor species. If False
-                           (two-list differential mode), anchor presence is not
-                           required — groups are matched across lists by OG ID.
+                           'longest' — keep only the longest per species.
+        require_anchor:    If True (single-list mode), discard groups that do
+                           not contain the anchor species. If False (two-list
+                           mode), anchor presence is not required.
     """
     if paralog_mode not in PARALOG_MODES:
         raise ValueError(
@@ -172,7 +177,6 @@ def filter_groups(
             )
             continue
 
-        # Paralog handling
         has_paralogs = len(species_ids) > len(uniq_ids)
         if has_paralogs:
             if paralog_mode == "remove":
@@ -184,7 +188,7 @@ def filter_groups(
             elif paralog_mode == "longest":
                 records = _resolve_paralogs_longest(records)
                 logger.info(
-                    "Group %s: paralogs resolved by keeping longest sequence per species.",
+                    "Group %s: paralogs resolved by keeping longest per species.",
                     group_name
                 )
 

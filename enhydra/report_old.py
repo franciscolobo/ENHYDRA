@@ -27,7 +27,7 @@ body {{ font-family: Arial, sans-serif; margin: 0; padding: 0;
 header {{ background: #1a3a5c; color: white; padding: 24px 40px; }}
 header h1 {{ margin: 0; font-size: 1.8em; }}
 header p  {{ margin: 4px 0 0; font-size: 0.95em; opacity: 0.85; }}
-main {{ max-width: 1300px; margin: 32px auto; padding: 0 24px; }}
+main {{ max-width: 1200px; margin: 32px auto; padding: 0 24px; }}
 section {{ background: white; border-radius: 8px;
            box-shadow: 0 1px 4px rgba(0,0,0,0.1);
            padding: 28px 32px; margin-bottom: 28px; }}
@@ -53,10 +53,6 @@ thead tr.filter-row th input {{
     width: 100%; box-sizing: border-box; font-size: 11px;
     padding: 3px; border: 1px solid #ccc; border-radius: 3px; }}
 thead tr.filter-row th {{ padding: 4px 8px; }}
-.svg-tooltip {{ position: fixed; background: #333; color: #fff;
-                padding: 8px 12px; border-radius: 4px; font-size: 12px;
-                max-width: 320px; line-height: 1.5; pointer-events: none;
-                z-index: 2000; display: none; white-space: normal; }}
 #modal-overlay {{ display: none; position: fixed; top: 0; left: 0;
                   width: 100%; height: 100%; background: rgba(0,0,0,0.6);
                   z-index: 1000; justify-content: center; align-items: center; }}
@@ -76,8 +72,6 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
   <h1>{title}</h1>
   <p>ENHYDRA &mdash; Gene Set Enrichment Analysis for evolutionary genomics</p>
 </header>
-
-<div id="svg-tooltip" class="svg-tooltip"></div>
 
 <div id="modal-overlay">
   <div id="modal-box">
@@ -110,24 +104,9 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 <script>
 {plot_data_js}
 $(document).ready(function() {{
-
-    // SVG bar tooltips
-    var tip = document.getElementById('svg-tooltip');
-    document.querySelectorAll('[data-tip]').forEach(function(el) {{
-        el.addEventListener('mousemove', function(e) {{
-            tip.innerHTML = this.getAttribute('data-tip');
-            tip.style.display = 'block';
-            tip.style.left = (e.clientX + 15) + 'px';
-            tip.style.top  = (e.clientY + 15) + 'px';
-        }});
-        el.addEventListener('mouseleave', function() {{
-            tip.style.display = 'none';
-        }});
-    }});
-
-    // Per-column filters
-    var numericCols = {numeric_col_indices};
-    var colFilters = {{}};
+    // Numeric expression filtering for NES, p-value, FDR only
+    var numericCols = new Set([2, 3, 4,5,6]);
+    var colFilters  = {{}};  // col index → {{ op, num }} or {{ text }}
 
     $.fn.dataTable.ext.search.push(function(settings, data) {{
         for (var i in colFilters) {{
@@ -148,34 +127,33 @@ $(document).ready(function() {{
         return true;
     }});
 
-    var table = $('#results-table').DataTable({{
-        pageLength: 25,
-        orderCellsTop: true,
-        order: [[4, 'asc']],
-        columnDefs: [{{ targets: numericCols, type: 'num' }}]
-    }});
-
     $('#results-table thead tr.filter-row th').each(function(i) {{
-        var isNumeric = numericCols.indexOf(i) !== -1;
-        var placeholder = isNumeric ? "e.g. < 0.05" : "Filter...";
+        var placeholder = numericCols.has(i) ? "e.g. < 0.05" : "Filter...";
         var input = $('<input type="text" placeholder="' + placeholder + '"/>');
         $(this).html(input);
         input.on('keyup change', function() {{
             var val = this.value.trim();
             if (val === '') {{
                 delete colFilters[i];
-            }} else if (isNumeric) {{
+            }} else if (numericCols.has(i)) {{
                 var m = val.match(/^([<>=!]=?)\s*([\d.eE+\-]+)$/);
-                if (m) colFilters[i] = {{ op: m[1], num: parseFloat(m[2]) }};
-                else delete colFilters[i];
+                if (m) {{
+                    colFilters[i] = {{ op: m[1], num: parseFloat(m[2]) }};
+                }} else {{
+                    delete colFilters[i];
+                }}
             }} else {{
                 colFilters[i] = {{ text: val.toLowerCase() }};
             }}
             table.draw();
         }});
     }});
-
-    // GO enrichment plot modal
+    var table = $('#results-table').DataTable({{
+        pageLength: 25,
+        orderCellsTop: true,
+        order: [[4, 'asc']],
+        columnDefs: [{{ targets: [2,3,4,5,6], type: 'num' }}]
+    }});
     $(document).on('click', '.go-link', function(e) {{
         e.preventDefault();
         var goId = $(this).data('goid');
@@ -189,7 +167,6 @@ $(document).ready(function() {{
     $('#modal-close, #modal-overlay').on('click', function(e) {{
         if (e.target === this) $('#modal-overlay').removeClass('active');
     }});
-
 }});
 </script>
 </body>
@@ -253,6 +230,7 @@ def _parse_obo_names(obo_path: str) -> dict[str, str]:
 
 
 def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
+    """Load and clean GSEApy prerank results, writing a processed TSV."""
     path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
     if not os.path.isfile(path):
         logger.warning("GSEA results not found: %s", path)
@@ -260,7 +238,7 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
 
     df = pd.read_csv(path)
 
-    # Convert Tag% (e.g. "1/10") to 0-1 float
+    # Convert Tag% (e.g. "1/10") to float
     if "Tag %" in df.columns:
         def _tag(v):
             try:
@@ -282,8 +260,11 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
                 return None
         df["Gene %"] = df["Gene %"].apply(_gene)
 
+    # Write processed intermediate file
     processed_path = os.path.join(results_dir, "gsea_results_processed.tsv")
     df.to_csv(processed_path, sep="\t", index=False)
+    logger.info("Processed GSEA results written to: %s", processed_path)
+
     return df
 
 
@@ -296,7 +277,8 @@ def _build_enrichment_plot_index(results_dir: str) -> dict[str, str]:
         if not filename.endswith(".png"):
             continue
         go_id = filename.replace(".png", "").replace("_", ":", 1)
-        index[go_id] = _img_to_base64(os.path.join(prerank_dir, filename))
+        png_path = os.path.join(prerank_dir, filename)
+        index[go_id] = _img_to_base64(png_path)
     logger.info("Indexed %d enrichment plot(s).", len(index))
     return index
 
@@ -306,12 +288,12 @@ def _results_table_html(
     obo_names: dict[str, str],
     plot_index: dict[str, str],
     fdr_threshold: float = 0.25,
-) -> tuple[str, list[int]]:
+) -> str:
     df = df.copy()
 
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
-        return "<p>No results to display.</p>", []
+        return "<p>No results to display.</p>"
 
     df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
 
@@ -325,16 +307,31 @@ def _results_table_html(
         lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
 
+    # (source_col, display_name, tooltip)
     col_defs = [
-        ("Term",       "GO ID",      "Gene Ontology term identifier."),
-        ("GO Term",    "Term name",  "Human-readable name of the GO term."),
-        ("NES",        "NES",        "Normalised Enrichment Score. Positive = more conserved, negative = faster evolving."),
-        ("NOM p-val",  "p-value",    "Nominal p-value from permutation testing."),
-        ("FDR q-val",  "FDR",        "False Discovery Rate q-value. Significant below %.2f." % fdr_threshold),
-        ("Tag %",      "Tag %",      "Fraction of gene set genes in the leading edge (0-1)."),
-        ("Gene %",     "Gene %",     "Fraction of all ranked genes in the leading edge (0-1)."),
-        ("Significant","Sig.",       "Significant at FDR < %.2f." % fdr_threshold),
+        ("Term",       "GO ID",
+         "Gene Ontology term identifier."),
+        ("GO Term",    "Term name",
+         "Human-readable name of the GO term."),
+        ("NES",        "NES",
+         "Normalised Enrichment Score. Positive = enriched at top of ranking "
+         "(more conserved). Negative = enriched at bottom (faster evolving)."),
+        ("NOM p-val",  "p-value",
+         "Nominal p-value from permutation testing. Not corrected for "
+         "multiple testing."),
+        ("FDR q-val",  "FDR",
+         "False Discovery Rate q-value. Gene sets below %.2f are significant."
+         % fdr_threshold),
+        ("Tag %",      "Tag %",
+         "Percentage of genes in the leading edge subset relative to the "
+         "total number of genes in the gene set."),
+        ("Gene %",     "Gene %",
+         "Percentage of genes in the leading edge subset relative to all "
+         "genes in the ranked list."),
+        ("Significant","Sig.",
+         "Significant at FDR < %.2f." % fdr_threshold),
     ]
+
     col_defs = [(s, d, t) for s, d, t in col_defs
                 if s in df.columns or s in ("GO Term", "Significant")]
 
@@ -344,8 +341,10 @@ def _results_table_html(
     table_df.columns = display_names
 
     numeric_display_names = {"NES", "p-value", "FDR", "Tag %", "Gene %"}
-    numeric_col_indices = [i for i, n in enumerate(display_names)
-                           if n in numeric_display_names]
+    numeric_col_indices = [
+        i for i, name in enumerate(display_names)
+        if name in numeric_display_names
+    ]
 
     header_cells = "".join(
         '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
@@ -358,44 +357,42 @@ def _results_table_html(
     for _, row in table_df.iterrows():
         sig_class = ' class="sig-row"' if row.get("Sig.") == "✓" else ""
         go_id = row.get("GO ID", "")
+        has_plot = go_id in plot_index
         cells = ""
         for col, val in row.items():
-            if col == "GO ID" and go_id in plot_index:
-                cells += '<td><a href="#" class="go-link" data-goid="%s">%s</a></td>' \
-                         % (go_id, val)
+            if col == "GO ID" and has_plot:
+                cells += (
+                    '<td><a href="#" class="go-link" data-goid="%s">%s</a></td>'
+                    % (go_id, val)
+                )
             else:
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
 
-    html = (
+    return (
         '<table id="results-table" class="display compact" style="width:100%%">'
-        "<thead><tr>%s</tr><tr class=\"filter-row\">%s</tr></thead>"
-        "<tbody>%s</tbody></table>"
-    ) % (header_cells, filter_cells, rows)
-
-    return html, numeric_col_indices
+        "<thead>"
+        "<tr>%s</tr>"
+        '<tr class="filter-row">%s</tr>'
+        "</thead>"
+        "<tbody>%s</tbody>"
+        "</table>"
+    ) % (header_cells, filter_cells, rows), numeric_col_indices
 
 
 def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
     html = ""
     for stem, caption in names:
-        svg_path = os.path.join(plots_dir, stem + ".svg")
         png_path = os.path.join(plots_dir, stem + ".png")
-        if os.path.isfile(svg_path):
-            with open(svg_path, encoding="utf-8") as fh:
-                svg_content = fh.read()
-            html += (
-                '<div class="plot-block">'
-                '<p class="plot-caption">%s (hover bars for GO definitions)</p>'
-                '%s</div>'
-            ) % (caption, svg_content)
-        elif os.path.isfile(png_path):
-            uri = _img_to_base64(png_path)
-            html += (
-                '<div class="plot-block">'
-                '<p class="plot-caption">%s</p>'
-                '<img src="%s" alt="%s"/></div>'
-            ) % (caption, uri, caption)
+        if not os.path.isfile(png_path):
+            continue
+        uri = _img_to_base64(png_path)
+        html += (
+            '<div class="plot-block">'
+            '<p class="plot-caption">%s</p>'
+            '<img src="%s" alt="%s"/>'
+            "</div>"
+        ) % (caption, uri, caption)
     return html
 
 
@@ -415,6 +412,8 @@ def build_report(
     if obo_path and os.path.isfile(obo_path):
         obo_names = _parse_obo_names(obo_path)
         logger.info("Loaded %d GO term names from OBO.", len(obo_names))
+    else:
+        logger.warning("OBO file not provided or not found — term names from GMT only.")
 
     df = _load_gsea_results(results_dir)
     if df is None:
@@ -465,4 +464,5 @@ def build_report(
 
     with open(report_path, "w", encoding="utf-8") as fh:
         fh.write(html)
+
     logger.info("HTML report written to: %s", report_path)

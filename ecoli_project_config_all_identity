@@ -1,0 +1,24 @@
+# --- Input/Output ---
+inputdir    = test_data/ecoli_orthogroups/all
+outdir      = test_data/ecoli_output_all_identity
+anchor      = NC_004431
+max_process = 8
+
+# --- Filtering ---
+min_species = 10        # minimum number of species per orthogroup
+paralogs    = all       # all | remove | longest
+
+# --- Ranking metric ---
+metric      = identity    # zscore | identity | rank
+
+# --- Gene set enrichment ---
+gene_sets   = test_data/gmt/NC_004431_GO_BP.gmt
+min_size    = 5         # minimum number of genes per gene set
+max_size    = 500       # maximum number of genes per gene set
+permutations = 1000
+seed        = 42
+fdr_threshold = 0.2    # significance threshold for plots and report
+
+# --- Two-list differential mode (optional) ---
+# list1      = tests/pathogenic_strains.txt
+# list2      = tests/non_pathogenic_strains.txt

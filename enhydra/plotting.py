@@ -177,20 +177,19 @@ def _save_gsea_barplot_svg(
     import xml.etree.ElementTree as ET
 
     n = len(plot_df)
-    bar_h = 22
-    margin_left = 260
-    margin_right = 130
+    bar_h = 18
+    margin_left = 120   # GO ID labels
+    margin_right = 20   # FDR labels
     margin_top = 50
-    margin_bottom = 40
-    plot_w = 500
+    margin_bottom = 50
+    plot_w = 400
     svg_w = margin_left + plot_w + margin_right
     svg_h = margin_top + n * bar_h + margin_bottom
 
-    x_min = plot_df["NES"].min()
-    x_max = plot_df["NES"].max()
-    pad = max(abs(x_min), abs(x_max)) * 0.25
-    x_min -= pad
-    x_max += pad
+    nes_vals = plot_df["NES"].values
+    x_abs_max = max(abs(nes_vals.min()), abs(nes_vals.max()))
+    x_min = -x_abs_max * 1.05
+    x_max =  x_abs_max * 1.05
 
     def to_px(nes):
         return margin_left + (nes - x_min) / (x_max - x_min) * plot_w
@@ -200,77 +199,97 @@ def _save_gsea_barplot_svg(
     svg = ET.Element("svg", {
         "xmlns": "http://www.w3.org/2000/svg",
         "width": str(svg_w), "height": str(svg_h),
-        "font-family": "Arial, sans-serif", "font-size": "11",
+        "font-family": "Arial, sans-serif",
     })
 
     # Title
     ET.SubElement(svg, "text", {
         "x": str(svg_w // 2), "y": "30",
-        "text-anchor": "middle", "font-size": "13", "font-weight": "bold",
-        "fill": "#1a3a5c",
+        "text-anchor": "middle", "font-size": "13",
+        "font-weight": "bold", "fill": "#1a3a5c",
     }).text = title
 
     # Zero line
     ET.SubElement(svg, "line", {
         "x1": str(zero_px), "y1": str(margin_top),
         "x2": str(zero_px), "y2": str(margin_top + n * bar_h),
-        "stroke": "#333", "stroke-width": "1", "stroke-dasharray": "4,3",
+        "stroke": "#555", "stroke-width": "1", "stroke-dasharray": "4,3",
     })
+
+    # X-axis tick labels
+    for nes_tick in [-x_abs_max, -x_abs_max / 2, 0, x_abs_max / 2, x_abs_max]:
+        tx = to_px(nes_tick)
+        ax_y = margin_top + n * bar_h
+        ET.SubElement(svg, "line", {
+            "x1": str(tx), "y1": str(ax_y),
+            "x2": str(tx), "y2": str(ax_y + 4),
+            "stroke": "#555", "stroke-width": "1",
+        })
+        ET.SubElement(svg, "text", {
+            "x": str(tx), "y": str(ax_y + 15),
+            "text-anchor": "middle", "font-size": "9", "fill": "#555",
+        }).text = "%.2f" % nes_tick
+
+    # X-axis label
+    ET.SubElement(svg, "text", {
+        "x": str(margin_left + plot_w // 2),
+        "y": str(margin_top + n * bar_h + 35),
+        "text-anchor": "middle", "font-size": "11", "fill": "#333",
+    }).text = "Normalised Enrichment Score (NES)"
 
     # Bars
     for idx, (_, row) in enumerate(plot_df.iterrows()):
         y = margin_top + idx * bar_h
         nes = row["NES"]
         bar_x = min(zero_px, to_px(nes))
-        bar_w = abs(to_px(nes) - zero_px)
+        bar_w = max(abs(to_px(nes) - zero_px), 1)
         color = PALETTE["positive"] if nes > 0 else PALETTE["negative"]
 
         go_id = row["Term"]
         definition = obo_names.get(go_id, "")
-        tooltip_text = "%s: %s | NES=%.3f FDR=%.3f" % (
+        tooltip_text = "%s | %s | NES=%.3f | FDR=%.3f" % (
             go_id, definition, nes, row["FDR q-val"]
         )
 
-        g = ET.SubElement(svg, "g")
-        rect = ET.SubElement(g, "rect", {
-            "x": str(bar_x), "y": str(y + 3),
-            "width": str(max(bar_w, 1)), "height": str(bar_h - 6),
-            "fill": color, "opacity": "0.85",
-            "rx": "2",
+        g = ET.SubElement(svg, "g", {
+            "class": "bar-group",
+            "data-tip": tooltip_text,
+            "style": "cursor:pointer;",
         })
-        ET.SubElement(rect, "title").text = tooltip_text
 
-        # Term label
-        label_x = margin_left - 5
-        label = ET.SubElement(g, "text", {
-            "x": str(label_x), "y": str(y + bar_h // 2 + 4),
-            "text-anchor": "end", "fill": "#222", "font-size": "10",
+        # Bar
+        ET.SubElement(g, "rect", {
+            "x": str(bar_x), "y": str(y + 5),
+            "width": str(bar_w), "height": str(bar_h - 10),
+            "fill": color, "opacity": "0.85", "rx": "2",
         })
-        label.text = go_id
-        ET.SubElement(label, "title").text = tooltip_text
+
+        # GO ID label
+        lbl = ET.SubElement(g, "text", {
+            "x": str(margin_left - 6),
+            "y": str(y + bar_h // 2 + 4),
+            "text-anchor": "end",
+            "font-size": "10", "fill": "#1a3a5c",
+        })
+        lbl.text = go_id
 
         # FDR label
-        fdr_x = (to_px(nes) + offset * plot_w * 1.5) if nes > 0 \
-                else (to_px(nes) - offset * plot_w * 1.5)
+        fdr_x = to_px(nes) + 5 if nes > 0 else to_px(nes) - 5
         fdr_anchor = "start" if nes > 0 else "end"
         fdr_el = ET.SubElement(g, "text", {
-            "x": str(fdr_x), "y": str(y + bar_h // 2 + 4),
-            "text-anchor": fdr_anchor, "fill": "#555", "font-size": "9",
+            "x": str(fdr_x),
+            "y": str(y + bar_h // 2 + 4),
+            "text-anchor": fdr_anchor,
+            "font-size": "9", "fill": "#555",
         })
         fdr_el.text = "FDR=%.3f" % row["FDR q-val"]
 
-    # X-axis
-    ax_y = margin_top + n * bar_h + 15
-    ET.SubElement(svg, "line", {
-        "x1": str(margin_left), "y1": str(ax_y),
-        "x2": str(margin_left + plot_w), "y2": str(ax_y),
-        "stroke": "#333", "stroke-width": "1",
-    })
-    ET.SubElement(svg, "text", {
-        "x": str(margin_left + plot_w // 2),
-        "y": str(ax_y + 20),
-        "text-anchor": "middle", "fill": "#333",
-    }).text = "Normalised Enrichment Score (NES)"
+        # Invisible hit area covering the full row for easier hovering
+        ET.SubElement(g, "rect", {
+            "x": str(margin_left), "y": str(y),
+            "width": str(plot_w), "height": str(bar_h),
+            "fill": "transparent",
+        })
 
     svg_path = os.path.join(plots_dir, "gsea_barplot.svg")
     ET.ElementTree(svg).write(svg_path, encoding="unicode", xml_declaration=False)

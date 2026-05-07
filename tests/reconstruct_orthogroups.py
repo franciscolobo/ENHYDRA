@@ -67,17 +67,33 @@ def parse_lcl_id(lcl_id: str) -> str | None:
     return None
 
 
-def parse_protein_id(full_header: str) -> str | None:
+def parse_protein_id(full_header: str, lcl_id: str) -> str:
     """Extract protein_id from a full efetch FASTA header.
 
-    '[protein_id=WP_000870373.1]' → 'WP_000870373.1'
+    First tries to extract from the [protein_id=...] field. If not found,
+    falls back to parsing the protein ID from the lcl-style sequence ID:
+        lcl|NC_004431.1_prot_WP_000361612.1_1 → WP_000361612.1
 
-    Returns the raw lcl ID as fallback if protein_id is not found.
+    Args:
+        full_header: Full sequence description string.
+        lcl_id:      Raw sequence ID (lcl|... style).
+
+    Returns:
+        Protein ID string.
     """
+    # Try [protein_id=...] field first
     match = re.search(r"\[protein_id=([^\]]+)\]", full_header)
     if match:
         return match.group(1)
-    return None
+
+    # Fall back to parsing from lcl ID:
+    # lcl|<accession>_prot_<protein_id>_<index> → <protein_id>
+    if "_prot_" in lcl_id:
+        prot_part = lcl_id.split("_prot_", 1)[1]
+        return "_".join(prot_part.split("_")[:-1])
+
+    # Last resort: return the lcl_id as-is
+    return lcl_id
 
 
 def index_proteomes(proteomes_dir: str) -> dict[str, tuple[str, str, str]]:
@@ -106,7 +122,7 @@ def index_proteomes(proteomes_dir: str) -> dict[str, tuple[str, str, str]]:
 
         for record in SeqIO.parse(path, "fasta"):
             lcl_id = record.id
-            protein_id = parse_protein_id(record.description) or lcl_id
+            protein_id = parse_protein_id(record.description, lcl_id)
             index[lcl_id] = (genome_id, protein_id, str(record.seq))
 
     logger.info("Indexed %d sequences.", len(index))

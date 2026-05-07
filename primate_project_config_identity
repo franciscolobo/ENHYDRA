@@ -1,0 +1,5 @@
+inputdir    = test_data/primates/groups_protein  # full orthogroup set — subsetting done internally
+outdir      = test_data/primates_output_identity
+min_species = 7        # applied independently to each list (~50% of ~40 strains per group)
+anchor      = homo_sapiens # ignored in two-list mode, required by config validation
+max_process = 8

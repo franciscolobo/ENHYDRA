@@ -1,0 +1,34 @@
+# --- Input/Output ---
+inputdir    = test_data/ecoli_orthogroups/all
+outdir      = test_data/ecoli_output
+anchor      = NC_004431
+max_process = 8
+
+# --- Filtering ---
+min_species     = 40        # minimum number of species per orthogroup
+min_sequences   = 2         # minimum sequences per group after length filtering
+paralogs        = all       # all | remove | longest
+length_filter_sd = 2.0      # sequences beyond mean ± (sd * length_filter_sd) are removed
+
+# --- Alignment ---
+aligner     = mafft         # mafft | muscle | prank
+mafft_mode  = auto          # auto | linsi | ginsi | einsi | fftnsi | fftns | nwnsi | nwns
+
+# --- Ranking metric ---
+metric      = zscore        # zscore | identity | rank
+
+# --- Gene set enrichment ---
+gene_sets     = test_data/gmt/NC_004431_GO_BP.gmt
+min_size      = 5
+max_size      = 500
+permutations  = 1000
+seed          = 42
+fdr_threshold = 0.25
+
+# --- Report ---
+top_n       = 20            # number of gene sets shown in barplot
+obo_cache   = test_data/obo_cache
+
+# --- Two-list differential mode (optional) ---
+# list1      = tests/pathogenic_strains.txt
+# list2      = tests/non_pathogenic_strains.txt
