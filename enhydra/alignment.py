@@ -33,11 +33,11 @@ def run_mafft(
         output_seq = os.path.join(alignment_dir, file + ".aln")
 
         if mode == "auto":
-            cmd = [mafft_path, "--auto", "--quiet",
+            cmd = [mafft_path, "--anysymbol", "--auto", "--quiet",
                    "--thread", str(threads), input_seq]
         else:
             # Named modes are standalone executables or flags in newer MAFFT
-            cmd = [mafft_path, "--%s" % mode, "--quiet",
+            cmd = [mafft_path, "--anysymbol", "--%s" % mode, "--quiet",
                    "--thread", str(threads), input_seq]
 
         try:

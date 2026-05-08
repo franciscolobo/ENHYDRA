@@ -2,6 +2,19 @@ import os
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
+def _check_tool(path: str, name: str, code_config: str):
+    """Validate that an external tool path is specified, exists, and is executable."""
+    if not path:
+        raise EnhydraConfigError(
+            "No path to %s was specified in code_config: %s" % (name, code_config))
+    if not os.path.isfile(path):
+        raise EnhydraToolError(
+            "%s executable not found at: %s" % (name, path))
+    if not os.access(path, os.X_OK):
+        raise EnhydraToolError(
+            "No execute permission for %s at: %s" % (name, path))
+
+
 def check_parameters(parameters, code_config):
     if not parameters['inputdir']:
         raise EnhydraConfigError(
@@ -29,22 +42,17 @@ def check_parameters(parameters, code_config):
         raise EnhydraConfigError(
             "max_process was not specified in your project's configuration file.")
 
-    if not parameters['trimal']:
-        raise EnhydraConfigError(
-            "No path to trimal was specified in code_config: %s" % code_config)
-    if not os.path.isfile(parameters['trimal']):
-        raise EnhydraToolError(
-            "trimal executable not found at: %s" % parameters['trimal'])
-    if not os.access(parameters['trimal'], os.X_OK):
-        raise EnhydraToolError(
-            "No execute permission for trimal at: %s" % parameters['trimal'])
+    # trimal is always required
+    _check_tool(parameters['trimal'], "trimal", code_config)
 
-    if not parameters['mafft']:
+    # Only validate the configured aligner
+    aligner = parameters.get('aligner', 'mafft')
+    if aligner == 'mafft':
+        _check_tool(parameters['mafft'], "mafft", code_config)
+    elif aligner == 'muscle':
+        _check_tool(parameters['muscle'], "muscle", code_config)
+    elif aligner == 'prank':
+        _check_tool(parameters['prank'], "prank", code_config)
+    else:
         raise EnhydraConfigError(
-            "No path to mafft was specified in code_config: %s" % code_config)
-    if not os.path.isfile(parameters['mafft']):
-        raise EnhydraToolError(
-            "mafft executable not found at: %s" % parameters['mafft'])
-    if not os.access(parameters['mafft'], os.X_OK):
-        raise EnhydraToolError(
-            "No execute permission for mafft at: %s" % parameters['mafft'])
+            "Unknown aligner '%s'. Choose from: mafft, muscle, prank." % aligner)

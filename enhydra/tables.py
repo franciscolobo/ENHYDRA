@@ -4,6 +4,17 @@ from Bio import SeqIO
 
 logger = logging.getLogger(__name__)
 
+_TABLE_FILES = ("group2mean.tsv", "anchor2mean.tsv", "group2anchor.tsv")
+
+
+def tables_complete(tables_dir: str) -> bool:
+    """Return True only if all three output tables exist and are non-empty."""
+    return all(
+        os.path.isfile(os.path.join(tables_dir, f)) and
+        os.path.getsize(os.path.join(tables_dir, f)) > 0
+        for f in _TABLE_FILES
+    )
+
 
 def make_tables(alignment_dir: str, ident_dir: str, tables_dir: str, anchor: str):
     """Generate ranked output tables from alignments and identity reports.
@@ -16,9 +27,9 @@ def make_tables(alignment_dir: str, ident_dir: str, tables_dir: str, anchor: str
     """
     os.makedirs(tables_dir, exist_ok=True)
     ortho_mean = {}
-    with open(os.path.join(tables_dir, "group2mean.tsv"), "a") as group2mean, \
-         open(os.path.join(tables_dir, "anchor2mean.tsv"), "a") as anchor2mean, \
-         open(os.path.join(tables_dir, "group2anchor.tsv"), "a") as group2anchor:
+    with open(os.path.join(tables_dir, "group2mean.tsv"), "w") as group2mean, \
+         open(os.path.join(tables_dir, "anchor2mean.tsv"), "w") as anchor2mean, \
+         open(os.path.join(tables_dir, "group2anchor.tsv"), "w") as group2anchor:
         for file in os.listdir(ident_dir):
             group_name = file.split(".")[0]
             ident_path = os.path.join(ident_dir, file)

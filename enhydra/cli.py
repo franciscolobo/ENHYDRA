@@ -8,7 +8,7 @@ from .io import read_config_file, read_species_list
 from .utils import check_parameters
 from .filtering import filter_length, filter_groups, subset_groups
 from .alignment import run_aligner, run_trimal
-from .tables import make_tables
+from .tables import make_tables, tables_complete
 from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
 from .differential import compute_differential, normalise_scores
@@ -130,7 +130,7 @@ def _run_single_list(
         )
 
     logger.info("Step 5: Generating tables")
-    if not _should_skip(tables_dir, "table generation"):
+    if not (resume and tables_complete(tables_dir)):
         make_tables(
             alignment_dir=alignment_dir,
             ident_dir=ident_dir,
