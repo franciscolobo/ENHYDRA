@@ -15,7 +15,7 @@ Functional annotations are mapped through an **anchor genome** — a reference s
 1. **[Optional] OrthoFinder preprocessing** — converts OrthoFinder 3 output into ENHYDRA-compatible input.
 2. **Length filtering** — sequences deviating more than 2 standard deviations from the group mean length are removed.
 3. **Group filtering** — groups lacking the anchor species, falling below the minimum species count, or failing paralog criteria are discarded.
-4. **Alignment** — surviving groups are aligned with MAFFT.
+4. **Alignment** — surviving groups are aligned (MAFFT/MUSCLE/PRANK).
 5. **Identity estimation** — trimAl computes per-alignment average sequence identity.
 6. **Table generation** — outputs ranked group-to-identity and anchor gene-to-identity tables.
 7. **GSEA** — GSEApy prerank is run on the ranked gene list using a local GMT file.
@@ -33,6 +33,8 @@ Functional annotations are mapped through an **anchor genome** — a reference s
 | [GSEApy](https://gseapy.readthedocs.io/) | GSEA algorithm |
 | [gprofiler-official](https://pypi.org/project/gprofiler-official/) | g:Profiler API access |
 | [MAFFT](https://mafft.cbrc.jp/alignment/software/) | Multiple sequence alignment |
+| [MUSCLE5](https://drive5.com/muscle/) | Multiple sequence alignment |
+| [PRANK](http://wasabiapp.org/software/prank/) | Multiple sequence alignment |
 | [trimAl](http://trimal.cgenomics.org/) | Alignment identity computation |
 
 Install Python dependencies:
@@ -41,7 +43,7 @@ Install Python dependencies:
 pip install enhydra
 ```
 
-MAFFT and trimAl must be installed separately and their paths provided in the code configuration file.
+MAFFT, MUSCLE, PRANK and trimAl must be installed separately and their paths provided in the code configuration file.
 
 ---
 
@@ -73,7 +75,9 @@ python tests/prepare_ecoli_proteomes.py strain_table.tsv proteomes/
 python tests/remove_pseudogenes.py proteomes/
 ```
 
-The strain table should be a TSV file with columns `genomeID`, `Pathogenicity`, and `plasmidIDs` (pipe-separated, or `-` if none):
+The strain table should be a TSV file with columns `genomeID`, `Phenotype`, and `plasmidIDs` (pipe-separated, or `-` if none):
+
+Phenotypes are used in the two-list mode.
 
 ```
 genomeID    Pathogenicity   plasmidIDs
@@ -142,6 +146,7 @@ max_process = 8
 | `inputdir` | Directory containing input FASTA files (one per homolog group) |
 | `outdir` | Output directory (must not already exist unless `--resume` is used) |
 | `min_species` | Minimum number of distinct species required to retain a group |
+| `aligner` | Alignment tool to use: `mafft` (default), `muscle`, or `prank` |
 | `anchor` | Species ID of the anchor genome used for annotation mapping |
 | `max_process` | Number of parallel processes for the length filtering step |
 
@@ -150,6 +155,8 @@ max_process = 8
 ```
 mafft  = /usr/local/bin/mafft
 trimal = /usr/local/bin/trimal
+muscle = /usr/local/bin/muscle   # optional, required only if aligner = muscle
+prank  = /usr/local/bin/prank    # optional, required only if aligner = prank
 ```
 
 ---
