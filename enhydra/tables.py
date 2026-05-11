@@ -1,6 +1,7 @@
 import os
 import logging
 from Bio import SeqIO
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +16,7 @@ def tables_complete(tables_dir: str) -> bool:
         for f in _TABLE_FILES
     )
 
-
-def make_tables(alignment_dir: str, ident_dir: str, tables_dir: str, anchor: str):
+def make_tables(alignment_dir, ident_dir, tables_dir, anchor, show_progress: bool = False):
     """Generate ranked output tables from alignments and identity reports.
 
     Args:
@@ -24,13 +24,15 @@ def make_tables(alignment_dir: str, ident_dir: str, tables_dir: str, anchor: str
         ident_dir:     Directory of trimAl identity report files.
         tables_dir:    Directory where output tables are written.
         anchor:        Anchor species ID used to map group → gene ID.
+        show_progress: False is verbose, True shows progress bar only.
     """
     os.makedirs(tables_dir, exist_ok=True)
     ortho_mean = {}
     with open(os.path.join(tables_dir, "group2mean.tsv"), "w") as group2mean, \
          open(os.path.join(tables_dir, "anchor2mean.tsv"), "w") as anchor2mean, \
          open(os.path.join(tables_dir, "group2anchor.tsv"), "w") as group2anchor:
-        for file in os.listdir(ident_dir):
+        for file in tqdm(os.listdir(ident_dir), desc="  identity",
+                         unit="group", leave=False, disable=not show_progress):
             group_name = file.split(".")[0]
             ident_path = os.path.join(ident_dir, file)
             with open(ident_path, "r") as ident_file:
@@ -43,7 +45,8 @@ def make_tables(alignment_dir: str, ident_dir: str, tables_dir: str, anchor: str
                         break
                 else:
                     logger.warning("No AverageIdentity found in %s", ident_path)
-        for file in os.listdir(alignment_dir):
+        for file in tqdm(os.listdir(alignment_dir), desc="  anchors",
+                         unit="group", leave=False, disable=not show_progress):
             group_name = file.split(".")[0]
             seq_file = os.path.join(alignment_dir, file)
             if group_name not in ortho_mean:
