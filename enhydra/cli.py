@@ -230,6 +230,7 @@ def _run_single_list(
                 alignment_dir=alignment_dir,
                 ident_dir=ident_dir,
                 trimal_path=trimal_path,
+                n_proc=max_process,
                 show_progress=show_progress,
             )
         sbar.update(1)
