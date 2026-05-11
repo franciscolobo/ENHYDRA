@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .io import parse_obo_names as _parse_obo_names
 
 import os
 import base64

@@ -4,7 +4,9 @@ import logging
 import argparse
 import multiprocessing
 
-from .io import read_config_file, read_species_list
+from tqdm import tqdm
+
+from .io import read_config_file, read_species_list, parse_obo_names
 from .utils import check_parameters
 from .filtering import filter_length, filter_groups, subset_groups
 from .alignment import run_aligner, run_trimal
@@ -17,17 +19,21 @@ from .report import build_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 
-def _setup_logging(outdir: str):
-    """Configure logging to both console and a log file in outdir."""
+def _setup_logging(outdir: str, quiet: bool = False):
+    """Configure logging to both console and a log file in outdir.
+
+    In quiet mode the console handler is raised to WARNING so that only
+    warnings and errors appear on stdout; INFO messages are still written
+    to enhydra.log regardless.
+    """
     log_path = os.path.join(outdir, "enhydra.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_path),
-            logging.StreamHandler(sys.stdout),
-        ]
-    )
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.ERROR if quiet else logging.INFO)
+    logging.basicConfig(level=logging.INFO, format=fmt,
+                        handlers=[file_handler, console_handler])
 
 
 def _resolve(cli_val, config_val, default=None):
@@ -37,6 +43,15 @@ def _resolve(cli_val, config_val, default=None):
     if config_val not in (None, ''):
         return config_val
     return default
+
+
+def _filter_length_star(args):
+    """Unpack args tuple and call filter_length.
+
+    Required at module level so multiprocessing can pickle it when
+    pool.imap_unordered is used in place of pool.starmap.
+    """
+    return filter_length(*args)
 
 
 def _run_single_list(
@@ -56,17 +71,20 @@ def _run_single_list(
     mafft_mode: str = "auto",
     parameters: dict = None,
     species: list[str] | None = None,
+    show_progress: bool = False,
+    label: str = "",
 ):
     """Run steps 1–5 (filter, align, identity, tables) for one species list."""
     logger = logging.getLogger(__name__)
 
     def _should_skip(step_dir: str, step_name: str) -> bool:
         if resume and os.path.isdir(step_dir):
-            logger.info(
-                "Skipping %s (output already exists: %s)", step_name, step_dir
-            )
+            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
             return True
         return False
+
+    def _desc(step: str) -> str:
+        return ("%s: %s" % (label, step)) if label else step
 
     subset_dir        = os.path.join(listdir, "subset")
     length_stats_dir  = os.path.join(listdir, "length_stats")
@@ -78,67 +96,112 @@ def _run_single_list(
 
     os.makedirs(listdir, exist_ok=True)
 
-    # Step 0 (two-list mode only): subset groups to species list
-    if species is not None:
-        if not _should_skip(subset_dir, "subsetting"):
-            subset_groups(inputdir, subset_dir, species)
-        source_dir = subset_dir
-    else:
-        source_dir = inputdir
+    n_steps = 6 if species is not None else 5
 
-    inputfiles = os.listdir(source_dir)
+    with tqdm(total=n_steps, desc=_desc("starting"),
+              unit="step", disable=not show_progress, leave=True) as sbar:
 
-    logger.info("Step 1: Length filtering")
-    if not _should_skip(length_filter_dir, "length filtering"):
-        os.makedirs(length_stats_dir, exist_ok=True)
-        os.makedirs(length_filter_dir, exist_ok=True)
-        args_list = [
-            (os.path.join(source_dir, f), length_stats_dir,
-             length_filter_dir, sd_multiplier)
-            for f in inputfiles
-        ]
-        with multiprocessing.Pool(processes=max_process) as pool:
-            pool.starmap(filter_length, args_list)
+        # Step 0 (two-list only): subset groups to species list
+        if species is not None:
+            sbar.set_description(_desc("subsetting"))
+            if not _should_skip(subset_dir, "subsetting"):
+                subset_groups(inputdir, subset_dir, species,
+                              show_progress=show_progress)
+            source_dir = subset_dir
+            sbar.update(1)
+        else:
+            source_dir = inputdir
 
-    logger.info("Step 2: Group filtering")
-    if not _should_skip(group_filter_dir, "group filtering"):
-        filter_groups(
-            length_filter_dir=length_filter_dir,
-            group_filter_dir=group_filter_dir,
-            anchor=anchor,
-            min_species=min_species,
-            min_sequences=min_sequences,
-            paralog_mode=paralog_mode,
-            require_anchor=require_anchor,
-        )
+        # Step 1: length filtering
+        sbar.set_description(_desc("length filter"))
+        logger.info("Step 1: Length filtering")
+        if not _should_skip(length_filter_dir, "length filtering"):
+            os.makedirs(length_stats_dir, exist_ok=True)
+            os.makedirs(length_filter_dir, exist_ok=True)
+            files = os.listdir(source_dir)
+            args_list = [
+                (os.path.join(source_dir, f), length_stats_dir,
+                 length_filter_dir, sd_multiplier)
+                for f in files
+            ]
+            with multiprocessing.Pool(processes=max_process) as pool:
+                try:
+                    list(tqdm(
+                        pool.imap_unordered(_filter_length_star, args_list),
+                        total=len(args_list),
+                        desc="  groups",
+                        unit="group",
+                        leave=False,
+                        disable=not show_progress,
+                    ))
+                except Exception as e:
+                    pool.terminate()
+                    raise EnhydraToolError(
+                        "Length filtering failed: %s" % e
+                    ) from e
+        sbar.update(1)
 
-    logger.info("Step 3: Alignment with %s", aligner.upper())
-    if not _should_skip(alignment_dir, "alignment"):
-        run_aligner(
-            group_filter_dir=group_filter_dir,
-            alignment_dir=alignment_dir,
-            aligner=aligner,
-            parameters=parameters,
-        )
+        # Step 2: group filtering
+        sbar.set_description(_desc("group filter"))
+        logger.info("Step 2: Group filtering")
+        if not _should_skip(group_filter_dir, "group filtering"):
+            filter_groups(
+                length_filter_dir=length_filter_dir,
+                group_filter_dir=group_filter_dir,
+                anchor=anchor,
+                min_species=min_species,
+                min_sequences=min_sequences,
+                paralog_mode=paralog_mode,
+                require_anchor=require_anchor,
+                show_progress=show_progress,
+            )
+        sbar.update(1)
 
-    logger.info("Step 4: Identity estimation with trimAl")
-    if not _should_skip(ident_dir, "identity estimation"):
-        run_trimal(
-            alignment_dir=alignment_dir,
-            ident_dir=ident_dir,
-            trimal_path=trimal_path,
-        )
+        # Step 3: alignment
+        sbar.set_description(_desc("alignment"))
+        logger.info("Step 3: Alignment with %s", aligner.upper())
+        if not _should_skip(alignment_dir, "alignment"):
+            run_aligner(
+                group_filter_dir=group_filter_dir,
+                alignment_dir=alignment_dir,
+                aligner=aligner,
+                parameters=parameters,
+                show_progress=show_progress,
+            )
+        sbar.update(1)
 
-    logger.info("Step 5: Generating tables")
-    if not (resume and tables_complete(tables_dir)):
-        make_tables(
-            alignment_dir=alignment_dir,
-            ident_dir=ident_dir,
-            tables_dir=tables_dir,
-            anchor=anchor,
-        )
+        # Step 4: identity estimation
+        sbar.set_description(_desc("identity"))
+        logger.info("Step 4: Identity estimation with trimAl")
+        if not _should_skip(ident_dir, "identity estimation"):
+            run_trimal(
+                alignment_dir=alignment_dir,
+                ident_dir=ident_dir,
+                trimal_path=trimal_path,
+                show_progress=show_progress,
+            )
+        sbar.update(1)
 
-    return tables_dir
+        # Step 5: tables
+        sbar.set_description(_desc("tables"))
+        logger.info("Step 5: Generating tables")
+        if not (resume and tables_complete(tables_dir)):
+            make_tables(
+                alignment_dir=alignment_dir,
+                ident_dir=ident_dir,
+                tables_dir=tables_dir,
+                anchor=anchor,
+                show_progress=show_progress,
+            )
+        sbar.update(1)
+        sbar.set_description(_desc("done"))
+
+    stats = {
+        "n_input":         len(os.listdir(source_dir)),
+        "n_length_filter": len(os.listdir(length_filter_dir)) if os.path.isdir(length_filter_dir) else 0,
+        "n_group_filter":  len(os.listdir(group_filter_dir))  if os.path.isdir(group_filter_dir)  else 0,
+    }
+    return tables_dir, stats
 
 
 def _build_arg_parser():
@@ -147,24 +210,24 @@ def _build_arg_parser():
         description="Gene Set Enrichment Analysis for evolutionary genomics."
     )
 
-    # --- Positional arguments ---
     parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
 
-    # --- Input mode ---
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--orthofinder-dir",
         help="Path to an OrthoFinder 3 output directory."
     )
 
-    # --- Run control ---
     parser.add_argument(
         "--resume", action="store_true", default=False,
         help="Resume a previously interrupted run."
     )
-
-    # --- Filtering (override config) ---
+    parser.add_argument(
+        "--quiet", action="store_true", default=False,
+        help="Suppress INFO messages on the console and show progress bars instead. "
+             "All messages are still written to enhydra.log."
+    )
     parser.add_argument(
         "--paralogs", choices=["all", "remove", "longest"], default=None,
         help="Paralog handling strategy. Overrides config 'paralogs'."
@@ -174,7 +237,6 @@ def _build_arg_parser():
         help="Minimum species per group. Overrides config 'min_species'."
     )
 
-    # --- Two-list differential mode ---
     diff_group = parser.add_argument_group("two-list differential mode")
     diff_group.add_argument(
         "--list1", default=None,
@@ -189,7 +251,6 @@ def _build_arg_parser():
         help="Differential/ranking metric. Overrides config 'metric'."
     )
 
-    # --- Gene set source (override config) ---
     gmt_group = parser.add_mutually_exclusive_group()
     gmt_group.add_argument(
         "--organism", default=None,
@@ -200,46 +261,48 @@ def _build_arg_parser():
         help="Path to a local .gmt file. Overrides config 'gene_sets'."
     )
 
-    # --- GSEA options (override config) ---
-    parser.add_argument(
-        "--sources", nargs="+", default=None,
-        help="g:Profiler data sources. Overrides config 'sources'."
-    )
-    parser.add_argument(
-        "--permutations", type=int, default=None,
-        help="Number of GSEA permutations. Overrides config 'permutations'."
-    )
-    parser.add_argument(
-        "--min-size", type=int, default=None,
-        help="Minimum gene set size. Overrides config 'min_size'."
-    )
-    parser.add_argument(
-        "--max-size", type=int, default=None,
-        help="Maximum gene set size. Overrides config 'max_size'."
-    )
-    parser.add_argument(
-        "--seed", type=int, default=None,
-        help="Random seed. Overrides config 'seed'."
-    )
-    parser.add_argument(
-        "--fdr-threshold", type=float, default=None,
-        help="FDR significance threshold. Overrides config 'fdr_threshold'."
-    )
-
-    # --- Report ---
-    parser.add_argument(
-        "--obo-cache", default=None,
-        help="Directory containing cached go-basic.obo file."
-    )
+    parser.add_argument("--sources", nargs="+", default=None)
+    parser.add_argument("--permutations", type=int, default=None)
+    parser.add_argument("--min-size", type=int, default=None)
+    parser.add_argument("--max-size", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--fdr-threshold", type=float, default=None)
+    parser.add_argument("--obo-cache", default=None)
 
     return parser
+
+def _log_summary(
+    stats: dict,
+    results_dir: str,
+    fdr_threshold: float,
+    label: str = "",
+):
+    """Log a concise end-of-run summary to INFO."""
+    logger = logging.getLogger(__name__)
+    prefix = ("[%s] " % label) if label else ""
+    n_tested = n_sig = 0
+    gsea_csv = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if os.path.isfile(gsea_csv):
+        import pandas as _pd
+        df = _pd.read_csv(gsea_csv)
+        n_tested = len(df)
+        n_sig = int((df["FDR q-val"] < fdr_threshold).sum())
+    logger.info("")
+    logger.info("=" * 52)
+    logger.info("%sENHYDRA RUN SUMMARY", prefix)
+    logger.info("=" * 52)
+    logger.info("  Input groups:             %d", stats["n_input"])
+    logger.info("  After length filter:      %d", stats["n_length_filter"])
+    logger.info("  After group filter:       %d", stats["n_group_filter"])
+    logger.info("  Gene sets tested:         %d", n_tested)
+    logger.info("  Significant (FDR < %.2f): %d", fdr_threshold, n_sig)
+    logger.info("=" * 52)
 
 
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    # --- Read config ---
     try:
         with open(args.project_config, "r") as fh_project, \
              open(args.code_config, "r") as fh_code:
@@ -252,7 +315,6 @@ def main():
     except (EnhydraConfigError, EnhydraIOError, EnhydraToolError) as e:
         sys.exit("Configuration error: %s" % e)
 
-    # --- Resolve parameters: CLI overrides config ---
     min_species    = _resolve(args.min_species,   parameters['min_species'],   4)
     min_sequences  = parameters['min_sequences']
     paralogs       = _resolve(args.paralogs,      parameters['paralogs'],      'all')
@@ -276,14 +338,12 @@ def main():
     top_n          = parameters['top_n']
     obo_cache      = _resolve(args.obo_cache, parameters['obo_cache'], None)
 
-    # Validate gene set source
     if not gene_sets and not organism:
         parser.error(
             "A gene set source is required. Set 'gene_sets' or 'organism' "
             "in your project config, or use --gene-sets / --organism."
         )
 
-    # Validate two-list mode
     two_list_mode = bool(list1_path or list2_path)
     if two_list_mode and not (list1_path and list2_path):
         parser.error(
@@ -291,7 +351,6 @@ def main():
             "(in config or via --list1/--list2)."
         )
 
-    # --- Set up output directory and logging ---
     outdir = parameters['outdir']
     if os.path.isdir(outdir) and not args.resume:
         sys.exit(
@@ -300,15 +359,16 @@ def main():
         )
     os.makedirs(outdir, exist_ok=True)
 
-    _setup_logging(outdir)
+    _setup_logging(outdir, quiet=args.quiet)
     logger = logging.getLogger(__name__)
     logger.info("Welcome to Enhydra")
-    logger.info("Resolved parameters: metric=%s, paralogs=%s, min_species=%d, "
-                "permutations=%d, min_size=%d, max_size=%d, fdr_threshold=%.2f",
-                metric, paralogs, min_species, permutations,
-                min_size, max_size, fdr_threshold)
+    logger.info(
+        "Resolved parameters: metric=%s, paralogs=%s, min_species=%d, "
+        "permutations=%d, min_size=%d, max_size=%d, fdr_threshold=%.2f",
+        metric, paralogs, min_species, permutations,
+        min_size, max_size, fdr_threshold,
+    )
 
-    # --- OrthoFinder preprocessing (optional) ---
     if args.orthofinder_dir:
         logger.info("OrthoFinder mode: preprocessing Orthogroup_Sequences/")
         preprocess_orthofinder(
@@ -316,7 +376,6 @@ def main():
             inputdir=parameters['inputdir'],
         )
 
-    # --- Common kwargs for _run_single_list ---
     common_kwargs = dict(
         inputdir=parameters['inputdir'],
         min_species=min_species,
@@ -330,16 +389,22 @@ def main():
         mafft_mode=mafft_mode,
         parameters=parameters,
         resume=args.resume,
+        show_progress=args.quiet,
     )
+
+    obo_path = os.path.join(obo_cache, "go-basic.obo") if obo_cache else None
+    obo_names = parse_obo_names(obo_path) \
+        if obo_path and os.path.isfile(obo_path) else {}
 
     # --- Single-list mode ---
     if not two_list_mode:
         logger.info("Running in single-list mode.")
-        tables_dir = _run_single_list(
+        tables_dir, stats = _run_single_list(
             listdir=outdir,
             anchor=parameters['anchor'],
             require_anchor=True,
             species=None,
+            label="",
             **common_kwargs,
         )
         results_dir = os.path.join(outdir, "enrichment")
@@ -350,7 +415,6 @@ def main():
                 return True
             return False
 
-        # Apply metric normalisation
         raw_anchor2mean = os.path.join(outdir, "tables", "anchor2mean.tsv")
         if metric == "identity":
             gsea_anchor2mean = raw_anchor2mean
@@ -385,11 +449,6 @@ def main():
             )
 
         logger.info("Generating plots")
-        obo_path = os.path.join(obo_cache, "go-basic.obo") \
-            if obo_cache else None
-        from .report import _parse_obo_names
-        obo_names = _parse_obo_names(obo_path) \
-            if obo_path and os.path.isfile(obo_path) else {}
         make_single_list_plots(
             anchor2mean_path=raw_anchor2mean,
             results_dir=results_dir,
@@ -414,27 +473,30 @@ def main():
         logger.info("Running in two-list differential mode.")
         species1 = read_species_list(list1_path)
         species2 = read_species_list(list2_path)
-        logger.info("List 1: %d species", len(species1))
-        logger.info("List 2: %d species", len(species2))
-        logger.info("Anchor: %s", parameters['anchor'])
+        logger.info("List 1: %d species. List 2: %d species. Anchor: %s",
+                    len(species1), len(species2), parameters['anchor'])
 
         logger.info("--- Processing list 1 ---")
-        tables_dir1 = _run_single_list(
+        tables_dir1, stats1 = _run_single_list(
             listdir=os.path.join(outdir, "list1"),
             anchor=parameters['anchor'],
             require_anchor=False,
             species=species1,
+            label="list 1",
             **common_kwargs,
         )
 
         logger.info("--- Processing list 2 ---")
-        tables_dir2 = _run_single_list(
+        tables_dir2, stats2 = _run_single_list(
             listdir=os.path.join(outdir, "list2"),
             anchor=parameters['anchor'],
             require_anchor=False,
             species=species2,
+            label="list 2",
             **common_kwargs,
         )
+        _log_summary(stats1, results_dir, fdr_threshold, label="list 1")
+        _log_summary(stats2, results_dir, fdr_threshold, label="list 2")
 
         diff_dir    = os.path.join(outdir, "differential")
         results_dir = os.path.join(diff_dir, "enrichment")
@@ -471,11 +533,6 @@ def main():
             )
 
         logger.info("Generating differential plots")
-        obo_path = os.path.join(obo_cache, "go-basic.obo") \
-            if obo_cache else None
-        from .report import _parse_obo_names
-        obo_names = _parse_obo_names(obo_path) \
-            if obo_path and os.path.isfile(obo_path) else {}
         make_differential_plots(
             tables_dir1=tables_dir1,
             tables_dir2=tables_dir2,

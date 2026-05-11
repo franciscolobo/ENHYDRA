@@ -1,5 +1,6 @@
 [tool.setuptools.packages.find]
 include = ["enhydra*"]
+
 [build-system]
 requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -16,6 +17,11 @@ dependencies = [
     "pandas>=2.0",
     "gprofiler-official>=1.0",
     "matplotlib>=3.7",
+    "tqdm>=4.0",
+]
+
+[project.optional-dependencies]
+plots = [
     "pdf2image>=1.16",
 ]
 
