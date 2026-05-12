@@ -1,7 +1,7 @@
 # --- Input/Output ---
 inputdir    = test_data/ecoli_orthogroups/all
 outdir      = test_data/ecoli_output_lists_zscore_patho_anchor
-anchor      = NC_004431
+anchor      = NZ_CP016546
 max_process = 8
 
 # --- Filtering ---
@@ -18,7 +18,7 @@ mafft_mode  = auto          # auto | linsi | ginsi | einsi | fftnsi | fftns | nw
 metric      = zscore        # zscore | identity | rank
 
 # --- Gene set enrichment ---
-gene_sets     = test_data/gmt/NC_004431_GO_BP.gmt
+gene_sets     = test_data/gmt/NZ_CP016546_GO_BP.gmt
 min_size      = 5
 max_size      = 500
 permutations  = 1000

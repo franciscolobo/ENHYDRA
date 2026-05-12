@@ -21,9 +21,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-plots = [
-    "pdf2image>=1.16",
-]
+plots = ["pdf2image>=1.16"]
+dev   = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [project.scripts]
 enhydra = "enhydra.cli:main"
