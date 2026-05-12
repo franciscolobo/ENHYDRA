@@ -26,36 +26,72 @@ def _load_ranked(anchor2mean_path: str) -> pd.DataFrame:
     return ranked.sort_values("identity", ascending=False)
 
 
-def _convert_gsea_plots_to_png(results_dir: str):
-    """Convert GSEApy-generated PDFs to PNGs for HTML embedding.
+def _gmt_gene_set(gmt_path: str) -> set[str]:
+    """Return the set of all gene IDs present in a GMT file."""
+    genes: set[str] = set()
+    with open(gmt_path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            # GMT: term_id <TAB> description <TAB> gene1 <TAB> gene2 ...
+            genes.update(fields[2:])
+    return genes
 
-    Requires pdf2image and poppler:
-        pip install pdf2image
-        brew install poppler  # macOS
-        apt install poppler-utils  # Linux
+
+def _check_overlap(ranked: pd.DataFrame, gmt_path: str) -> None:
+    """Raise a clear error if the ranked list barely overlaps with the GMT.
 
     Args:
-        results_dir: Directory containing the GSEApy prerank/ subdirectory.
+        ranked:   Ranked gene DataFrame (gene_id, identity).
+        gmt_path: Path to the GMT file.
+
+    Raises:
+        EnhydraIOError: If fewer than 2 genes overlap, with a diagnostic
+                        message showing example IDs from both sides.
     """
+    ranked_ids = set(ranked["gene_id"].astype(str))
+    gmt_ids    = _gmt_gene_set(gmt_path)
+    overlap    = ranked_ids & gmt_ids
+    n_overlap  = len(overlap)
+
+    logger.info(
+        "Preflight: %d ranked genes, %d genes in GMT, %d in common.",
+        len(ranked_ids), len(gmt_ids), n_overlap,
+    )
+
+    if n_overlap < 2:
+        ranked_ex = ", ".join(list(ranked_ids)[:5])
+        gmt_ex    = ", ".join(list(gmt_ids)[:5])
+        raise EnhydraIOError(
+            "Too few genes overlap between the ranked list and the GMT file "
+            "(%d in common — GSEApy requires at least 2).\n\n"
+            "This usually means the gene IDs in anchor2mean.tsv do not match "
+            "those in the GMT file.\n\n"
+            "Example ranked IDs : %s\n"
+            "Example GMT IDs    : %s\n\n"
+            "Check that the GMT was built from the same anchor proteome used "
+            "to run the pipeline."
+            % (n_overlap, ranked_ex, gmt_ex)
+        )
+
+
+def _convert_gsea_plots_to_png(results_dir: str):
+    """Convert GSEApy-generated PDFs to PNGs for HTML embedding."""
     prerank_dir = os.path.join(results_dir, "prerank")
     if not os.path.isdir(prerank_dir):
         return
-
     pdfs = [f for f in os.listdir(prerank_dir) if f.endswith(".pdf")]
     if not pdfs:
         return
-
     try:
         from pdf2image import convert_from_path
     except ImportError:
         logger.warning(
             "pdf2image not installed — enrichment plots will not be embedded "
-            "in the HTML report. Install with: pip install pdf2image\n"
+            "in the HTML report. Install with: pip install 'enhydra[plots]'\n"
             "Also requires poppler: brew install poppler (macOS) or "
             "apt install poppler-utils (Linux)."
         )
         return
-
     logger.info("Converting %d GSEApy PDF plots to PNG...", len(pdfs))
     for pdf_file in pdfs:
         pdf_path = os.path.join(prerank_dir, pdf_file)
@@ -76,26 +112,13 @@ def build_gmt_from_gprofiler(
     gmt_path: str,
     sources: list[str] | None = None,
 ) -> str:
-    """Fetch annotations from g:Profiler and write a GMT file.
-
-    Args:
-        gene_ids: List of anchor gene IDs (Ensembl format).
-        organism: g:Profiler organism name (e.g. 'hsapiens', 'athaliana').
-        gmt_path: Path where the GMT file will be written.
-        sources:  Data sources to query. Defaults to GO:BP, GO:MF, GO:CC,
-                  KEGG, and Reactome.
-
-    Returns:
-        Path to the written GMT file.
-    """
+    """Fetch annotations from g:Profiler and write a GMT file."""
     if sources is None:
         sources = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]
-
     logger.info(
         "Fetching annotations from g:Profiler for %d genes, organism: %s, sources: %s",
         len(gene_ids), organism, sources,
     )
-
     gprofiler = GProfiler(user_agent="ENHYDRA", return_dataframe=True)
     results = gprofiler.profile(
         organism=organism,
@@ -104,24 +127,20 @@ def build_gmt_from_gprofiler(
         user_threshold=1.0,
         no_evidences=False,
     )
-
     if results.empty:
         raise EnhydraIOError(
             "g:Profiler returned no annotations for organism '%s'. "
             "Please check the organism name at https://biit.cs.ut.ee/gprofiler."
             % organism
         )
-
     n_terms = 0
     with open(gmt_path, "w") as fh:
         for _, row in results.iterrows():
             genes = row.get("intersections")
             if not genes:
                 continue
-            gene_str = "\t".join(genes)
-            fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], gene_str))
+            fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], "\t".join(genes)))
             n_terms += 1
-
     logger.info("GMT file written: %d terms, path: %s", n_terms, gmt_path)
     return gmt_path
 
@@ -138,23 +157,7 @@ def run_gsea(
     seed: int = 42,
     fdr_threshold: float = 0.25,
 ) -> gp.Prerank:
-    """Run GSEApy prerank, optionally fetching annotations from g:Profiler.
-
-    Args:
-        anchor2mean_path: Path to anchor2mean.tsv (gene_id, mean_identity).
-        results_dir:      Directory where results are written.
-        gene_sets:        Path to a local GMT file. Used when organism is None.
-        organism:         g:Profiler organism name. When provided, annotations
-                          are fetched via the API and gene_sets is ignored.
-        sources:          Data sources for g:Profiler (only used with organism).
-        permutations:     Number of GSEA permutations.
-        min_size:         Minimum gene set size to test.
-        max_size:         Maximum gene set size to test.
-        seed:             Random seed for reproducibility.
-
-    Returns:
-        A gseapy Prerank result object.
-    """
+    """Run GSEApy prerank, optionally fetching annotations from g:Profiler."""
     os.makedirs(results_dir, exist_ok=True)
     ranked = _load_ranked(anchor2mean_path)
 
@@ -171,6 +174,9 @@ def run_gsea(
             )
         gene_sets = gmt_path
 
+    # Preflight: fail early with a clear message if IDs don't match
+    _check_overlap(ranked, gene_sets)
+
     logger.info(
         "Running GSEApy prerank: %d genes, gene sets: %s, permutations: %d",
         len(ranked), gene_sets, permutations,
@@ -184,7 +190,7 @@ def run_gsea(
         min_size=min_size,
         max_size=max_size,
         seed=seed,
-        graph_num=0,   # no plots on first pass — we count significant terms first
+        graph_num=0,
         verbose=False,
     )
 

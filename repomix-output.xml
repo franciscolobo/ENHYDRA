@@ -1,0 +1,4880 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: enhydra/**, tests/**, pyproject.toml, README.md
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+enhydra/
+  __init__.py
+  alignment.py
+  cli.py
+  differential.py
+  exceptions.py
+  filtering.py
+  gsea.py
+  io.py
+  orthofinder.py
+  plotting.py
+  report_old.py
+  report.py
+  tables.py
+  utils.py
+tests/
+  __init__.py
+  build_gmt_interproscan.py
+  build_gmt.py
+  E_coli_genomes.tsv
+  generate_test_data.py
+  prepare_ecoli_proteomes.py
+  reconstruct_orthogroups.py
+  remove_pseudogenes.py
+  test_config_file
+pyproject.toml
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="enhydra/exceptions.py">
+class EnhydraConfigError(ValueError):
+    """Raised when a required configuration parameter is missing or invalid."""
+    pass
+
+
+class EnhydraIOError(IOError):
+    """Raised when an input file or directory is missing or inaccessible."""
+    pass
+
+
+class EnhydraToolError(FileNotFoundError):
+    """Raised when an external tool (mafft, trimal) is missing or not executable."""
+    pass
+</file>
+
+<file path="enhydra/orthofinder.py">
+from __future__ import annotations
+
+import os
+import logging
+from Bio import SeqIO
+
+from .exceptions import EnhydraIOError
+
+logger = logging.getLogger(__name__)
+
+_OG_SEQUENCES_SUBDIR = "Orthogroup_Sequences"
+
+
+def _find_og_sequences_dir(orthofinder_dir: str) -> str:
+    """Locate the Orthogroup_Sequences directory in an OrthoFinder 3 output tree.
+
+    OrthoFinder 3 nests results under a dated run directory:
+        <orthofinder_dir>/Results_<date>/Orthogroup_Sequences/
+
+    If the user points directly at the Results directory, we also handle that.
+
+    Args:
+        orthofinder_dir: Path to the OrthoFinder output directory.
+
+    Returns:
+        Path to the Orthogroup_Sequences directory.
+
+    Raises:
+        EnhydraIOError: If the directory cannot be found.
+    """
+    # Case 1: user pointed directly at Results_<date>/
+    direct = os.path.join(orthofinder_dir, _OG_SEQUENCES_SUBDIR)
+    if os.path.isdir(direct):
+        return direct
+
+    # Case 2: user pointed at the top-level OrthoFinder output dir,
+    # which contains one or more Results_<date>/ subdirectories
+    candidates = []
+    for entry in os.listdir(orthofinder_dir):
+        if entry.startswith("Results_"):
+            candidate = os.path.join(orthofinder_dir, entry, _OG_SEQUENCES_SUBDIR)
+            if os.path.isdir(candidate):
+                candidates.append(candidate)
+
+    if not candidates:
+        raise EnhydraIOError(
+            "Could not find '%s' in OrthoFinder output at: %s\n"
+            "Please point --orthofinder-dir at either the top-level OrthoFinder "
+            "output directory or the Results_<date> subdirectory."
+            % (_OG_SEQUENCES_SUBDIR, orthofinder_dir)
+        )
+    if len(candidates) > 1:
+        # Use the most recent run
+        candidates.sort()
+        logger.warning(
+            "Multiple OrthoFinder runs found, using the most recent: %s",
+            candidates[-1]
+        )
+    return candidates[-1]
+
+
+def _reformat_header(header: str) -> tuple[str, str]:
+    """Parse an OrthoFinder 3 sequence header into (species_id, gene_id).
+
+    OrthoFinder 3 prefixes gene IDs with the proteome filename stem:
+        >Hsapiens_ENSG00000141510  →  species='Hsapiens', gene='ENSG00000141510'
+
+    The split is on the first underscore only, so gene IDs containing
+    underscores are preserved intact.
+
+    Args:
+        header: Sequence ID string (without the leading '>').
+
+    Returns:
+        Tuple of (species_id, gene_id).
+
+    Raises:
+        EnhydraIOError: If the header does not match the expected format.
+    """
+    parts = header.split("_", 1)
+    if len(parts) != 2:
+        raise EnhydraIOError(
+            "Unexpected sequence header format in OrthoFinder output: '%s'. "
+            "Expected 'speciesname_geneID'." % header
+        )
+    return parts[0], parts[1]
+
+
+def preprocess_orthofinder(orthofinder_dir: str, inputdir: str) -> int:
+    """Convert OrthoFinder 3 output into ENHYDRA-compatible input files.
+
+    Reads protein FASTA files from OrthoFinder's Orthogroup_Sequences/
+    directory, reformats sequence headers from 'speciesname_geneID' to
+    'speciesID|geneID', and writes one FASTA per orthogroup to inputdir.
+
+    Args:
+        orthofinder_dir: Path to the OrthoFinder output directory (either
+                         the top-level directory or a Results_<date> subdir).
+        inputdir:        Path to the directory where reformatted FASTAs will
+                         be written. Created if it does not exist.
+
+    Returns:
+        Number of orthogroup files written.
+
+    Raises:
+        EnhydraIOError: If the OrthoFinder output structure is not recognised.
+    """
+    og_dir = _find_og_sequences_dir(orthofinder_dir)
+    os.makedirs(inputdir, exist_ok=True)
+
+    files = [f for f in os.listdir(og_dir) if f.endswith(".fa")]
+    if not files:
+        raise EnhydraIOError(
+            "No .fa files found in Orthogroup_Sequences directory: %s" % og_dir
+        )
+
+    n_written = 0
+    for filename in files:
+        og_id = filename.replace(".fa", "")
+        in_path = os.path.join(og_dir, filename)
+        out_path = os.path.join(inputdir, og_id)
+        with open(out_path, "w") as out_fh:
+            for seq_record in SeqIO.parse(in_path, "fasta"):
+                try:
+                    species_id, gene_id = _reformat_header(seq_record.id)
+                except EnhydraIOError as e:
+                    logger.warning("Skipping malformed header in %s: %s", filename, e)
+                    continue
+                out_fh.write(">%s|%s\n%s\n" % (species_id, gene_id, seq_record.seq))
+        n_written += 1
+
+    logger.info(
+        "OrthoFinder preprocessing complete: %d orthogroups written to %s",
+        n_written, inputdir
+    )
+    return n_written
+</file>
+
+<file path="enhydra/report_old.py">
+from __future__ import annotations
+
+import os
+import base64
+import logging
+import urllib.request
+import ssl
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+_DATATABLES_JS_URL  = "https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"
+_JQUERY_URL         = "https://code.jquery.com/jquery-3.7.0.min.js"
+_DATATABLES_CSS_URL = "https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"
+
+_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>{title}</title>
+<style>
+{dt_css}
+body {{ font-family: Arial, sans-serif; margin: 0; padding: 0;
+        background: #f5f5f5; color: #222; }}
+header {{ background: #1a3a5c; color: white; padding: 24px 40px; }}
+header h1 {{ margin: 0; font-size: 1.8em; }}
+header p  {{ margin: 4px 0 0; font-size: 0.95em; opacity: 0.85; }}
+main {{ max-width: 1200px; margin: 32px auto; padding: 0 24px; }}
+section {{ background: white; border-radius: 8px;
+           box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+           padding: 28px 32px; margin-bottom: 28px; }}
+h2 {{ margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
+      padding-bottom: 8px; }}
+.plot-block {{ margin: 20px 0; text-align: center; }}
+.plot-block img {{ max-width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
+.plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
+.plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
+a.go-link {{ color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
+.col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
+            font-size: 10px; text-align: center; border-radius: 50%;
+            background: #aaa; color: white; cursor: help; margin-left: 3px;
+            position: relative; }}
+.col-tip .tip-text {{ display: none; position: absolute; bottom: 120%; left: 50%;
+                      transform: translateX(-50%); background: #333; color: #fff;
+                      padding: 6px 10px; border-radius: 4px; font-size: 11px;
+                      white-space: normal; width: 220px; z-index: 999;
+                      font-weight: normal; line-height: 1.4; }}
+.col-tip:hover .tip-text {{ display: block; }}
+thead tr.filter-row th input {{
+    width: 100%; box-sizing: border-box; font-size: 11px;
+    padding: 3px; border: 1px solid #ccc; border-radius: 3px; }}
+thead tr.filter-row th {{ padding: 4px 8px; }}
+#modal-overlay {{ display: none; position: fixed; top: 0; left: 0;
+                  width: 100%; height: 100%; background: rgba(0,0,0,0.6);
+                  z-index: 1000; justify-content: center; align-items: center; }}
+#modal-overlay.active {{ display: flex; }}
+#modal-box {{ background: white; border-radius: 8px; padding: 24px;
+              max-width: 700px; width: 90%; position: relative; }}
+#modal-title {{ font-size: 1.1em; font-weight: bold; color: #1a3a5c;
+                margin-bottom: 12px; }}
+#modal-img {{ width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
+#modal-close {{ position: absolute; top: 12px; right: 16px; font-size: 1.4em;
+                cursor: pointer; color: #555; background: none; border: none; }}
+footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>{title}</h1>
+  <p>ENHYDRA &mdash; Gene Set Enrichment Analysis for evolutionary genomics</p>
+</header>
+
+<div id="modal-overlay">
+  <div id="modal-box">
+    <button id="modal-close" title="Close">&times;</button>
+    <div id="modal-title"></div>
+    <img id="modal-img" src="" alt="Enrichment plot"/>
+  </div>
+</div>
+
+<main>
+<section>
+  <h2>Plots</h2>
+  <div class="plot-grid">
+{plots_html}
+  </div>
+</section>
+
+<section>
+  <h2>Enrichment results</h2>
+  <p>Significant gene sets are highlighted in blue.
+     Click a GO ID to view its enrichment plot.
+     Use the filter boxes below each column header to filter by that column.</p>
+{table_html}
+</section>
+</main>
+<footer>Generated by ENHYDRA</footer>
+
+<script>{jquery_js}</script>
+<script>{dt_js}</script>
+<script>
+{plot_data_js}
+$(document).ready(function() {{
+    // Numeric expression filtering for NES, p-value, FDR only
+    var numericCols = new Set([2, 3, 4,5,6]);
+    var colFilters  = {{}};  // col index → {{ op, num }} or {{ text }}
+
+    $.fn.dataTable.ext.search.push(function(settings, data) {{
+        for (var i in colFilters) {{
+            var f = colFilters[i];
+            if (f.text !== undefined) {{
+                if (data[i].toLowerCase().indexOf(f.text) === -1) return false;
+            }} else {{
+                var cell = parseFloat(data[i]);
+                if (isNaN(cell)) return false;
+                if (f.op === '<'  && !(cell <  f.num)) return false;
+                if (f.op === '<=' && !(cell <= f.num)) return false;
+                if (f.op === '>'  && !(cell >  f.num)) return false;
+                if (f.op === '>=' && !(cell >= f.num)) return false;
+                if ((f.op === '=' || f.op === '==') && !(cell === f.num)) return false;
+                if (f.op === '!=' && !(cell !== f.num)) return false;
+            }}
+        }}
+        return true;
+    }});
+
+    $('#results-table thead tr.filter-row th').each(function(i) {{
+        var placeholder = numericCols.has(i) ? "e.g. < 0.05" : "Filter...";
+        var input = $('<input type="text" placeholder="' + placeholder + '"/>');
+        $(this).html(input);
+        input.on('keyup change', function() {{
+            var val = this.value.trim();
+            if (val === '') {{
+                delete colFilters[i];
+            }} else if (numericCols.has(i)) {{
+                var m = val.match(/^([<>=!]=?)\s*([\d.eE+\-]+)$/);
+                if (m) {{
+                    colFilters[i] = {{ op: m[1], num: parseFloat(m[2]) }};
+                }} else {{
+                    delete colFilters[i];
+                }}
+            }} else {{
+                colFilters[i] = {{ text: val.toLowerCase() }};
+            }}
+            table.draw();
+        }});
+    }});
+    var table = $('#results-table').DataTable({{
+        pageLength: 25,
+        orderCellsTop: true,
+        order: [[4, 'asc']],
+        columnDefs: [{{ targets: [2,3,4,5,6], type: 'num' }}]
+    }});
+    $(document).on('click', '.go-link', function(e) {{
+        e.preventDefault();
+        var goId = $(this).data('goid');
+        var uri  = enrichmentPlots[goId];
+        if (uri) {{
+            $('#modal-title').text(goId);
+            $('#modal-img').attr('src', uri);
+            $('#modal-overlay').addClass('active');
+        }}
+    }});
+    $('#modal-close, #modal-overlay').on('click', function(e) {{
+        if (e.target === this) $('#modal-overlay').removeClass('active');
+    }});
+}});
+</script>
+</body>
+</html>"""
+
+
+def _fetch(url: str) -> str:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; ENHYDRA)"}
+    )
+    with urllib.request.urlopen(req, context=ctx) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def _fetch_cached(url: str, cache_dir: str | None, filename: str) -> str:
+    if cache_dir:
+        local_path = os.path.join(cache_dir, filename)
+        if os.path.isfile(local_path):
+            with open(local_path, encoding="utf-8") as fh:
+                return fh.read()
+    content = _fetch(url)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(local_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    return content
+
+
+def _img_to_base64(img_path: str) -> str:
+    with open(img_path, "rb") as fh:
+        data = base64.b64encode(fh.read()).decode("utf-8")
+    return "data:image/png;base64,%s" % data
+
+
+def _parse_obo_names(obo_path: str) -> dict[str, str]:
+    names = {}
+    current_id = None
+    current_name = None
+    is_obsolete = False
+    with open(obo_path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line == "[Term]":
+                if current_id and not is_obsolete and current_name:
+                    names[current_id] = current_name
+                current_id = None
+                current_name = None
+                is_obsolete = False
+            elif line.startswith("id: GO:"):
+                current_id = line[4:]
+            elif line.startswith("name: "):
+                current_name = line[6:]
+            elif line == "is_obsolete: true":
+                is_obsolete = True
+    if current_id and not is_obsolete and current_name:
+        names[current_id] = current_name
+    return names
+
+
+def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
+    """Load and clean GSEApy prerank results, writing a processed TSV."""
+    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if not os.path.isfile(path):
+        logger.warning("GSEA results not found: %s", path)
+        return None
+
+    df = pd.read_csv(path)
+
+    # Convert Tag% (e.g. "1/10") to float
+    if "Tag %" in df.columns:
+        def _tag(v):
+            try:
+                v = str(v).strip()
+                if "/" in v:
+                    a, b = v.split("/")
+                    return round(float(a) / float(b), 4)
+                return round(float(v), 4)
+            except Exception:
+                return None
+        df["Tag %"] = df["Tag %"].apply(_tag)
+
+    # Convert Gene% (e.g. "9.55%") to 0-1 float
+    if "Gene %" in df.columns:
+        def _gene(v):
+            try:
+                return round(float(str(v).strip().rstrip("%")) / 100.0, 4)
+            except Exception:
+                return None
+        df["Gene %"] = df["Gene %"].apply(_gene)
+
+    # Write processed intermediate file
+    processed_path = os.path.join(results_dir, "gsea_results_processed.tsv")
+    df.to_csv(processed_path, sep="\t", index=False)
+    logger.info("Processed GSEA results written to: %s", processed_path)
+
+    return df
+
+
+def _build_enrichment_plot_index(results_dir: str) -> dict[str, str]:
+    prerank_dir = os.path.join(results_dir, "prerank")
+    if not os.path.isdir(prerank_dir):
+        return {}
+    index = {}
+    for filename in os.listdir(prerank_dir):
+        if not filename.endswith(".png"):
+            continue
+        go_id = filename.replace(".png", "").replace("_", ":", 1)
+        png_path = os.path.join(prerank_dir, filename)
+        index[go_id] = _img_to_base64(png_path)
+    logger.info("Indexed %d enrichment plot(s).", len(index))
+    return index
+
+
+def _results_table_html(
+    df: pd.DataFrame,
+    obo_names: dict[str, str],
+    plot_index: dict[str, str],
+    fdr_threshold: float = 0.25,
+) -> str:
+    df = df.copy()
+
+    if "Term" not in df.columns:
+        logger.warning("'Term' column not found in GSEA results.")
+        return "<p>No results to display.</p>"
+
+    df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
+
+    for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val", "Tag %", "Gene %"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").apply(
+                lambda x: "%.4f" % x if pd.notna(x) else ""
+            )
+
+    df["Significant"] = df["FDR q-val"].apply(
+        lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
+    )
+
+    # (source_col, display_name, tooltip)
+    col_defs = [
+        ("Term",       "GO ID",
+         "Gene Ontology term identifier."),
+        ("GO Term",    "Term name",
+         "Human-readable name of the GO term."),
+        ("NES",        "NES",
+         "Normalised Enrichment Score. Positive = enriched at top of ranking "
+         "(more conserved). Negative = enriched at bottom (faster evolving)."),
+        ("NOM p-val",  "p-value",
+         "Nominal p-value from permutation testing. Not corrected for "
+         "multiple testing."),
+        ("FDR q-val",  "FDR",
+         "False Discovery Rate q-value. Gene sets below %.2f are significant."
+         % fdr_threshold),
+        ("Tag %",      "Tag %",
+         "Percentage of genes in the leading edge subset relative to the "
+         "total number of genes in the gene set."),
+        ("Gene %",     "Gene %",
+         "Percentage of genes in the leading edge subset relative to all "
+         "genes in the ranked list."),
+        ("Significant","Sig.",
+         "Significant at FDR < %.2f." % fdr_threshold),
+    ]
+
+    col_defs = [(s, d, t) for s, d, t in col_defs
+                if s in df.columns or s in ("GO Term", "Significant")]
+
+    table_df = df[[s for s, _, _ in col_defs]].copy()
+    display_names = [d for _, d, _ in col_defs]
+    tooltips      = [t for _, _, t in col_defs]
+    table_df.columns = display_names
+
+    numeric_display_names = {"NES", "p-value", "FDR", "Tag %", "Gene %"}
+    numeric_col_indices = [
+        i for i, name in enumerate(display_names)
+        if name in numeric_display_names
+    ]
+
+    header_cells = "".join(
+        '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
+        % (name, tip)
+        for name, tip in zip(display_names, tooltips)
+    )
+    filter_cells = "<th></th>" * len(display_names)
+
+    rows = ""
+    for _, row in table_df.iterrows():
+        sig_class = ' class="sig-row"' if row.get("Sig.") == "✓" else ""
+        go_id = row.get("GO ID", "")
+        has_plot = go_id in plot_index
+        cells = ""
+        for col, val in row.items():
+            if col == "GO ID" and has_plot:
+                cells += (
+                    '<td><a href="#" class="go-link" data-goid="%s">%s</a></td>'
+                    % (go_id, val)
+                )
+            else:
+                cells += "<td>%s</td>" % str(val)
+        rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
+
+    return (
+        '<table id="results-table" class="display compact" style="width:100%%">'
+        "<thead>"
+        "<tr>%s</tr>"
+        '<tr class="filter-row">%s</tr>'
+        "</thead>"
+        "<tbody>%s</tbody>"
+        "</table>"
+    ) % (header_cells, filter_cells, rows), numeric_col_indices
+
+
+def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
+    html = ""
+    for stem, caption in names:
+        png_path = os.path.join(plots_dir, stem + ".png")
+        if not os.path.isfile(png_path):
+            continue
+        uri = _img_to_base64(png_path)
+        html += (
+            '<div class="plot-block">'
+            '<p class="plot-caption">%s</p>'
+            '<img src="%s" alt="%s"/>'
+            "</div>"
+        ) % (caption, uri, caption)
+    return html
+
+
+def build_report(
+    results_dir: str,
+    plots_dir: str,
+    report_path: str,
+    obo_path: str | None = None,
+    mode: str = "single",
+    metric: str = "zscore",
+    fdr_threshold: float = 0.25,
+):
+    """Build a self-contained HTML report for ENHYDRA results."""
+    logger.info("Building HTML report...")
+
+    obo_names = {}
+    if obo_path and os.path.isfile(obo_path):
+        obo_names = _parse_obo_names(obo_path)
+        logger.info("Loaded %d GO term names from OBO.", len(obo_names))
+    else:
+        logger.warning("OBO file not provided or not found — term names from GMT only.")
+
+    df = _load_gsea_results(results_dir)
+    if df is None:
+        logger.warning("Cannot build report: no GSEA results found.")
+        return
+
+    cache_dir = os.path.dirname(obo_path) if obo_path else None
+    logger.info("Fetching DataTables assets (cached after first download)...")
+    jquery_js = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
+    dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
+    dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
+
+    plot_index = _build_enrichment_plot_index(results_dir)
+    plot_data_js = "var enrichmentPlots = {%s};" % ",".join(
+        '"%s": "%s"' % (go_id, uri) for go_id, uri in plot_index.items()
+    )
+
+    if mode == "single":
+        plot_names = [
+            ("identity_distribution", "Distribution of mean alignment identity"),
+            ("gsea_barplot",          "Top enriched gene sets (NES)"),
+        ]
+        title = "ENHYDRA Single-List Enrichment Report"
+    else:
+        plot_names = [
+            ("identity_scatter",          "Identity comparison between lists"),
+            ("differential_distribution", "Differential conservation score distribution"),
+            ("identity_distribution",     "Distribution of differential scores"),
+            ("gsea_barplot",              "Top differentially enriched gene sets (NES)"),
+        ]
+        title = "ENHYDRA Differential Enrichment Report"
+
+    plots_html = _plot_section(plots_dir, plot_names)
+    table_html, numeric_col_indices = _results_table_html(
+        df, obo_names, plot_index, fdr_threshold
+    )
+
+    html = _TEMPLATE.format(
+        title=title,
+        dt_css=dt_css,
+        plots_html=plots_html,
+        table_html=table_html,
+        jquery_js=jquery_js,
+        dt_js=dt_js,
+        plot_data_js=plot_data_js,
+        numeric_col_indices=numeric_col_indices,
+    )
+
+    with open(report_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+    logger.info("HTML report written to: %s", report_path)
+</file>
+
+<file path="tests/__init__.py">
+
+</file>
+
+<file path="tests/build_gmt.py">
+"""
+Build a GMT file for an anchor strain using NCBI gene2go and gene2refseq.
+
+Workflow:
+    anchor genome accession (e.g. NC_004431)
+        → NCBI Entrez: resolve taxonomy ID
+        → NCBI FTP: download and cache gene2go.gz + gene2refseq.gz
+        → filter both files by taxid
+        → join on GeneID: protein_accession → GO terms
+        → write one GMT file per requested namespace
+
+GMT format (tab-separated):
+    GO_ID <TAB> GO_term <TAB> protein1 <TAB> protein2 ...
+
+Usage:
+    python tests/build_gmt.py \\
+        --anchor    NC_004431 \\
+        --email     your@email.com \\
+        --outdir    test_data/gmt/ \\
+        --cache     test_data/ncbi_cache/ \\
+        --namespaces GO_BP
+
+Note:
+    gene2refseq.gz is ~1.2 GB compressed. It is downloaded once and cached.
+    Subsequent runs reuse the cached file.
+
+Dependencies: Biopython
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import gzip
+import logging
+import argparse
+import urllib.request
+from collections import defaultdict
+from Bio import Entrez
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+# Mapping from namespace name to the Category string used in gene2go
+NAMESPACE_CATEGORIES: dict[str, str] = {
+    "GO_BP": "Process",
+    "GO_MF": "Function",
+    "GO_CC": "Component",
+}
+
+NCBI_FTP_BASE = "https://ftp.ncbi.nlm.nih.gov/gene/DATA"
+
+
+# --- Step 1: Taxonomy ID resolution ---
+
+def get_taxid(genome_accession: str, email: str) -> str:
+    """Resolve a genome accession to an NCBI taxonomy ID.
+
+    Args:
+        genome_accession: Genome sequence accession (e.g. NC_004431).
+        email:            Email address for NCBI Entrez (required by NCBI).
+
+    Returns:
+        Taxonomy ID as a string.
+
+    Raises:
+        ValueError: If the accession cannot be found in NCBI nuccore.
+    """
+    Entrez.email = email
+    logger.info("Resolving taxid for %s...", genome_accession)
+
+    handle = Entrez.esearch(db="nuccore", term=genome_accession, retmax=1)
+    record = Entrez.read(handle)
+    handle.close()
+
+    if not record["IdList"]:
+        raise ValueError(
+            "Could not find '%s' in NCBI nuccore. "
+            "Please check the accession." % genome_accession
+        )
+    uid = record["IdList"][0]
+
+    handle = Entrez.esummary(db="nuccore", id=uid)
+    summary = Entrez.read(handle)
+    handle.close()
+
+    taxid = str(int(summary[0]["TaxId"]))
+    logger.info("Taxid for %s: %s", genome_accession, taxid)
+    return taxid
+
+
+# --- Step 2: NCBI FTP downloads ---
+
+def _download_with_progress(url: str, local_path: str):
+    """Download a file from url to local_path with progress reporting."""
+    def _progress(block_count, block_size, total_size):
+        if total_size > 0 and block_count % 1000 == 0:
+            mb_done = block_count * block_size / 1_000_000
+            mb_total = total_size / 1_000_000
+            logger.info("  %.0f / %.0f MB", mb_done, mb_total)
+
+    urllib.request.urlretrieve(url, local_path, reporthook=_progress)
+
+
+def download_ncbi_file(filename: str, cache_dir: str) -> str:
+    """Download a file from the NCBI FTP gene/DATA directory if not cached.
+
+    Args:
+        filename:  Filename on the FTP server (e.g. 'gene2go.gz').
+        cache_dir: Local directory to cache the file.
+
+    Returns:
+        Path to the local (possibly cached) file.
+    """
+    local_path = os.path.join(cache_dir, filename)
+    if os.path.isfile(local_path):
+        logger.info("Using cached file: %s", local_path)
+        return local_path
+
+    url = "%s/%s" % (NCBI_FTP_BASE, filename)
+    logger.info("Downloading %s (this may take a while)...", filename)
+    _download_with_progress(url, local_path)
+    logger.info("Saved to: %s", local_path)
+    return local_path
+
+
+# --- Step 3: Load and filter NCBI data files ---
+
+def load_gene2go(
+    gene2go_path: str,
+    taxid: str,
+    namespaces: list[str],
+) -> dict[str, dict[str, list[tuple[str, str]]]]:
+    """Load gene2go.gz filtered by taxid and namespaces.
+
+    Args:
+        gene2go_path: Path to gene2go.gz.
+        taxid:        Taxonomy ID to filter on.
+        namespaces:   List of namespace keys (e.g. ['GO_BP']).
+
+    Returns:
+        Nested dict: gene_id → {namespace → [(go_id, go_term)]}.
+    """
+    target_categories = {NAMESPACE_CATEGORIES[ns]: ns for ns in namespaces}
+    gene_to_go: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+
+    logger.info("Loading gene2go for taxid %s, namespaces: %s...", taxid, namespaces)
+    with gzip.open(gene2go_path, "rt") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                continue
+            if fields[0] != taxid:
+                continue
+            category = fields[7]
+            if category not in target_categories:
+                continue
+            ns = target_categories[category]
+            gene_id, go_id, go_term = fields[1], fields[2], fields[5]
+            gene_to_go[gene_id][ns].append((go_id, go_term))
+
+    logger.info(
+        "Loaded GO annotations for %d genes (taxid %s).", len(gene_to_go), taxid
+    )
+    return dict(gene_to_go)
+
+
+def load_gene2refseq(gene2refseq_path: str, taxid: str) -> dict[str, list[str]]:
+    """Stream gene2refseq.gz and extract gene_id → protein accessions for taxid.
+
+    Both versioned (WP_000001.1) and unversioned (WP_000001) accessions
+    are retained. Entries without a protein accession ('-') are skipped.
+
+    Args:
+        gene2refseq_path: Path to gene2refseq.gz.
+        taxid:            Taxonomy ID to filter on.
+
+    Returns:
+        Dict: gene_id → list of protein accessions.
+    """
+    gene_to_proteins: dict[str, list[str]] = defaultdict(list)
+
+    logger.info(
+        "Streaming gene2refseq for taxid %s (file is large, please wait)...", taxid
+    )
+    with gzip.open(gene2refseq_path, "rt") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 6:
+                continue
+            if fields[0] != taxid:
+                continue
+            gene_id = fields[1]
+            protein_acc = fields[5]  # protein_accession.version column
+            if protein_acc != "-":
+                gene_to_proteins[gene_id].append(protein_acc)
+
+    logger.info(
+        "Loaded protein accessions for %d genes (taxid %s).", len(gene_to_proteins), taxid
+    )
+    return dict(gene_to_proteins)
+
+
+# --- Step 4: Build and write GMT ---
+
+def build_gmt(
+    gene_to_go: dict[str, dict[str, list[tuple[str, str]]]],
+    gene_to_proteins: dict[str, list[str]],
+    namespace: str,
+    out_path: str,
+):
+    """Build and write a GMT file for a single namespace.
+
+    Args:
+        gene_to_go:       gene_id → {namespace → [(go_id, go_term)]}.
+        gene_to_proteins: gene_id → [protein_accessions].
+        namespace:        Namespace key to write (e.g. 'GO_BP').
+        out_path:         Output GMT file path.
+    """
+    go_to_proteins: dict[str, tuple[str, set[str]]] = {}
+
+    n_genes_mapped = 0
+    for gene_id, ns_dict in gene_to_go.items():
+        go_terms = ns_dict.get(namespace, [])
+        proteins = gene_to_proteins.get(gene_id, [])
+        if not go_terms or not proteins:
+            continue
+        n_genes_mapped += 1
+        for go_id, go_term in go_terms:
+            if go_id not in go_to_proteins:
+                go_to_proteins[go_id] = (go_term, set())
+            go_to_proteins[go_id][1].update(proteins)
+
+    logger.info(
+        "Namespace %s: %d GO terms, %d genes with protein annotations.",
+        namespace, len(go_to_proteins), n_genes_mapped,
+    )
+
+    with open(out_path, "w") as fh:
+        for go_id, (go_term, proteins) in sorted(go_to_proteins.items()):
+            fh.write("%s\t%s\t%s\n" % (go_id, go_term, "\t".join(sorted(proteins))))
+
+    logger.info("GMT written to: %s", out_path)
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build a GMT file for an anchor strain using NCBI gene2go and gene2refseq."
+    )
+    parser.add_argument(
+        "--anchor", required=True,
+        help="Anchor genome accession (e.g. NC_004431)."
+    )
+    parser.add_argument(
+        "--email", required=True,
+        help="Email address for NCBI Entrez (required by NCBI policy)."
+    )
+    parser.add_argument(
+        "--outdir", required=True,
+        help="Directory where GMT files will be written."
+    )
+    parser.add_argument(
+        "--cache", required=True,
+        help="Directory for caching downloaded NCBI data files."
+    )
+    parser.add_argument(
+        "--namespaces",
+        nargs="+",
+        default=["GO_BP"],
+        choices=list(NAMESPACE_CATEGORIES.keys()),
+        help="GO namespaces to include. Default: GO_BP. "
+             "Options: GO_BP GO_MF GO_CC."
+    )
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(args.cache, exist_ok=True)
+
+    # Step 1: Resolve taxid
+    taxid = get_taxid(args.anchor, args.email)
+
+    # Step 2: Download NCBI data files (cached)
+    gene2go_path     = download_ncbi_file("gene2go.gz",     args.cache)
+    gene2refseq_path = download_ncbi_file("gene2refseq.gz", args.cache)
+
+    # Step 3: Load and filter
+    gene_to_go       = load_gene2go(gene2go_path, taxid, args.namespaces)
+    gene_to_proteins = load_gene2refseq(gene2refseq_path, taxid)
+
+    # Step 4: Build one GMT per namespace
+    for namespace in args.namespaces:
+        out_path = os.path.join(
+            args.outdir, "%s_%s.gmt" % (args.anchor, namespace)
+        )
+        build_gmt(gene_to_go, gene_to_proteins, namespace, out_path)
+
+    logger.info("Done.")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="tests/E_coli_genomes.tsv">
+genomeID	Pathogenicity	plasmidIDs
+CP019778	non-pathogenic	-
+NC_002655	pathogenic	NC_007414
+NC_002695	pathogenic	NC_002127|NC_002128
+NC_004431	pathogenic	-
+NC_007946	pathogenic	NC_007941
+NC_008253	pathogenic	-
+NC_008563	pathogenic	NC_009837|NC_009838
+NC_009800	non-pathogenic	-
+NC_009801	pathogenic	NC_009791|NC_009790|NC_009789|NC_009788|NC_009787|NC_009786
+NC_010498	non-pathogenic	NC_010488|NC_010487|NC_010486|NC_010485
+NC_011353	pathogenic	NC_011351|NC_011350
+NC_011415	non-pathogenic	NC_011407|NC_011408|NC_011411|NC_011413|NC_011416|NC_011419
+NC_011601	pathogenic	NC_011602|NC_011603
+NC_011741	non-pathogenic	-
+NC_011742	pathogenic	NC_011747
+NC_011745	non-pathogenic	-
+NC_011748	pathogenic	-
+NC_011750	pathogenic	-
+NC_011751	pathogenic	NC_011749|NC_011739
+NC_011993	pathogenic	-
+NC_013008	pathogenic	NC_013010
+NC_013353	pathogenic	NC_013354
+NC_013361	pathogenic	NC_013362|NC_013363|NC_013369|NC_014543
+NC_013364	pathogenic	NC_013365|NC_013366|NC_013367|NC_013368|NC_013370
+NC_013654	non-pathogenic	NC_013655
+NC_013941	pathogenic	NC_013942
+NC_017626	pathogenic	NC_017627
+NC_017628	pathogenic	-
+NC_017631	non-pathogenic	NC_017629
+NC_017632	pathogenic	NC_017630
+NC_017633	pathogenic	NC_017721|NC_017722|NC_017723|NC_017724
+NC_017634	pathogenic	NC_017659
+NC_017641	pathogenic	NC_017639|NC_017640|NC_017642|NC_017643|NC_017645
+NC_017644	pathogenic	-
+NC_017646	pathogenic	NC_017647|NC_017648|NC_017649|NC_017650
+NC_017656	pathogenic	NC_017653|NC_017654|NC_017655|NC_017657|NC_017658
+NC_017906	pathogenic	NC_017903|NC_017907
+NC_018650	pathogenic	NC_018651|NC_018652|NC_018654
+NC_018658	pathogenic	NC_018659|NC_018660|NC_018666
+NC_018661	pathogenic	NC_018662|NC_018663
+NC_020163	pathogenic	-
+NC_022648	pathogenic	NC_022661|NC_022649|NC_022662|NC_022650|NC_022651
+NZ_CP006636	pathogenic	NZ_CP006637|NZ_CP006638|NZ_CP006639|NZ_CP006640|NZ_CP006641|NZ_CP006642
+NZ_CP007799	non-pathogenic	-
+NZ_CP008805	pathogenic	 NZ_CP008806|NZ_CP008807
+NZ_CP010171	non-pathogenic	-
+NZ_CP010230	non-pathogenic	-
+NZ_CP010231	non-pathogenic	NZ_CP010232|NZ_CP010233|NZ_CP010234
+NZ_CP010235	non-pathogenic	-
+NZ_CP010236	non-pathogenic	-
+NZ_CP010238	non-pathogenic	NZ_CP010239
+NZ_CP010242	non-pathogenic	NZ_CP010243|NZ_CP010244|NZ_CP010245
+NZ_CP010315	pathogenic	NZ_CP010317|NZ_CP010318|NZ_CP010316
+NZ_CP010876	pathogenic	NZ_CP010877|NZ_CP010878|NZ_CP010879|NZ_CP010880|NZ_CP010881|NZ_CP010882
+NZ_CP011134	non-pathogenic	NZ_CP011135|NZ_CP011136|NZ_CP011137|NZ_CP011138|NZ_CP011139|NZ_CP011140|NZ_CP011141|NZ_CP011142|NZ_CP011143
+NZ_CP012379	non-pathogenic	-
+NZ_CP012380	non-pathogenic	-
+NZ_CP013658	pathogenic	NZ_CP013657
+NZ_CP016546	non-pathogenic	NZ_CP016547|NZ_CP016548|NZ_CP016549|NZ_CP016550|NZ_CP016551
+NZ_CP017220	non-pathogenic	NZ_CP017221|NZ_CP017221|NZ_CP017222|NZ_CP017223|NZ_CP017224|NZ_CP017225
+NZ_CP019903	pathogenic	NZ_CP019908|NZ_CP019904|NZ_CP019907|NZ_CP019909|NZ_CP019910|NZ_CP019906|NZ_CP019905
+NZ_CP019961	non-pathogenic	-
+NZ_CP020543	non-pathogenic	-
+NZ_CP020835	pathogenic	NZ_CP020836
+NZ_CP021179	pathogenic	NZ_CP021180
+NZ_CP021202	pathogenic	NZ_CP021203|NZ_CP021204|NZ_CP021205|NZ_CP021206
+NZ_CP021207	pathogenic	NZ_CP021208|NZ_CP021209|NZ_CP021210
+NZ_CP022154	non-pathogenic	NZ_CP022155|NZ_CP022156|NZ_CP022157|NZ_CP022158|NZ_CP022159
+NZ_CP024717	non-pathogenic	NZ_CP024718|NZ_CP024719
+NZ_CP024801	pathogenic	NZ_CP024802|NZ_CP024803|NZ_CP024804|NZ_CP024805|NZ_CP024806
+NZ_CP025401	pathogenic	NZ_CP025402|NZ_CP025403
+NZ_CP025707	pathogenic	NZ_CP025708|NZ_CP025711|NZ_CP025710
+NZ_CP025747	non-pathogenic	-
+NZ_CP026853	pathogenic	NZ_CP026854|NZ_CP026855
+NZ_CP027105	non-pathogenic	NZ_CP027106
+NZ_CP027701	non-pathogenic	NZ_CP027703
+NZ_CP028112	pathogenic	NZ_CP028113|NZ_CP028114
+NZ_HF572917	pathogenic	NC_022742|NC_022743|NC_022741
+NZ_HG941718	pathogenic	NZ_HG941719|NZ_HG941720
+NZ_LT601384	non-pathogenic	-
+</file>
+
+<file path="tests/generate_test_data.py">
+"""
+Generate a synthetic ENHYDRA test dataset.
+
+Groups produced and what they test:
+  OG000001  5 species, anchor present  → passes all filters (clean group)
+  OG000002  5 species, anchor present  → passes all filters (clean group)
+  OG000003  5 species, anchor present  → passes all filters (clean group)
+  OG000004  5 species, NO anchor       → removed by filter_groups (anchor check)
+  OG000005  2 species, anchor present  → removed by filter_groups (min_species=4)
+  OG000006  5 species, anchor present, one seq too long/short
+                                       → seq removed by filter_length
+
+Anchor species : hsapiens
+Other species  : mmusculus, drerio, ggallus, xtropicalis
+Sequence type  : amino acid (single-letter codes)
+"""
+
+import os
+import random
+
+random.seed(42)
+
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+ANCHOR      = "hsapiens"
+SPECIES     = [ANCHOR, "mmusculus", "drerio", "ggallus", "xtropicalis"]
+BASE_LENGTH = 400   # aa residues
+MUTATION_RATE = 0.15
+
+# Real human Ensembl gene IDs — used as anchor gene IDs so g:Profiler
+# can map them to GO terms. These are well-annotated housekeeping genes.
+ANCHOR_GENE_IDS = [
+    "ENSG00000141510",  # TP53
+    "ENSG00000012048",  # BRCA1
+    "ENSG00000139618",  # BRCA2
+    "ENSG00000157764",  # BRAF
+    "ENSG00000133703",  # KRAS
+    "ENSG00000171862",  # PTEN
+]
+
+
+def random_sequence(length: int) -> str:
+    return "".join(random.choices(AMINO_ACIDS, k=length))
+
+
+def mutate(seq: str, rate: float) -> str:
+    """Introduce point mutations at a given rate."""
+    aa = list(seq)
+    for i in range(len(aa)):
+        if random.random() < rate:
+            aa[i] = random.choice(AMINO_ACIDS)
+    return "".join(aa)
+
+
+def write_group(outdir: str, name: str, entries: list[tuple[str, str, str]]):
+    """Write a FASTA file. entries = [(species, gene_id, sequence)]"""
+    path = os.path.join(outdir, name)
+    with open(path, "w") as fh:
+        for species, gene_id, seq in entries:
+            fh.write(">%s|%s\n%s\n" % (species, gene_id, seq))
+    print("Written: %s (%d sequences)" % (path, len(entries)))
+
+
+def make_group(name: str, species_list: list[str], base_seq: str,
+               anchor_gene_id: str,
+               mutation_rate: float = MUTATION_RATE) -> list[tuple]:
+    """Generate one homolog group with per-species mutations."""
+    entries = []
+    for sp in species_list:
+        # Anchor uses the real Ensembl ID; others get a placeholder
+        if sp == ANCHOR:
+            gene_id = anchor_gene_id
+        else:
+            gene_id = "%s_%s" % (name, sp[:3].upper())
+        seq = mutate(base_seq, mutation_rate)
+        entries.append((sp, gene_id, seq))
+    return entries
+
+
+def main(outdir: str = "test_data/input"):
+    os.makedirs(outdir, exist_ok=True)
+
+    # OG000001–OG000003: clean groups, all species, anchor present
+    for i in range(1, 4):
+        name = "OG%06d" % i
+        base = random_sequence(BASE_LENGTH)
+        entries = make_group(name, SPECIES, base, anchor_gene_id=ANCHOR_GENE_IDS[i - 1])
+        write_group(outdir, name, entries)
+
+    # OG000004: no anchor species → removed by filter_groups
+    name = "OG000004"
+    non_anchor = [sp for sp in SPECIES if sp != ANCHOR]
+    base = random_sequence(BASE_LENGTH)
+    entries = make_group(name, non_anchor, base, anchor_gene_id=ANCHOR_GENE_IDS[3])
+    write_group(outdir, name, entries)
+
+    # OG000005: only 2 species (anchor + 1) → removed by filter_groups
+    name = "OG000005"
+    base = random_sequence(BASE_LENGTH)
+    entries = make_group(name, [ANCHOR, "mmusculus"], base, anchor_gene_id=ANCHOR_GENE_IDS[4])
+    write_group(outdir, name, entries)
+
+    # OG000006: anchor present, 5 species, but one seq is an outlier length
+    name = "OG000006"
+    base = random_sequence(BASE_LENGTH)
+    entries = make_group(name, SPECIES, base, anchor_gene_id=ANCHOR_GENE_IDS[5])
+    # Replace drerio sequence with one that is 3x longer (clear outlier)
+    outlier_seq = random_sequence(BASE_LENGTH * 3)
+    entries = [(sp, gid, outlier_seq if sp == "drerio" else seq)
+               for sp, gid, seq in entries]
+    write_group(outdir, name, entries)
+
+    print("\nTest data written to '%s'" % outdir)
+    print("\nExpected behaviour:")
+    print("  OG000001–3 : pass all filters → aligned → identity computed")
+    print("  OG000004   : removed (no anchor species)")
+    print("  OG000005   : removed (only 2 species, min_species=4)")
+    print("  OG000006   : drerio seq removed by length filter; "
+          "group passes with 4 remaining species")
+
+
+if __name__ == "__main__":
+    import sys
+    outdir = sys.argv[1] if len(sys.argv) > 1 else "test_data/input"
+    main(outdir)
+</file>
+
+<file path="tests/prepare_ecoli_proteomes.py">
+"""
+Download and prepare proteomes for E. coli strains.
+
+Optionally removes pseudogene sequences, which are flagged with [pseudo=true]
+in efetch fasta_cds_aa headers and typically contain internal stop codons.
+
+For each strain:
+  1. Download chromosome protein sequences via efetch (fasta_cds_aa format)
+  2. Download plasmid protein sequences via efetch (one per plasmid accession)
+  3. Concatenate chromosome + plasmid proteins into a single FASTA per strain
+
+Identical sequences from different loci are intentionally kept — in bacteria,
+duplicate protein sequences reflect genuine multi-locus coding or horizontal
+gene transfer, and their presence increases the average identity score of the
+corresponding homolog group, which is biologically meaningful.
+
+Usage:
+    python tests/prepare_ecoli_proteomes.py <table> <outdir>
+
+    table  : TSV file with columns genomeID, Pathogenicity, plasmidIDs
+    outdir : Directory where proteome FASTAs will be written
+
+Dependencies:
+    efetch (entrez-direct)
+"""
+
+import os
+import sys
+import subprocess
+import logging
+import tempfile
+import argparse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+
+def parse_table(table_path: str) -> list[dict]:
+    """Parse the strain table into a list of records."""
+    strains = []
+    with open(table_path) as fh:
+        header = fh.readline().rstrip().split("\t")
+        for line in fh:
+            fields = line.rstrip().split("\t")
+            record = dict(zip(header, fields))
+            plasmids = (
+                record["plasmidIDs"].split("|")
+                if record["plasmidIDs"] != "-"
+                else []
+            )
+            strains.append({
+                "genome_id":     record["genomeID"],
+                "pathogenicity": record["Pathogenicity"],
+                "plasmids":      plasmids,
+            })
+    return strains
+
+
+def efetch_proteins(accession: str, out_path: str) -> str | None:
+    """Download protein sequences for any nucleotide accession via efetch.
+
+    Works for both chromosome and plasmid sequence accessions (NC_*, CP_*, etc.).
+    Uses fasta_cds_aa format which extracts translated CDS sequences directly
+    from the GenBank record.
+
+    Returns path to the protein FASTA, or None on failure.
+    """
+    if os.path.isfile(out_path):
+        return out_path
+
+    logger.info("Downloading proteins: %s", accession)
+    result = subprocess.run(
+        ["efetch", "-db", "nuccore", "-id", accession, "-format", "fasta_cds_aa"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        logger.warning(
+            "efetch failed for %s: %s",
+            accession, result.stderr.strip() or "empty response"
+        )
+        return None
+
+    with open(out_path, "w") as fh:
+        fh.write(result.stdout)
+
+    return out_path
+
+
+def prepare_strain(strain: dict, tmp_dir: str, outdir: str, remove_pseudogenes: bool = True):
+    """Download and merge proteome for a single strain."""
+    genome_id = strain["genome_id"]
+    out_fasta = os.path.join(outdir, genome_id + ".fa")
+
+    if os.path.isfile(out_fasta):
+        logger.info("Skipping %s (already processed)", genome_id)
+        return
+
+    fastas = []
+
+    # Chromosome
+    chrom_path = os.path.join(tmp_dir, genome_id + "_chromosome.faa")
+    chrom_fasta = efetch_proteins(genome_id, chrom_path)
+    if chrom_fasta:
+        fastas.append(chrom_fasta)
+    else:
+        logger.warning("Could not get chromosome proteins for %s", genome_id)
+
+    # Plasmids
+    for plasmid_id in strain["plasmids"]:
+        plasmid_path = os.path.join(tmp_dir, plasmid_id + "_plasmid.faa")
+        plasmid_fasta = efetch_proteins(plasmid_id, plasmid_path)
+        if plasmid_fasta:
+            fastas.append(plasmid_fasta)
+        else:
+            logger.warning("Could not get plasmid proteins for %s", plasmid_id)
+
+    if not fastas:
+        logger.error("No sequences retrieved for %s, skipping.", genome_id)
+        return
+
+    # Merge all sequences into a single proteome file, deduplicating by header ID
+    seen_ids = set()
+    n_seqs = 0
+    n_dupes = 0
+    with open(out_fasta, "w") as out_fh:
+        current_header = None
+        current_seq_lines = []
+        skip = False
+
+        def flush():
+            nonlocal n_seqs, n_dupes, skip
+            if current_header is None:
+                return
+            seq_id = current_header.split()[0][1:]  # strip '>' and take first field
+            if seq_id in seen_ids:
+                n_dupes += 1
+                return
+            seen_ids.add(seq_id)
+            out_fh.write(current_header + "\n")
+            for sl in current_seq_lines:
+                out_fh.write(sl + "\n")
+            n_seqs += 1
+
+        for fasta in fastas:
+            with open(fasta) as in_fh:
+                for line in in_fh:
+                    line = line.rstrip()
+                    if line.startswith(">"):
+                        flush()
+                        current_header = line
+                        current_seq_lines = []
+                    else:
+                        current_seq_lines.append(line)
+        flush()  # write the last record
+
+    if n_dupes:
+        logger.warning("Removed %d duplicate sequence(s) from %s", n_dupes, genome_id)
+    logger.info("Written: %s (%d sequences)", out_fasta, n_seqs)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download and prepare E. coli proteomes for OrthoFinder + ENHYDRA."
+    )
+    parser.add_argument("table",  help="TSV table with genomeID, Pathogenicity, plasmidIDs.")
+    parser.add_argument("outdir", help="Output directory for proteome FASTAs.")
+    parser.add_argument(
+        "--keep-pseudogenes",
+        action="store_true",
+        default=False,
+        help="Keep pseudogene sequences (flagged with [pseudo=true] in efetch output). "
+             "By default pseudogenes are removed, as they typically contain "
+             "internal stop codons and are not translated into functional proteins."
+    )
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    strains = parse_table(args.table)
+    logger.info("Loaded %d strains from %s", len(strains), args.table)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for strain in strains:
+            try:
+                prepare_strain(strain, tmp_dir, args.outdir,
+                               remove_pseudogenes=not args.keep_pseudogenes)
+            except Exception as e:
+                logger.error("Failed to process %s: %s", strain["genome_id"], e)
+
+    logger.info("Done. Proteomes written to: %s", args.outdir)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="tests/remove_pseudogenes.py">
+"""Quick script to remove pseudogene sequences from existing proteome FASTAs.
+Filters out any sequence whose header contains [pseudo=true].
+Overwrites files in place.
+
+Usage:
+    python tests/remove_pseudogenes.py <proteomes_dir>
+"""
+
+import os
+import sys
+
+proteomes_dir = sys.argv[1]
+
+for filename in os.listdir(proteomes_dir):
+    if not filename.endswith(".fa"):
+        continue
+    path = os.path.join(proteomes_dir, filename)
+    kept, removed = [], 0
+    current_header, current_seq = None, []
+
+    def flush():
+        global removed
+        if current_header is None:
+            return
+        if "[pseudo=true]" in current_header:
+            removed += 1
+        else:
+            kept.append(current_header)
+            kept.extend(current_seq)
+
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith(">"):
+                flush()
+                current_header = line
+                current_seq = []
+            else:
+                current_seq.append(line)
+    flush()
+
+    with open(path, "w") as fh:
+        fh.write("\n".join(kept) + "\n")
+
+    if removed:
+        print("%s: removed %d pseudogene(s), kept %d sequences" %
+              (filename, removed, len([l for l in kept if l.startswith(">")])))
+</file>
+
+<file path="tests/test_config_file">
+# test_project_config
+
+```
+inputdir    = test_data/input
+outdir      = test_data/output
+min_species = 4
+anchor      = hsapiens
+max_process = 4
+```
+
+# test_code_config
+
+```
+mafft  = /usr/local/bin/mafft    # adjust to your mafft path
+trimal = /usr/local/bin/trimal   # adjust to your trimal path
+```
+
+Find your paths with:
+```bash
+which mafft
+which trimal
+```
+</file>
+
+<file path="enhydra/differential.py">
+from __future__ import annotations
+
+import os
+import logging
+import pandas as pd
+
+from .exceptions import EnhydraIOError
+
+logger = logging.getLogger(__name__)
+
+
+def normalise_scores(
+    scores: pd.Series,
+    metric: str,
+) -> pd.Series:
+    """Normalise a Series of identity scores according to the chosen metric.
+
+    Args:
+        scores: Series of raw mean alignment identity values.
+        metric: Normalisation method:
+                'identity' — no transformation, raw identity values.
+                'zscore'   — z-score normalisation: (x - mean) / sd.
+                'rank'     — normalised rank: rank / N (1 = most conserved).
+
+    Returns:
+        Normalised Series with the same index.
+    """
+    if metric == "identity":
+        return scores
+    elif metric == "zscore":
+        return (scores - scores.mean()) / scores.std()
+    elif metric == "rank":
+        n = len(scores)
+        return scores.rank(ascending=False) / n
+    else:
+        raise ValueError(
+            "Unknown metric '%s'. Choose 'identity', 'zscore', or 'rank'." % metric
+        )
+
+
+
+    """Load group2mean.tsv as a Series indexed by group ID.
+
+    Args:
+        tables_dir: Path to a list's tables/ directory.
+
+    Returns:
+        Series: group_id → mean_identity (float).
+    """
+    path = os.path.join(tables_dir, "group2mean.tsv")
+    if not os.path.isfile(path):
+        raise EnhydraIOError("group2mean.tsv not found: %s" % path)
+    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "identity"])
+    df["identity"] = pd.to_numeric(df["identity"], errors="coerce")
+    df = df.dropna(subset=["identity"])
+    return df.set_index("group_id")["identity"]
+
+
+def _load_group2anchor(tables_dir: str) -> pd.Series:
+    """Load group2anchor.tsv as a Series indexed by group ID.
+
+    Args:
+        tables_dir: Path to a list's tables/ directory.
+
+    Returns:
+        Series: group_id → anchor_gene_id (str).
+    """
+    path = os.path.join(tables_dir, "group2anchor.tsv")
+    if not os.path.isfile(path):
+        raise EnhydraIOError("group2anchor.tsv not found: %s" % path)
+    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "gene_id"])
+    return df.set_index("group_id")["gene_id"]
+
+
+def compute_differential(
+    tables_dir1: str,
+    tables_dir2: str,
+    diff_dir: str,
+    metric: str = "identity",
+) -> str:
+    """Compute differential conservation scores between two ranked lists.
+
+    Subsets both lists to common orthogroups, computes a signed differential
+    score per group, and maps groups to anchor gene IDs using list 1's
+    group2anchor.tsv (so that gene IDs match the GMT file built from anchor 1).
+
+    Positive scores indicate higher conservation in list 1 (relative to list 2).
+    Negative scores indicate higher conservation in list 2.
+
+    Args:
+        tables_dir1: Path to list 1's tables/ directory.
+        tables_dir2: Path to list 2's tables/ directory.
+        diff_dir:    Directory where differential output files are written.
+        metric:      Scoring metric:
+                     'identity' — mean identity difference (identity_1 - identity_2).
+                     'rank'     — normalised rank difference (rank_1/N - rank_2/N),
+                                  where rank 1 = most conserved and N = list length.
+
+    Returns:
+        Path to the differential anchor2mean.tsv file for use with run_gsea().
+
+    Raises:
+        EnhydraIOError: If required input files are missing.
+        ValueError:     If no common orthogroups are found between the two lists.
+    """
+    os.makedirs(diff_dir, exist_ok=True)
+
+    logger.info("Loading group identity scores...")
+    mean1 = _load_group2mean(tables_dir1)
+    mean2 = _load_group2mean(tables_dir2)
+
+    # Subset to common orthogroups
+    common_groups = mean1.index.intersection(mean2.index)
+    n_common = len(common_groups)
+    logger.info(
+        "List 1: %d groups. List 2: %d groups. Common: %d groups.",
+        len(mean1), len(mean2), n_common,
+    )
+    if n_common == 0:
+        raise ValueError(
+            "No common orthogroups found between the two lists. "
+            "Check that both lists were derived from the same OrthoFinder run."
+        )
+
+    mean1 = mean1.loc[common_groups]
+    mean2 = mean2.loc[common_groups]
+
+    # Compute differential score
+    if metric == "identity":
+        scores = mean1 - mean2
+        logger.info("Metric: raw identity difference (identity_1 - identity_2).")
+    elif metric == "zscore":
+        scores = normalise_scores(mean1, "zscore") - normalise_scores(mean2, "zscore")
+        logger.info("Metric: z-score normalised identity difference.")
+    elif metric == "rank":
+        scores = normalise_scores(mean1, "rank") - normalise_scores(mean2, "rank")
+        logger.info("Metric: normalised rank difference (rank_1/N - rank_2/N).")
+    else:
+        raise ValueError(
+            "Unknown metric '%s'. Choose 'identity', 'zscore', or 'rank'." % metric
+        )
+
+    scores.name = "differential_score"
+
+    # Map group IDs → anchor gene IDs using list 1's group2anchor
+    logger.info("Mapping orthogroups to anchor gene IDs (from list 1)...")
+    group2anchor = _load_group2anchor(tables_dir1)
+    mapped = scores.to_frame().join(group2anchor, how="left")
+    n_unmapped = mapped["gene_id"].isna().sum()
+    if n_unmapped:
+        logger.warning(
+            "%d common groups could not be mapped to an anchor gene ID "
+            "and will be excluded from GSEA.", n_unmapped
+        )
+    mapped = mapped.dropna(subset=["gene_id"])
+
+    # Write differential scores table (group-level)
+    diff_scores_path = os.path.join(diff_dir, "differential_scores.tsv")
+    scores.reset_index().rename(
+        columns={"group_id": "group_id", "differential_score": "score"}
+    ).to_csv(diff_scores_path, sep="\t", index=False)
+    logger.info("Differential scores written to: %s", diff_scores_path)
+
+    # Write anchor2mean.tsv in ENHYDRA format (gene_id → score) for GSEA
+    anchor2mean_path = os.path.join(diff_dir, "anchor2mean.tsv")
+    mapped[["gene_id", "differential_score"]].to_csv(
+        anchor2mean_path, sep="\t", index=False, header=False
+    )
+    logger.info(
+        "Differential anchor2mean.tsv written: %d genes. Path: %s",
+        len(mapped), anchor2mean_path,
+    )
+
+    return anchor2mean_path
+</file>
+
+<file path="tests/build_gmt_interproscan.py">
+"""
+Build GMT files from InterProScan TSV output and the GO OBO file.
+
+Workflow:
+    InterProScan TSV (for anchor proteome)
+        → parse protein → GO term mappings
+        → download GO OBO file (cached)
+        → resolve GO term names and namespaces
+        → write one GMT file per requested namespace
+
+GMT format (tab-separated):
+    GO_ID <TAB> GO_term_name <TAB> protein1 <TAB> protein2 ...
+
+Protein IDs are extracted from the InterProScan TSV sequence column.
+If your FASTA headers follow the ENHYDRA format (speciesID|proteinID),
+only the proteinID portion is used.
+
+Usage:
+    python tests/build_gmt_interproscan.py \\
+        --interproscan  results/NC_004431.tsv \\
+        --anchor        NC_004431 \\
+        --outdir        test_data/gmt/ \\
+        --cache         test_data/obo_cache/ \\
+        --namespaces    GO_BP
+
+Dependencies: none beyond the standard library
+"""
+
+from __future__ import annotations
+
+import os
+import ssl
+import sys
+import logging
+import argparse
+import urllib.request
+from collections import defaultdict
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+GO_OBO_URL = "https://purl.obolibrary.org/obo/go/go-basic.obo"
+
+# Maps CLI namespace argument to GO OBO namespace string
+NAMESPACE_MAP: dict[str, str] = {
+    "GO_BP": "biological_process",
+    "GO_MF": "molecular_function",
+    "GO_CC": "cellular_component",
+}
+
+
+# --- Step 1: Download and parse GO OBO ---
+
+def download_obo(cache_dir: str) -> str:
+    """Download go-basic.obo if not already cached.
+
+    Args:
+        cache_dir: Directory to cache the OBO file.
+
+    Returns:
+        Path to the local OBO file.
+    """
+    local_path = os.path.join(cache_dir, "go-basic.obo")
+    if os.path.isfile(local_path):
+        logger.info("Using cached OBO file: %s", local_path)
+        return local_path
+    logger.info("Downloading GO OBO file from %s...", GO_OBO_URL)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(GO_OBO_URL, context=ctx) as response, \
+         open(local_path, "wb") as fh:
+        fh.write(response.read())
+    logger.info("Saved to: %s", local_path)
+    return local_path
+
+
+def parse_obo(obo_path: str) -> tuple[dict[str, dict[str, str]], dict[str, set[str]]]:
+    """Parse go-basic.obo into a term lookup dict and a parent→children DAG.
+
+    Args:
+        obo_path: Path to the OBO file.
+
+    Returns:
+        Tuple of:
+            go_terms: GO ID → {'name': str, 'namespace': str}.
+            parents:  GO ID → set of direct parent GO IDs
+                      (via is_a and part_of relationships).
+    """
+    logger.info("Parsing OBO file: %s", obo_path)
+    go_terms: dict[str, dict[str, str]] = {}
+    parents:  dict[str, set[str]] = {}
+
+    current_id        = None
+    current_name      = None
+    current_namespace = None
+    current_parents   = set()
+    is_obsolete       = False
+
+    with open(obo_path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line == "[Term]":
+                if current_id and not is_obsolete:
+                    go_terms[current_id] = {
+                        "name":      current_name or "",
+                        "namespace": current_namespace or "",
+                    }
+                    parents[current_id] = current_parents
+                current_id        = None
+                current_name      = None
+                current_namespace = None
+                current_parents   = set()
+                is_obsolete       = False
+            elif line.startswith("id: GO:"):
+                current_id = line[4:]
+            elif line.startswith("name: "):
+                current_name = line[6:]
+            elif line.startswith("namespace: "):
+                current_namespace = line[11:]
+            elif line.startswith("is_a:") or line.startswith("part_of:"):
+                # Extract parent GO ID: "is_a: GO:0008150 ! ..." → "GO:0008150"
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].startswith("GO:"):
+                    current_parents.add(parts[1])
+            elif line == "is_obsolete: true":
+                is_obsolete = True
+
+    # Save the last term
+    if current_id and not is_obsolete:
+        go_terms[current_id] = {
+            "name":      current_name or "",
+            "namespace": current_namespace or "",
+        }
+        parents[current_id] = current_parents
+
+    logger.info(
+        "Parsed %d non-obsolete GO terms with parent relationships.",
+        len(go_terms)
+    )
+    return go_terms, parents
+
+
+def get_ancestors(go_id: str, parents: dict[str, set[str]]) -> set[str]:
+    """Return all ancestor GO IDs for a given term (transitive closure).
+
+    Walks up the DAG via is_a and part_of relationships until the root.
+
+    Args:
+        go_id:   Starting GO term ID.
+        parents: Dict mapping GO ID → set of direct parent GO IDs.
+
+    Returns:
+        Set of all ancestor GO IDs (excluding the term itself).
+    """
+    ancestors = set()
+    queue = list(parents.get(go_id, []))
+    while queue:
+        parent = queue.pop()
+        if parent not in ancestors:
+            ancestors.add(parent)
+            queue.extend(parents.get(parent, []))
+    return ancestors
+
+
+# --- Step 2: Parse InterProScan TSV ---
+
+def parse_interproscan_tsv(
+    tsv_path: str,
+) -> dict[str, set[str]]:
+    """Parse an InterProScan TSV file into a protein → GO terms mapping.
+
+    InterProScan TSV columns (0-indexed):
+        0:  Protein accession
+        1:  Sequence MD5
+        2:  Sequence length
+        3:  Analysis
+        4:  Signature accession
+        5:  Signature description
+        6:  Start position
+        7:  Stop position
+        8:  Score
+        9:  Status
+        10: Date
+        11: InterPro accession (optional)
+        12: InterPro description (optional)
+        13: GO annotations (optional, pipe-separated)
+        14: Pathways (optional)
+
+    Protein IDs are taken from column 0. If the ID follows ENHYDRA's
+    'speciesID|proteinID' format, only the proteinID portion is used.
+
+    Args:
+        tsv_path: Path to the InterProScan TSV file.
+
+    Returns:
+        Dict mapping protein_id → set of GO IDs.
+    """
+    logger.info("Parsing InterProScan TSV: %s", tsv_path)
+    protein_to_go: dict[str, set[str]] = defaultdict(set)
+    n_rows = 0
+    n_with_go = 0
+
+    with open(tsv_path) as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            fields = line.rstrip("\n").split("\t")
+            n_rows += 1
+
+            # Extract protein ID from lcl-style ID:
+            # 'lcl|NC_004431.1_prot_WP_001366457.1_448' → 'WP_001366457.1'
+            # Falls back to the raw ID if the pattern is not matched
+            raw_id = fields[0]
+            if "|" in raw_id and "_prot_" in raw_id:
+                # lcl|<accession>_prot_<protein_id>_<index>
+                prot_part = raw_id.split("_prot_", 1)[1]
+                # Strip the trailing _<index> (last underscore-delimited field)
+                protein_id = "_".join(prot_part.split("_")[:-1])
+            elif "|" in raw_id:
+                protein_id = raw_id.split("|")[-1]
+            else:
+                protein_id = raw_id
+
+            # GO annotations are in column 13 (pipe-separated), if present
+            if len(fields) < 14 or not fields[13].strip():
+                continue
+            go_ids = [g.strip().split("(")[0] for g in fields[13].split("|") if g.strip()]
+            if go_ids:
+                protein_to_go[protein_id].update(go_ids)
+                n_with_go += 1
+
+    logger.info(
+        "Parsed %d rows. %d unique proteins with GO annotations.",
+        n_rows, len(protein_to_go)
+    )
+    return dict(protein_to_go)
+
+
+# --- Step 3: Build and write GMT ---
+
+def build_and_write_gmt(
+    protein_to_go: dict[str, set[str]],
+    go_terms: dict[str, dict[str, str]],
+    parents: dict[str, set[str]],
+    namespace: str,
+    out_path: str,
+):
+    """Build and write a GMT file for a single GO namespace.
+
+    Annotations are propagated up the GO DAG — if a protein is annotated
+    to a term, it is also added to all ancestor terms (true path rule).
+
+    Args:
+        protein_to_go: protein_id → set of directly annotated GO IDs.
+        go_terms:      GO ID → {'name': str, 'namespace': str}.
+        parents:       GO ID → set of direct parent GO IDs.
+        namespace:     Namespace key to write (e.g. 'GO_BP').
+        out_path:      Output GMT file path.
+    """
+    target_namespace = NAMESPACE_MAP[namespace]
+    go_to_proteins: dict[str, tuple[str, set[str]]] = {}
+
+    n_direct   = 0
+    n_propagated = 0
+    n_skipped  = 0
+
+    for protein_id, go_ids in protein_to_go.items():
+        # Expand direct annotations to include all ancestors
+        expanded = set(go_ids)
+        for go_id in go_ids:
+            if go_id in go_terms:
+                expanded.update(get_ancestors(go_id, parents))
+
+        for go_id in expanded:
+            term = go_terms.get(go_id)
+            if term is None:
+                n_skipped += 1
+                continue
+            if term["namespace"] != target_namespace:
+                continue
+            if go_id not in go_to_proteins:
+                go_to_proteins[go_id] = (term["name"], set())
+            go_to_proteins[go_id][1].add(protein_id)
+
+        n_direct     += len(go_ids)
+        n_propagated += len(expanded) - len(go_ids)
+
+    if n_skipped:
+        logger.warning(
+            "%d GO ID(s) not found in OBO file (obsolete or malformed).", n_skipped
+        )
+
+    logger.info(
+        "Namespace %s: %d GO terms after propagation "
+        "(%d direct annotations, %d propagated), "
+        "%d unique proteins.",
+        namespace,
+        len(go_to_proteins),
+        n_direct,
+        n_propagated,
+        len({p for _, proteins in go_to_proteins.values() for p in proteins}),
+    )
+
+    with open(out_path, "w") as fh:
+        for go_id, (go_name, proteins) in sorted(go_to_proteins.items()):
+            fh.write("%s\t%s\t%s\n" % (go_id, go_name, "\t".join(sorted(proteins))))
+
+    logger.info("GMT written to: %s", out_path)
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build GMT files from InterProScan TSV and GO OBO."
+    )
+    parser.add_argument(
+        "--interproscan", required=True,
+        help="Path to the InterProScan TSV output file."
+    )
+    parser.add_argument(
+        "--anchor", required=True,
+        help="Anchor genome ID (used to name the output GMT files, e.g. NC_004431)."
+    )
+    parser.add_argument(
+        "--outdir", required=True,
+        help="Directory where GMT files will be written."
+    )
+    parser.add_argument(
+        "--cache", required=True,
+        help="Directory for caching the GO OBO file."
+    )
+    parser.add_argument(
+        "--namespaces",
+        nargs="+",
+        default=["GO_BP"],
+        choices=list(NAMESPACE_MAP.keys()),
+        help="GO namespaces to build GMTs for. "
+             "Default: GO_BP. Options: GO_BP GO_MF GO_CC."
+    )
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(args.cache, exist_ok=True)
+
+    # Step 1: Download and parse OBO
+    obo_path = download_obo(args.cache)
+    go_terms, parents = parse_obo(obo_path)
+
+    # Step 2: Parse InterProScan TSV
+    protein_to_go = parse_interproscan_tsv(args.interproscan)
+
+    # Step 3: Build one GMT per namespace
+    for namespace in args.namespaces:
+        out_path = os.path.join(
+            args.outdir, "%s_%s.gmt" % (args.anchor, namespace)
+        )
+        build_and_write_gmt(protein_to_go, go_terms, parents, namespace, out_path)
+
+    logger.info("Done.")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="tests/reconstruct_orthogroups.py">
+"""
+Reconstruct orthogroup FASTA files from OrthoFinder output and E. coli proteomes.
+
+Produces three sets of per-orthogroup FASTA files:
+  all/             one FASTA per OG, all species
+  pathogenic/      one FASTA per OG, pathogenic species only
+  non_pathogenic/  one FASTA per OG, non-pathogenic species only
+
+Sequence headers follow ENHYDRA's expected format:
+  >genomeID|proteinID
+
+Usage:
+    python tests/reconstruct_orthogroups.py \\
+        --table    tests/E_coli_genomes.tsv \\
+        --proteomes test_data/ecoli_proteomes/ \\
+        --orthogroups <orthofinder_dir>/Orthogroups/Orthogroups.txt \\
+        --outdir   test_data/ecoli_orthogroups/
+
+Dependencies: Biopython
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import logging
+import argparse
+from Bio import SeqIO
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+
+# --- Parsing ---
+
+def parse_table(table_path: str) -> dict[str, str]:
+    """Parse the strain table.
+
+    Returns:
+        pathogenicity: maps genome_id → 'pathogenic' | 'non-pathogenic'
+    """
+    pathogenicity = {}
+    with open(table_path) as fh:
+        header = fh.readline().rstrip().split("\t")
+        for line in fh:
+            fields = line.rstrip().split("\t")
+            record = dict(zip(header, fields))
+            pathogenicity[record["genomeID"]] = record["Pathogenicity"]
+    return pathogenicity
+
+
+def parse_lcl_id(lcl_id: str) -> str | None:
+    """Extract the sequence accession from a lcl-style sequence ID.
+
+    'lcl|NZ_CP012380.1_prot_WP_000870373.1_847' → 'NZ_CP012380.1'
+
+    Returns None if the format is not recognised.
+    """
+    match = re.match(r"lcl\|(.+?)_prot_", lcl_id)
+    if match:
+        return match.group(1)
+    return None
+
+
+def parse_protein_id(full_header: str, lcl_id: str) -> str:
+    """Extract protein_id from a full efetch FASTA header.
+
+    First tries to extract from the [protein_id=...] field. If not found,
+    falls back to parsing the protein ID from the lcl-style sequence ID:
+        lcl|NC_004431.1_prot_WP_000361612.1_1 → WP_000361612.1
+
+    Args:
+        full_header: Full sequence description string.
+        lcl_id:      Raw sequence ID (lcl|... style).
+
+    Returns:
+        Protein ID string.
+    """
+    # Try [protein_id=...] field first
+    match = re.search(r"\[protein_id=([^\]]+)\]", full_header)
+    if match:
+        return match.group(1)
+
+    # Fall back to parsing from lcl ID:
+    # lcl|<accession>_prot_<protein_id>_<index> → <protein_id>
+    if "_prot_" in lcl_id:
+        prot_part = lcl_id.split("_prot_", 1)[1]
+        return "_".join(prot_part.split("_")[:-1])
+
+    # Last resort: return the lcl_id as-is
+    return lcl_id
+
+
+def index_proteomes(proteomes_dir: str) -> dict[str, tuple[str, str, str]]:
+    """Build a lookup index from proteome FASTAs.
+
+    Indexes sequences by their lcl ID (as used in Orthogroups.txt).
+    The genome ID is determined first by the proteome filename (authoritative),
+    then by the accession2genome table as a fallback.
+
+    Args:
+        proteomes_dir:    Directory of per-strain proteome FASTAs.
+        accession2genome: Maps any sequence accession → genome_id.
+
+    Returns:
+        Dictionary mapping lcl_id → (genome_id, protein_id, sequence).
+    """
+    index = {}
+    files = [f for f in os.listdir(proteomes_dir) if f.endswith(".fa")]
+    logger.info("Indexing %d proteome files...", len(files))
+
+    for filename in files:
+        # Genome ID is always the filename stem — authoritative regardless
+        # of what accessions appear inside the lcl headers
+        genome_id = filename.replace(".fa", "")
+        path = os.path.join(proteomes_dir, filename)
+
+        for record in SeqIO.parse(path, "fasta"):
+            lcl_id = record.id
+            protein_id = parse_protein_id(record.description, lcl_id)
+            index[lcl_id] = (genome_id, protein_id, str(record.seq))
+
+    logger.info("Indexed %d sequences.", len(index))
+    return index
+
+
+def parse_orthogroups(orthogroups_path: str) -> dict[str, list[str]]:
+    """Parse Orthogroups.txt into a dict mapping OG_id → list of lcl_ids."""
+    orthogroups = {}
+    with open(orthogroups_path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if not line:
+                continue
+            og_id, _, members = line.partition(": ")
+            orthogroups[og_id] = members.split()
+    logger.info("Parsed %d orthogroups.", len(orthogroups))
+    return orthogroups
+
+
+# --- Writing ---
+
+def write_orthogroup_fastas(
+    orthogroups: dict[str, list[str]],
+    seq_index: dict[str, tuple[str, str, str]],
+    pathogenicity: dict[str, str],
+    outdir: str,
+):
+    """Write three sets of per-orthogroup FASTA files.
+
+    Args:
+        orthogroups:   OG_id → list of lcl_ids.
+        seq_index:     lcl_id → (genome_id, protein_id, sequence).
+        pathogenicity: genome_id → 'pathogenic' | 'non-pathogenic'.
+        outdir:        Root output directory.
+    """
+    dirs = {
+        "all":            os.path.join(outdir, "all"),
+        "pathogenic":     os.path.join(outdir, "pathogenic"),
+        "non_pathogenic": os.path.join(outdir, "non_pathogenic"),
+    }
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
+
+    n_written = 0
+    n_skipped = 0
+
+    for og_id, lcl_ids in orthogroups.items():
+        entries = []
+        for lcl_id in lcl_ids:
+            if lcl_id not in seq_index:
+                logger.debug("lcl_id not in index: %s", lcl_id)
+                n_skipped += 1
+                continue
+            genome_id, protein_id, seq = seq_index[lcl_id]
+            entries.append((genome_id, protein_id, seq))
+
+        if not entries:
+            continue
+
+        # Write all
+        _write_fasta(entries, os.path.join(dirs["all"], og_id))
+
+        # Write pathogenic subset
+        pathogenic_entries = [
+            e for e in entries if pathogenicity.get(e[0]) == "pathogenic"
+        ]
+        if pathogenic_entries:
+            _write_fasta(pathogenic_entries, os.path.join(dirs["pathogenic"], og_id))
+
+        # Write non-pathogenic subset
+        non_pathogenic_entries = [
+            e for e in entries if pathogenicity.get(e[0]) == "non-pathogenic"
+        ]
+        if non_pathogenic_entries:
+            _write_fasta(non_pathogenic_entries, os.path.join(dirs["non_pathogenic"], og_id))
+
+        n_written += 1
+
+    logger.info(
+        "Written %d orthogroups. Sequences not found in index: %d.",
+        n_written, n_skipped
+    )
+
+
+def _write_fasta(entries: list[tuple[str, str, str]], out_path: str):
+    """Write a list of (genome_id, protein_id, sequence) to a FASTA file."""
+    with open(out_path, "w") as fh:
+        for genome_id, protein_id, seq in entries:
+            fh.write(">%s|%s\n%s\n" % (genome_id, protein_id, seq))
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reconstruct orthogroup FASTAs from OrthoFinder output."
+    )
+    parser.add_argument("--table",       required=True, help="Strain TSV table.")
+    parser.add_argument("--proteomes",   required=True, help="Directory of proteome FASTAs.")
+    parser.add_argument("--orthogroups", required=True, help="Path to Orthogroups.txt.")
+    parser.add_argument("--outdir",      required=True, help="Output directory.")
+    args = parser.parse_args()
+
+    logger.info("Parsing strain table...")
+    pathogenicity = parse_table(args.table)
+    logger.info("Loaded %d strains.", len(pathogenicity))
+
+    logger.info("Indexing proteomes...")
+    seq_index = index_proteomes(args.proteomes)
+
+    logger.info("Parsing Orthogroups.txt...")
+    orthogroups = parse_orthogroups(args.orthogroups)
+
+    logger.info("Writing orthogroup FASTAs...")
+    write_orthogroup_fastas(orthogroups, seq_index, pathogenicity, args.outdir)
+
+    logger.info("Done. Output written to: %s", args.outdir)
+    logger.info("  all/            → %s", os.path.join(args.outdir, "all"))
+    logger.info("  pathogenic/     → %s", os.path.join(args.outdir, "pathogenic"))
+    logger.info("  non_pathogenic/ → %s", os.path.join(args.outdir, "non_pathogenic"))
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="README.md">
+# ENHYDRA
+
+**ENHYDRA** is a bioinformatics pipeline for Gene Set Enrichment Analysis (GSEA) in an evolutionary genomics context. Starting from groups of homologs, it filters, aligns, and ranks them by sequence identity, then applies the GSEA algorithm to detect functional enrichment patterns across a phylogenetic comparative framework.
+
+---
+
+## Overview
+
+Traditional GSEA is designed for expression data. ENHYDRA extends this concept to evolutionary genomics by ranking homolog groups according to their average pairwise sequence identity across species, and testing whether gene sets (e.g. Gene Ontology terms) are enriched at the top or bottom of this ranking — revealing which biological functions are evolving faster or slower across a set of species.
+
+Functional annotations are mapped through an **anchor genome** — a reference species for which GO annotation data is available.
+
+### Pipeline steps
+
+1. **[Optional] OrthoFinder preprocessing** — converts OrthoFinder 3 output into ENHYDRA-compatible input.
+2. **Length filtering** — sequences deviating more than 2 standard deviations from the group mean length are removed.
+3. **Group filtering** — groups lacking the anchor species, falling below the minimum species count, or failing paralog criteria are discarded.
+4. **Alignment** — surviving groups are aligned with MAFFT.
+5. **Identity estimation** — trimAl computes per-alignment average sequence identity.
+6. **Table generation** — outputs ranked group-to-identity and anchor gene-to-identity tables.
+7. **GSEA** — GSEApy prerank is run on the ranked gene list using a local GMT file.
+
+---
+
+## Dependencies
+
+| Tool / Library | Purpose |
+|---|---|
+| Python ≥ 3.9 | Runtime |
+| [Biopython](https://biopython.org/) | FASTA parsing |
+| [NumPy](https://numpy.org/) | Sequence length sorting |
+| [pandas](https://pandas.pydata.org/) | Ranked list handling |
+| [GSEApy](https://gseapy.readthedocs.io/) | GSEA algorithm |
+| [gprofiler-official](https://pypi.org/project/gprofiler-official/) | g:Profiler API access |
+| [MAFFT](https://mafft.cbrc.jp/alignment/software/) | Multiple sequence alignment |
+| [trimAl](http://trimal.cgenomics.org/) | Alignment identity computation |
+
+Install Python dependencies:
+
+```bash
+pip install enhydra
+```
+
+MAFFT and trimAl must be installed separately and their paths provided in the code configuration file.
+
+---
+
+## Input
+
+ENHYDRA accepts two types of input:
+
+### Mode A — Pre-computed homolog groups
+A directory of FASTA files, one per homolog group. Sequence identifiers must follow the format:
+
+```
+>speciesID|geneID
+```
+
+### Mode B — OrthoFinder 3 output
+Pass the OrthoFinder output directory via `--orthofinder-dir`. ENHYDRA will automatically convert `Orthogroup_Sequences/` into the required format. Sequence headers in OrthoFinder output must follow the `speciesname_geneID` convention (automatically produced when input proteome files are named `<speciesID>.fa`).
+
+---
+
+## Preparing input proteomes
+
+For bacterial datasets, ENHYDRA provides a helper script to download proteomes from NCBI and prepare them for OrthoFinder:
+
+```bash
+# Download proteomes (chromosome + plasmids merged per strain)
+python tests/prepare_ecoli_proteomes.py strain_table.tsv proteomes/
+
+# Remove pseudogenes from existing proteome FASTAs
+python tests/remove_pseudogenes.py proteomes/
+```
+
+The strain table should be a TSV file with columns `genomeID`, `Pathogenicity`, and `plasmidIDs` (pipe-separated, or `-` if none):
+
+```
+genomeID    Pathogenicity   plasmidIDs
+NC_004431   pathogenic      -
+NC_002655   pathogenic      NC_007414
+CP019778    non-pathogenic  -
+```
+
+Pseudogene removal is enabled by default (sequences flagged `[pseudo=true]` in efetch output). To keep pseudogenes:
+
+```bash
+python tests/prepare_ecoli_proteomes.py strain_table.tsv proteomes/ --keep-pseudogenes
+```
+
+---
+
+## Building GMT files
+
+ENHYDRA requires a GMT file for GSEA. The recommended approach is to run InterProScan on the anchor proteome and build the GMT from its output:
+
+```bash
+# Run InterProScan (requires separate installation)
+interproscan.sh -i proteomes/NC_004431.fa -f TSV \
+    -o NC_004431.interpro.tsv -goterms -pa
+
+# Build GMT (one per namespace)
+python tests/build_gmt_interproscan.py \
+    --interproscan NC_004431.interpro.tsv \
+    --anchor       NC_004431 \
+    --outdir       gmt/ \
+    --cache        obo_cache/ \
+    --namespaces   GO_BP
+```
+
+To build all three GO namespaces at once:
+
+```bash
+python tests/build_gmt_interproscan.py \
+    --interproscan NC_004431.interpro.tsv \
+    --anchor       NC_004431 \
+    --outdir       gmt/ \
+    --cache        obo_cache/ \
+    --namespaces   GO_BP GO_MF GO_CC
+```
+
+The GO OBO file is downloaded automatically and cached for reuse across runs and anchors.
+
+---
+
+## Configuration
+
+ENHYDRA uses two configuration files.
+
+### Project configuration file
+
+```
+inputdir    = /path/to/input/fasta/directory
+outdir      = /path/to/output/directory
+min_species = 40
+anchor      = NC_004431
+max_process = 8
+```
+
+| Parameter | Description |
+|---|---|
+| `inputdir` | Directory containing input FASTA files (one per homolog group) |
+| `outdir` | Output directory (must not already exist unless `--resume` is used) |
+| `min_species` | Minimum number of distinct species required to retain a group |
+| `anchor` | Species ID of the anchor genome used for annotation mapping |
+| `max_process` | Number of parallel processes for the length filtering step |
+
+### Code configuration file
+
+```
+mafft  = /usr/local/bin/mafft
+trimal = /usr/local/bin/trimal
+```
+
+---
+
+## Usage
+
+```bash
+enhydra <code_config> <project_config> --gene-sets <gmt_file> [options]
+```
+
+### Basic usage
+
+```bash
+enhydra code_config project_config --gene-sets gmt/NC_004431_GO_BP.gmt
+```
+
+### With OrthoFinder input
+
+```bash
+enhydra code_config project_config \
+    --orthofinder-dir OrthoFinder/Results_Jan01 \
+    --gene-sets gmt/NC_004431_GO_BP.gmt
+```
+
+### Resume an interrupted run
+
+```bash
+enhydra code_config project_config \
+    --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --resume
+```
+
+### Paralog handling
+
+```bash
+# Keep all sequences including paralogs (default)
+enhydra code_config project_config --gene-sets gmt/NC_004431_GO_BP.gmt
+
+# Remove any group containing paralogs
+enhydra code_config project_config --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --paralogs remove
+
+# Keep only the longest sequence per species
+enhydra code_config project_config --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --paralogs longest
+```
+
+### Full options
+
+```
+positional arguments:
+  code_config           Path to the code configuration file.
+  project_config        Path to the project configuration file.
+
+options:
+  --orthofinder-dir     Path to an OrthoFinder 3 output directory.
+  --resume              Resume a previously interrupted run.
+  --paralogs {all,remove,longest}
+                        How to handle paralogs (default: all).
+  --gene-sets           Path to a local .gmt file.
+  --organism            g:Profiler organism name (alternative to --gene-sets).
+  --sources             g:Profiler data sources (default: GO:BP GO:MF GO:CC KEGG REAC).
+  --permutations        Number of GSEA permutations (default: 1000).
+  --min-size            Minimum gene set size (default: 5).
+  --max-size            Maximum gene set size (default: 500).
+  --seed                Random seed (default: 42).
+```
+
+---
+
+## Output
+
+```
+outdir/
+├── enhydra.log                   # Run log
+├── length_stats/                 # Per-group length distribution statistics
+├── length_filter/                # FASTA files after length filtering
+├── group_filter/                 # FASTA files after group filtering
+├── alignment/                    # MAFFT alignments
+├── ident_alignment/              # trimAl identity reports
+├── tables/
+│   ├── group2mean.tsv            # Homolog group → mean alignment identity
+│   ├── anchor2mean.tsv           # Anchor gene ID → mean alignment identity
+│   └── group2anchor.tsv          # Homolog group → anchor gene ID
+└── enrichment/
+    └── gseapy.gene_set.prerank.report.csv   # GSEA results
+```
+
+### Interpreting GSEA results
+
+The results table contains one row per tested gene set with the following key columns:
+
+| Column | Description |
+|---|---|
+| `Name` | GO term ID |
+| `Term` | GO term name |
+| `NES` | Normalised enrichment score (positive = more conserved, negative = faster evolving) |
+| `NOM p-val` | Nominal p-value |
+| `FDR q-val` | FDR-corrected p-value |
+| `Lead_genes` | Genes in the leading edge |
+
+Significant gene sets are conventionally those with FDR < 0.25. To extract them:
+
+```bash
+awk -F',' 'NR==1 || $6 < 0.25' \
+    outdir/enrichment/gseapy.gene_set.prerank.report.csv
+```
+
+Or in R:
+
+```r
+library(tidyverse)
+read_csv("outdir/enrichment/gseapy.gene_set.prerank.report.csv") %>%
+    filter(`FDR q-val` < 0.25) %>%
+    arrange(`FDR q-val`) %>%
+    select(Name, Term, NES, `NOM p-val`, `FDR q-val`, Lead_genes)
+```
+
+---
+
+## Notes on sequence identity and paralogs
+
+ENHYDRA uses **protein-level** average pairwise sequence identity as the ranking metric. Synonymous mutations at the nucleotide level are invisible at the protein level, making protein identity a better proxy for functional conservation and a stronger signal for positive Darwinian selection.
+
+Paralog handling is controlled by `--paralogs`:
+- For **bacterial datasets**, `--paralogs all` (default) is recommended — duplicate proteins from multi-locus coding or horizontal gene transfer are biologically meaningful and correctly increase a group's average identity score.
+- For **eukaryotic datasets**, `--paralogs longest` or `--paralogs remove` is recommended to avoid bias from within-species gene family expansions.
+
+---
+
+## Citation
+
+> *(Citation information will be added upon publication.)*
+
+---
+
+## License
+
+> *(License information to be added.)*
+</file>
+
+<file path="enhydra/utils.py">
+import os
+from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
+
+
+def check_parameters(parameters, code_config):
+    if not parameters['inputdir']:
+        raise EnhydraConfigError(
+            "No path to inputdir was specified in your project's configuration file.")
+    if not os.path.isdir(parameters['inputdir']):
+        raise EnhydraIOError(
+            "inputdir is not a valid directory: %s" % parameters['inputdir'])
+    if not os.access(parameters['inputdir'], os.R_OK):
+        raise EnhydraIOError(
+            "No read permission for inputdir: %s" % parameters['inputdir'])
+
+    if not parameters['outdir']:
+        raise EnhydraConfigError(
+            "No path to outdir was specified in your project's configuration file.")
+
+    if not parameters['min_species']:
+        raise EnhydraConfigError(
+            "min_species was not specified in your project's configuration file.")
+
+    if not parameters['anchor']:
+        raise EnhydraConfigError(
+            "No anchor species was specified in your project's configuration file.")
+
+    if not parameters['max_process']:
+        raise EnhydraConfigError(
+            "max_process was not specified in your project's configuration file.")
+
+    if not parameters['trimal']:
+        raise EnhydraConfigError(
+            "No path to trimal was specified in code_config: %s" % code_config)
+    if not os.path.isfile(parameters['trimal']):
+        raise EnhydraToolError(
+            "trimal executable not found at: %s" % parameters['trimal'])
+    if not os.access(parameters['trimal'], os.X_OK):
+        raise EnhydraToolError(
+            "No execute permission for trimal at: %s" % parameters['trimal'])
+
+    if not parameters['mafft']:
+        raise EnhydraConfigError(
+            "No path to mafft was specified in code_config: %s" % code_config)
+    if not os.path.isfile(parameters['mafft']):
+        raise EnhydraToolError(
+            "mafft executable not found at: %s" % parameters['mafft'])
+    if not os.access(parameters['mafft'], os.X_OK):
+        raise EnhydraToolError(
+            "No execute permission for mafft at: %s" % parameters['mafft'])
+</file>
+
+<file path="enhydra/plotting.py">
+from __future__ import annotations
+
+import os
+import logging
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend, safe for pipeline use
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
+logger = logging.getLogger(__name__)
+
+# --- Shared style ---
+FIGURE_DPI   = 300
+FIGURE_STYLE = "seaborn-v0_8-whitegrid"
+PALETTE      = {
+    "positive": "#2166ac",  # blue  — more conserved in list 1 / overall
+    "negative": "#d6604d",  # red   — faster evolving in list 1 / overall
+    "neutral":  "#878787",  # grey  — background
+}
+
+
+def _save(fig: plt.Figure, out_dir: str, name: str):
+    """Save a figure as both PNG and PDF."""
+    for ext in ("png", "pdf"):
+        path = os.path.join(out_dir, "%s.%s" % (name, ext))
+        fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    logger.info("Plot saved: %s (.png/.pdf)", os.path.join(out_dir, name))
+    plt.close(fig)
+
+
+def _load_anchor2mean(anchor2mean_path: str) -> pd.DataFrame:
+    """Load anchor2mean.tsv into a DataFrame."""
+    return pd.read_csv(
+        anchor2mean_path, sep="\t", header=None, names=["gene_id", "score"]
+    )
+
+
+def _load_group2mean(tables_dir: str) -> pd.Series:
+    """Load group2mean.tsv as a Series indexed by group ID."""
+    path = os.path.join(tables_dir, "group2mean.tsv")
+    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "score"])
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    return df.dropna().set_index("group_id")["score"]
+
+
+def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
+    """Load GSEApy prerank results CSV."""
+    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if not os.path.isfile(path):
+        logger.warning("GSEA results not found: %s", path)
+        return None
+    return pd.read_csv(path)
+
+
+# --- Single-list plots ---
+
+def plot_identity_distribution(
+    anchor2mean_path: str,
+    plots_dir: str,
+    label: str = "Mean alignment identity",
+):
+    """Histogram of mean alignment identity scores across all groups.
+
+    Args:
+        anchor2mean_path: Path to anchor2mean.tsv.
+        plots_dir:        Output directory for plots.
+        label:            X-axis label (adjust for differential mode).
+    """
+    df = _load_anchor2mean(anchor2mean_path)
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df = df.dropna(subset=["score"])
+
+    with plt.style.context(FIGURE_STYLE):
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(
+            df["score"], bins=50,
+            color=PALETTE["neutral"], edgecolor="white", linewidth=0.5
+        )
+        ax.set_xlabel(label, fontsize=12)
+        ax.set_ylabel("Number of orthogroups", fontsize=12)
+        ax.set_title("Distribution of %s" % label.lower(), fontsize=13)
+        ax.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+        fig.tight_layout()
+
+    _save(fig, plots_dir, "identity_distribution")
+
+
+def plot_gsea_barplot(
+    results_dir: str,
+    plots_dir: str,
+    obo_names: dict[str, str] | None = None,
+    fdr_threshold: float = 0.25,
+    top_n: int = 20,
+    title: str = "Top enriched gene sets",
+):
+    """Horizontal bar plot of NES scores for significant gene sets.
+
+    Generates PNG and PDF for publication and an SVG with GO definition
+    tooltips for the HTML report.
+
+    Args:
+        results_dir:   Directory containing GSEApy results CSV.
+        plots_dir:     Output directory for plots.
+        obo_names:     GO ID → term name dict for SVG tooltips (optional).
+        fdr_threshold: FDR threshold for significance (default: 0.25).
+        top_n:         Maximum number of gene sets to show per direction.
+        title:         Plot title.
+    """
+    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if not os.path.isfile(path):
+        logger.warning("GSEA results not found: %s", path)
+        return
+    df = pd.read_csv(path)
+
+    sig = df[df["FDR q-val"] < fdr_threshold].copy()
+    if sig.empty:
+        logger.warning("No significant gene sets (FDR < %s) to plot.", fdr_threshold)
+        return
+
+    pos = sig[sig["NES"] > 0].nlargest(top_n, "NES")
+    neg = sig[sig["NES"] < 0].nsmallest(top_n, "NES")
+    plot_df = pd.concat([pos, neg]).sort_values("NES").reset_index(drop=True)
+
+    colors = [
+        PALETTE["positive"] if nes > 0 else PALETTE["negative"]
+        for nes in plot_df["NES"]
+    ]
+
+    with plt.style.context(FIGURE_STYLE):
+        fig_height = max(4, len(plot_df) * 0.45)
+        fig, ax = plt.subplots(figsize=(10, fig_height))
+        bars = ax.barh(plot_df["Term"], plot_df["NES"], color=colors, edgecolor="none")
+        ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("Normalised Enrichment Score (NES)", fontsize=12)
+        ax.set_title(title, fontsize=13)
+
+        # Fixed offset for FDR labels — always outside the bar
+        x_range = max(abs(plot_df["NES"].max()), abs(plot_df["NES"].min()))
+        offset = x_range * 0.03
+
+        for bar, (_, row) in zip(bars, plot_df.iterrows()):
+            if row["NES"] > 0:
+                x = bar.get_width() + offset
+                ha = "left"
+            else:
+                x = bar.get_width() - offset
+                ha = "right"
+            ax.text(
+                x, bar.get_y() + bar.get_height() / 2,
+                "FDR=%.3f" % row["FDR q-val"],
+                va="center", ha=ha, fontsize=7, color="#333"
+            )
+
+        # Add extra margin so labels don't get clipped
+        ax.set_xlim(
+            ax.get_xlim()[0] - offset * 8,
+            ax.get_xlim()[1] + offset * 8
+        )
+        fig.tight_layout()
+
+    _save(fig, plots_dir, "gsea_barplot")
+
+    # --- SVG version with GO definition tooltips ---
+    _save_gsea_barplot_svg(plot_df, colors, offset, title, plots_dir, obo_names or {})
+
+
+def _save_gsea_barplot_svg(
+    plot_df: pd.DataFrame,
+    colors: list[str],
+    offset: float,
+    title: str,
+    plots_dir: str,
+    obo_names: dict[str, str],
+):
+    """Save an SVG version of the barplot with browser-native hover tooltips."""
+    import xml.etree.ElementTree as ET
+
+    n = len(plot_df)
+    bar_h = 18
+    margin_left = 120   # GO ID labels
+    margin_right = 20   # FDR labels
+    margin_top = 50
+    margin_bottom = 50
+    plot_w = 400
+    svg_w = margin_left + plot_w + margin_right
+    svg_h = margin_top + n * bar_h + margin_bottom
+
+    nes_vals = plot_df["NES"].values
+    x_abs_max = max(abs(nes_vals.min()), abs(nes_vals.max()))
+    x_min = -x_abs_max * 1.05
+    x_max =  x_abs_max * 1.05
+
+    def to_px(nes):
+        return margin_left + (nes - x_min) / (x_max - x_min) * plot_w
+
+    zero_px = to_px(0)
+
+    svg = ET.Element("svg", {
+        "xmlns": "http://www.w3.org/2000/svg",
+        "width": str(svg_w), "height": str(svg_h),
+        "font-family": "Arial, sans-serif",
+    })
+
+    # Title
+    ET.SubElement(svg, "text", {
+        "x": str(svg_w // 2), "y": "30",
+        "text-anchor": "middle", "font-size": "13",
+        "font-weight": "bold", "fill": "#1a3a5c",
+    }).text = title
+
+    # Zero line
+    ET.SubElement(svg, "line", {
+        "x1": str(zero_px), "y1": str(margin_top),
+        "x2": str(zero_px), "y2": str(margin_top + n * bar_h),
+        "stroke": "#555", "stroke-width": "1", "stroke-dasharray": "4,3",
+    })
+
+    # X-axis tick labels
+    for nes_tick in [-x_abs_max, -x_abs_max / 2, 0, x_abs_max / 2, x_abs_max]:
+        tx = to_px(nes_tick)
+        ax_y = margin_top + n * bar_h
+        ET.SubElement(svg, "line", {
+            "x1": str(tx), "y1": str(ax_y),
+            "x2": str(tx), "y2": str(ax_y + 4),
+            "stroke": "#555", "stroke-width": "1",
+        })
+        ET.SubElement(svg, "text", {
+            "x": str(tx), "y": str(ax_y + 15),
+            "text-anchor": "middle", "font-size": "9", "fill": "#555",
+        }).text = "%.2f" % nes_tick
+
+    # X-axis label
+    ET.SubElement(svg, "text", {
+        "x": str(margin_left + plot_w // 2),
+        "y": str(margin_top + n * bar_h + 35),
+        "text-anchor": "middle", "font-size": "11", "fill": "#333",
+    }).text = "Normalised Enrichment Score (NES)"
+
+    # Bars
+    for idx, (_, row) in enumerate(plot_df.iterrows()):
+        y = margin_top + idx * bar_h
+        nes = row["NES"]
+        bar_x = min(zero_px, to_px(nes))
+        bar_w = max(abs(to_px(nes) - zero_px), 1)
+        color = PALETTE["positive"] if nes > 0 else PALETTE["negative"]
+
+        go_id = row["Term"]
+        definition = obo_names.get(go_id, "")
+        tooltip_text = "%s | %s | NES=%.3f | FDR=%.3f" % (
+            go_id, definition, nes, row["FDR q-val"]
+        )
+
+        g = ET.SubElement(svg, "g", {
+            "class": "bar-group",
+            "data-tip": tooltip_text,
+            "style": "cursor:pointer;",
+        })
+
+        # Bar
+        ET.SubElement(g, "rect", {
+            "x": str(bar_x), "y": str(y + 5),
+            "width": str(bar_w), "height": str(bar_h - 10),
+            "fill": color, "opacity": "0.85", "rx": "2",
+        })
+
+        # GO ID label
+        lbl = ET.SubElement(g, "text", {
+            "x": str(margin_left - 6),
+            "y": str(y + bar_h // 2 + 4),
+            "text-anchor": "end",
+            "font-size": "10", "fill": "#1a3a5c",
+        })
+        lbl.text = go_id
+
+        # FDR label
+        fdr_x = to_px(nes) + 5 if nes > 0 else to_px(nes) - 5
+        fdr_anchor = "start" if nes > 0 else "end"
+        fdr_el = ET.SubElement(g, "text", {
+            "x": str(fdr_x),
+            "y": str(y + bar_h // 2 + 4),
+            "text-anchor": fdr_anchor,
+            "font-size": "9", "fill": "#555",
+        })
+        fdr_el.text = "FDR=%.3f" % row["FDR q-val"]
+
+        # Invisible hit area covering the full row for easier hovering
+        ET.SubElement(g, "rect", {
+            "x": str(margin_left), "y": str(y),
+            "width": str(plot_w), "height": str(bar_h),
+            "fill": "transparent",
+        })
+
+    svg_path = os.path.join(plots_dir, "gsea_barplot.svg")
+    ET.ElementTree(svg).write(svg_path, encoding="unicode", xml_declaration=False)
+    logger.info("SVG barplot written to: %s", svg_path)
+
+
+# --- Two-list plots ---
+
+def plot_identity_scatter(
+    tables_dir1: str,
+    tables_dir2: str,
+    diff_scores_path: str,
+    plots_dir: str,
+    label1: str = "List 1 mean identity",
+    label2: str = "List 2 mean identity",
+):
+    """Scatter plot of list 1 vs list 2 identity for common groups.
+
+    Points are coloured by differential score — blue for genes more conserved
+    in list 1, red for genes more conserved in list 2.
+
+    Args:
+        tables_dir1:      Path to list 1's tables/ directory.
+        tables_dir2:      Path to list 2's tables/ directory.
+        diff_scores_path: Path to differential_scores.tsv.
+        plots_dir:        Output directory for plots.
+        label1:           X-axis label.
+        label2:           Y-axis label.
+    """
+    s1 = _load_group2mean(tables_dir1)
+    s2 = _load_group2mean(tables_dir2)
+    diff = pd.read_csv(diff_scores_path, sep="\t").set_index("group_id")["score"]
+
+    common = s1.index.intersection(s2.index)
+    x = s1.loc[common]
+    y = s2.loc[common]
+    c = diff.reindex(common).fillna(0)
+
+    mask = x.notna() & y.notna()
+    x, y, c = x[mask], y[mask], c[mask]
+
+    if x.empty:
+        logger.warning("No common groups with valid identity scores for scatter plot.")
+        return
+
+    with plt.style.context(FIGURE_STYLE):
+        fig, ax = plt.subplots(figsize=(6, 6))
+        vmax = c.abs().quantile(0.95)
+        sc = ax.scatter(
+            x, y, c=c, cmap="RdBu", alpha=0.5, s=8,
+            vmin=-vmax, vmax=vmax
+        )
+        lims = [min(x.min(), y.min()) - 0.02, max(x.max(), y.max()) + 0.02]
+        ax.plot(lims, lims, "k--", linewidth=0.8, alpha=0.5)
+        ax.set_xlim(lims)
+        ax.set_ylim(lims)
+        ax.set_xlabel(label1, fontsize=12)
+        ax.set_ylabel(label2, fontsize=12)
+        ax.set_title("Identity comparison between lists", fontsize=13)
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
+        cbar.set_label("Differential score", fontsize=10)
+        fig.tight_layout()
+
+    _save(fig, plots_dir, "identity_scatter")
+
+
+def plot_differential_distribution(
+    diff_scores_path: str,
+    plots_dir: str,
+    metric: str = "zscore",
+):
+    """Histogram of differential scores between the two lists.
+
+    Args:
+        diff_scores_path: Path to differential_scores.tsv.
+        plots_dir:        Output directory for plots.
+        metric:           Metric used (for axis label).
+    """
+    diff = pd.read_csv(diff_scores_path, sep="\t")
+    scores = pd.to_numeric(diff["score"], errors="coerce").dropna()
+
+    label_map = {
+        "zscore":   "Z-score difference (list 1 − list 2)",
+        "identity": "Identity difference (list 1 − list 2)",
+        "rank":     "Normalised rank difference (list 1 − list 2)",
+    }
+    xlabel = label_map.get(metric, "Differential score")
+
+    with plt.style.context(FIGURE_STYLE):
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(
+            scores[scores >= 0], bins=40,
+            color=PALETTE["positive"], edgecolor="white",
+            linewidth=0.5, label="More conserved in list 1"
+        )
+        ax.hist(
+            scores[scores < 0], bins=40,
+            color=PALETTE["negative"], edgecolor="white",
+            linewidth=0.5, label="More conserved in list 2"
+        )
+        ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel("Number of orthogroups", fontsize=12)
+        ax.set_title("Differential conservation score distribution", fontsize=13)
+        ax.legend(fontsize=10)
+        fig.tight_layout()
+
+    _save(fig, plots_dir, "differential_distribution")
+
+
+# --- Entry points called from cli.py ---
+
+def make_single_list_plots(
+    anchor2mean_path: str,
+    results_dir: str,
+    plots_dir: str,
+    obo_names: dict[str, str] | None = None,
+    fdr_threshold: float = 0.25,
+    top_n: int = 20,
+):
+    os.makedirs(plots_dir, exist_ok=True)
+    plot_identity_distribution(anchor2mean_path, plots_dir)
+    plot_gsea_barplot(results_dir, plots_dir,
+                      obo_names=obo_names, fdr_threshold=fdr_threshold,
+                      top_n=top_n)
+
+
+def make_differential_plots(
+    tables_dir1: str,
+    tables_dir2: str,
+    diff_dir: str,
+    plots_dir: str,
+    metric: str,
+    obo_names: dict[str, str] | None = None,
+    fdr_threshold: float = 0.25,
+    top_n: int = 20,
+):
+    os.makedirs(plots_dir, exist_ok=True)
+    diff_scores = os.path.join(diff_dir, "differential_scores.tsv")
+    results_dir = os.path.join(diff_dir, "enrichment")
+    plot_identity_distribution(
+        os.path.join(diff_dir, "anchor2mean.tsv"),
+        plots_dir,
+        label="Differential conservation score",
+    )
+    plot_identity_scatter(tables_dir1, tables_dir2, diff_scores, plots_dir)
+    plot_differential_distribution(diff_scores, plots_dir, metric=metric)
+    plot_gsea_barplot(
+        results_dir, plots_dir,
+        obo_names=obo_names, fdr_threshold=fdr_threshold,
+        top_n=top_n,
+        title="Top differentially enriched gene sets"
+    )
+</file>
+
+<file path="enhydra/tables.py">
+import os
+import logging
+from Bio import SeqIO
+
+logger = logging.getLogger(__name__)
+
+
+def make_tables(alignment_dir: str, ident_dir: str, tables_dir: str, anchor: str):
+    """Generate ranked output tables from alignments and identity reports.
+
+    Args:
+        alignment_dir: Directory of MAFFT alignment files.
+        ident_dir:     Directory of trimAl identity report files.
+        tables_dir:    Directory where output tables are written.
+        anchor:        Anchor species ID used to map group → gene ID.
+    """
+    os.makedirs(tables_dir, exist_ok=True)
+    ortho_mean = {}
+    with open(os.path.join(tables_dir, "group2mean.tsv"), "a") as group2mean, \
+         open(os.path.join(tables_dir, "anchor2mean.tsv"), "a") as anchor2mean, \
+         open(os.path.join(tables_dir, "group2anchor.tsv"), "a") as group2anchor:
+        for file in os.listdir(ident_dir):
+            group_name = file.split(".")[0]
+            ident_path = os.path.join(ident_dir, file)
+            with open(ident_path, "r") as ident_file:
+                for line in ident_file:
+                    line = line.rstrip()
+                    if line.startswith("## AverageIdentity"):
+                        mean_percent = line.split()[-1]
+                        ortho_mean[group_name] = mean_percent
+                        group2mean.write("%s\t%s\n" % (group_name, mean_percent))
+                        break
+                else:
+                    logger.warning("No AverageIdentity found in %s", ident_path)
+        for file in os.listdir(alignment_dir):
+            group_name = file.split(".")[0]
+            seq_file = os.path.join(alignment_dir, file)
+            if group_name not in ortho_mean:
+                logger.warning("No identity score found for group %s, skipping.", group_name)
+                continue
+            for seq_record in SeqIO.parse(seq_file, "fasta"):
+                ids_fields = seq_record.id.split("|")
+                species, gene_id = ids_fields[0], ids_fields[1]
+                if species == anchor:
+                    anchor2mean.write("%s\t%s\n" % (gene_id, ortho_mean[group_name]))
+                    group2anchor.write("%s\t%s\n" % (group_name, gene_id))
+</file>
+
+<file path="enhydra/io.py">
+from __future__ import annotations
+
+import re
+
+
+def _parse_config(fh) -> dict:
+    """Parse a config file handle into a dict, ignoring comments and blank lines."""
+    pattern = re.compile(r'^\s*(\w+)\s*=\s*([^#]*)')
+    config = {}
+    for line in fh:
+        m = pattern.match(line)
+        if m:
+            config[m.group(1)] = m.group(2).strip()
+    return config
+
+
+def read_config_file(fh_project, fh_code) -> dict:
+    """Read project and code config files into a parameters dict.
+
+    Required parameters:
+        inputdir, outdir, anchor, max_process (project config)
+        mafft, trimal (code config)
+
+    Optional parameters (with defaults):
+        min_species   (default: 4)
+        paralogs      (default: 'all')
+        metric        (default: 'zscore')
+        gene_sets     (default: '')
+        organism      (default: '')
+        min_size      (default: 5)
+        max_size      (default: 500)
+        permutations  (default: 1000)
+        seed          (default: 42)
+        fdr_threshold (default: 0.25)
+        list1         (default: '')
+        list2         (default: '')
+        sources       (default: 'GO:BP GO:MF GO:CC KEGG REAC')
+    """
+    project = _parse_config(fh_project)
+    code    = _parse_config(fh_code)
+
+    parameters = {
+        # Required
+        'inputdir':        project.get('inputdir', ''),
+        'outdir':          project.get('outdir', ''),
+        'anchor':          project.get('anchor', ''),
+        'max_process':     int(project.get('max_process', 1)),
+        'mafft':           code.get('mafft', ''),
+        'trimal':          code.get('trimal', ''),
+        # Optional tool paths
+        'muscle':          code.get('muscle', ''),
+        'prank':           code.get('prank', ''),
+        # Filtering
+        'min_species':     int(project.get('min_species', 4)),
+        'min_sequences':   int(project.get('min_sequences', 2)),
+        'paralogs':        project.get('paralogs', 'all'),
+        'length_filter_sd': float(project.get('length_filter_sd', 2.0)),
+        # Alignment
+        'aligner':         project.get('aligner', 'mafft'),
+        'mafft_mode':      project.get('mafft_mode', 'auto'),
+        # Ranking
+        'metric':          project.get('metric', 'zscore'),
+        # Gene sets
+        'gene_sets':       project.get('gene_sets', ''),
+        'organism':        project.get('organism', ''),
+        'min_size':        int(project.get('min_size', 5)),
+        'max_size':        int(project.get('max_size', 500)),
+        'permutations':    int(project.get('permutations', 1000)),
+        'seed':            int(project.get('seed', 42)),
+        'fdr_threshold':   float(project.get('fdr_threshold', 0.25)),
+        # Report
+        'top_n':           int(project.get('top_n', 20)),
+        'obo_cache':       project.get('obo_cache', ''),
+        # Two-list mode
+        'list1':           project.get('list1', ''),
+        'list2':           project.get('list2', ''),
+        'sources':         project.get('sources', 'GO:BP GO:MF GO:CC KEGG REAC'),
+    }
+    return parameters
+
+
+def read_species_list(path: str) -> list[str]:
+    """Parse a species list file into a list of species IDs.
+
+    The file should contain one species ID per line. Lines starting with
+    '#' and blank lines are ignored.
+
+    Args:
+        path: Path to the species list file.
+
+    Returns:
+        List of species ID strings.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the file is empty after filtering comments and blanks.
+    """
+    species = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            species.append(line)
+    if not species:
+        raise ValueError(
+            "Species list file '%s' is empty or contains only comments." % path
+        )
+    return species
+</file>
+
+<file path="enhydra/report.py">
+from __future__ import annotations
+
+import os
+import base64
+import logging
+import urllib.request
+import ssl
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+_DATATABLES_JS_URL  = "https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"
+_JQUERY_URL         = "https://code.jquery.com/jquery-3.7.0.min.js"
+_DATATABLES_CSS_URL = "https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"
+
+_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>{title}</title>
+<style>
+{dt_css}
+body {{ font-family: Arial, sans-serif; margin: 0; padding: 0;
+        background: #f5f5f5; color: #222; }}
+header {{ background: #1a3a5c; color: white; padding: 24px 40px; }}
+header h1 {{ margin: 0; font-size: 1.8em; }}
+header p  {{ margin: 4px 0 0; font-size: 0.95em; opacity: 0.85; }}
+main {{ max-width: 1300px; margin: 32px auto; padding: 0 24px; }}
+section {{ background: white; border-radius: 8px;
+           box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+           padding: 28px 32px; margin-bottom: 28px; }}
+h2 {{ margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
+      padding-bottom: 8px; }}
+.plot-block {{ margin: 20px 0; text-align: center; }}
+.plot-block img {{ max-width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
+.plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
+.plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
+a.go-link {{ color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
+.col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
+            font-size: 10px; text-align: center; border-radius: 50%;
+            background: #aaa; color: white; cursor: help; margin-left: 3px;
+            position: relative; }}
+.col-tip .tip-text {{ display: none; position: absolute; bottom: 120%; left: 50%;
+                      transform: translateX(-50%); background: #333; color: #fff;
+                      padding: 6px 10px; border-radius: 4px; font-size: 11px;
+                      white-space: normal; width: 220px; z-index: 999;
+                      font-weight: normal; line-height: 1.4; }}
+.col-tip:hover .tip-text {{ display: block; }}
+thead tr.filter-row th input {{
+    width: 100%; box-sizing: border-box; font-size: 11px;
+    padding: 3px; border: 1px solid #ccc; border-radius: 3px; }}
+thead tr.filter-row th {{ padding: 4px 8px; }}
+.svg-tooltip {{ position: fixed; background: #333; color: #fff;
+                padding: 8px 12px; border-radius: 4px; font-size: 12px;
+                max-width: 320px; line-height: 1.5; pointer-events: none;
+                z-index: 2000; display: none; white-space: normal; }}
+#modal-overlay {{ display: none; position: fixed; top: 0; left: 0;
+                  width: 100%; height: 100%; background: rgba(0,0,0,0.6);
+                  z-index: 1000; justify-content: center; align-items: center; }}
+#modal-overlay.active {{ display: flex; }}
+#modal-box {{ background: white; border-radius: 8px; padding: 24px;
+              max-width: 700px; width: 90%; position: relative; }}
+#modal-title {{ font-size: 1.1em; font-weight: bold; color: #1a3a5c;
+                margin-bottom: 12px; }}
+#modal-img {{ width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
+#modal-close {{ position: absolute; top: 12px; right: 16px; font-size: 1.4em;
+                cursor: pointer; color: #555; background: none; border: none; }}
+footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>{title}</h1>
+  <p>ENHYDRA &mdash; Gene Set Enrichment Analysis for evolutionary genomics</p>
+</header>
+
+<div id="svg-tooltip" class="svg-tooltip"></div>
+
+<div id="modal-overlay">
+  <div id="modal-box">
+    <button id="modal-close" title="Close">&times;</button>
+    <div id="modal-title"></div>
+    <img id="modal-img" src="" alt="Enrichment plot"/>
+  </div>
+</div>
+
+<main>
+<section>
+  <h2>Plots</h2>
+  <div class="plot-grid">
+{plots_html}
+  </div>
+</section>
+
+<section>
+  <h2>Enrichment results</h2>
+  <p>Significant gene sets are highlighted in blue.
+     Click a GO ID to view its enrichment plot.
+     Use the filter boxes below each column header to filter by that column.</p>
+{table_html}
+</section>
+</main>
+<footer>Generated by ENHYDRA</footer>
+
+<script>{jquery_js}</script>
+<script>{dt_js}</script>
+<script>
+{plot_data_js}
+$(document).ready(function() {{
+
+    // SVG bar tooltips
+    var tip = document.getElementById('svg-tooltip');
+    document.querySelectorAll('[data-tip]').forEach(function(el) {{
+        el.addEventListener('mousemove', function(e) {{
+            tip.innerHTML = this.getAttribute('data-tip');
+            tip.style.display = 'block';
+            tip.style.left = (e.clientX + 15) + 'px';
+            tip.style.top  = (e.clientY + 15) + 'px';
+        }});
+        el.addEventListener('mouseleave', function() {{
+            tip.style.display = 'none';
+        }});
+    }});
+
+    // Per-column filters
+    var numericCols = {numeric_col_indices};
+    var colFilters = {{}};
+
+    $.fn.dataTable.ext.search.push(function(settings, data) {{
+        for (var i in colFilters) {{
+            var f = colFilters[i];
+            if (f.text !== undefined) {{
+                if (data[i].toLowerCase().indexOf(f.text) === -1) return false;
+            }} else {{
+                var cell = parseFloat(data[i]);
+                if (isNaN(cell)) return false;
+                if (f.op === '<'  && !(cell <  f.num)) return false;
+                if (f.op === '<=' && !(cell <= f.num)) return false;
+                if (f.op === '>'  && !(cell >  f.num)) return false;
+                if (f.op === '>=' && !(cell >= f.num)) return false;
+                if ((f.op === '=' || f.op === '==') && !(cell === f.num)) return false;
+                if (f.op === '!=' && !(cell !== f.num)) return false;
+            }}
+        }}
+        return true;
+    }});
+
+    var table = $('#results-table').DataTable({{
+        pageLength: 25,
+        orderCellsTop: true,
+        order: [[4, 'asc']],
+        columnDefs: [{{ targets: numericCols, type: 'num' }}]
+    }});
+
+    $('#results-table thead tr.filter-row th').each(function(i) {{
+        var isNumeric = numericCols.indexOf(i) !== -1;
+        var placeholder = isNumeric ? "e.g. < 0.05" : "Filter...";
+        var input = $('<input type="text" placeholder="' + placeholder + '"/>');
+        $(this).html(input);
+        input.on('keyup change', function() {{
+            var val = this.value.trim();
+            if (val === '') {{
+                delete colFilters[i];
+            }} else if (isNumeric) {{
+                var m = val.match(/^([<>=!]=?)\s*([\d.eE+\-]+)$/);
+                if (m) colFilters[i] = {{ op: m[1], num: parseFloat(m[2]) }};
+                else delete colFilters[i];
+            }} else {{
+                colFilters[i] = {{ text: val.toLowerCase() }};
+            }}
+            table.draw();
+        }});
+    }});
+
+    // GO enrichment plot modal
+    $(document).on('click', '.go-link', function(e) {{
+        e.preventDefault();
+        var goId = $(this).data('goid');
+        var uri  = enrichmentPlots[goId];
+        if (uri) {{
+            $('#modal-title').text(goId);
+            $('#modal-img').attr('src', uri);
+            $('#modal-overlay').addClass('active');
+        }}
+    }});
+    $('#modal-close, #modal-overlay').on('click', function(e) {{
+        if (e.target === this) $('#modal-overlay').removeClass('active');
+    }});
+
+}});
+</script>
+</body>
+</html>"""
+
+
+def _fetch(url: str) -> str:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; ENHYDRA)"}
+    )
+    with urllib.request.urlopen(req, context=ctx) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def _fetch_cached(url: str, cache_dir: str | None, filename: str) -> str:
+    if cache_dir:
+        local_path = os.path.join(cache_dir, filename)
+        if os.path.isfile(local_path):
+            with open(local_path, encoding="utf-8") as fh:
+                return fh.read()
+    content = _fetch(url)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(local_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    return content
+
+
+def _img_to_base64(img_path: str) -> str:
+    with open(img_path, "rb") as fh:
+        data = base64.b64encode(fh.read()).decode("utf-8")
+    return "data:image/png;base64,%s" % data
+
+
+def _parse_obo_names(obo_path: str) -> dict[str, str]:
+    names = {}
+    current_id = None
+    current_name = None
+    is_obsolete = False
+    with open(obo_path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line == "[Term]":
+                if current_id and not is_obsolete and current_name:
+                    names[current_id] = current_name
+                current_id = None
+                current_name = None
+                is_obsolete = False
+            elif line.startswith("id: GO:"):
+                current_id = line[4:]
+            elif line.startswith("name: "):
+                current_name = line[6:]
+            elif line == "is_obsolete: true":
+                is_obsolete = True
+    if current_id and not is_obsolete and current_name:
+        names[current_id] = current_name
+    return names
+
+
+def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
+    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if not os.path.isfile(path):
+        logger.warning("GSEA results not found: %s", path)
+        return None
+
+    df = pd.read_csv(path)
+
+    # Convert Tag% (e.g. "1/10") to 0-1 float
+    if "Tag %" in df.columns:
+        def _tag(v):
+            try:
+                v = str(v).strip()
+                if "/" in v:
+                    a, b = v.split("/")
+                    return round(float(a) / float(b), 4)
+                return round(float(v), 4)
+            except Exception:
+                return None
+        df["Tag %"] = df["Tag %"].apply(_tag)
+
+    # Convert Gene% (e.g. "9.55%") to 0-1 float
+    if "Gene %" in df.columns:
+        def _gene(v):
+            try:
+                return round(float(str(v).strip().rstrip("%")) / 100.0, 4)
+            except Exception:
+                return None
+        df["Gene %"] = df["Gene %"].apply(_gene)
+
+    processed_path = os.path.join(results_dir, "gsea_results_processed.tsv")
+    df.to_csv(processed_path, sep="\t", index=False)
+    return df
+
+
+def _build_enrichment_plot_index(results_dir: str) -> dict[str, str]:
+    prerank_dir = os.path.join(results_dir, "prerank")
+    if not os.path.isdir(prerank_dir):
+        return {}
+    index = {}
+    for filename in os.listdir(prerank_dir):
+        if not filename.endswith(".png"):
+            continue
+        go_id = filename.replace(".png", "").replace("_", ":", 1)
+        index[go_id] = _img_to_base64(os.path.join(prerank_dir, filename))
+    logger.info("Indexed %d enrichment plot(s).", len(index))
+    return index
+
+
+def _results_table_html(
+    df: pd.DataFrame,
+    obo_names: dict[str, str],
+    plot_index: dict[str, str],
+    fdr_threshold: float = 0.25,
+) -> tuple[str, list[int]]:
+    df = df.copy()
+
+    if "Term" not in df.columns:
+        logger.warning("'Term' column not found in GSEA results.")
+        return "<p>No results to display.</p>", []
+
+    df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
+
+    for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val", "Tag %", "Gene %"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").apply(
+                lambda x: "%.4f" % x if pd.notna(x) else ""
+            )
+
+    df["Significant"] = df["FDR q-val"].apply(
+        lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
+    )
+
+    col_defs = [
+        ("Term",       "GO ID",      "Gene Ontology term identifier."),
+        ("GO Term",    "Term name",  "Human-readable name of the GO term."),
+        ("NES",        "NES",        "Normalised Enrichment Score. Positive = more conserved, negative = faster evolving."),
+        ("NOM p-val",  "p-value",    "Nominal p-value from permutation testing."),
+        ("FDR q-val",  "FDR",        "False Discovery Rate q-value. Significant below %.2f." % fdr_threshold),
+        ("Tag %",      "Tag %",      "Fraction of gene set genes in the leading edge (0-1)."),
+        ("Gene %",     "Gene %",     "Fraction of all ranked genes in the leading edge (0-1)."),
+        ("Significant","Sig.",       "Significant at FDR < %.2f." % fdr_threshold),
+    ]
+    col_defs = [(s, d, t) for s, d, t in col_defs
+                if s in df.columns or s in ("GO Term", "Significant")]
+
+    table_df = df[[s for s, _, _ in col_defs]].copy()
+    display_names = [d for _, d, _ in col_defs]
+    tooltips      = [t for _, _, t in col_defs]
+    table_df.columns = display_names
+
+    numeric_display_names = {"NES", "p-value", "FDR", "Tag %", "Gene %"}
+    numeric_col_indices = [i for i, n in enumerate(display_names)
+                           if n in numeric_display_names]
+
+    header_cells = "".join(
+        '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
+        % (name, tip)
+        for name, tip in zip(display_names, tooltips)
+    )
+    filter_cells = "<th></th>" * len(display_names)
+
+    rows = ""
+    for _, row in table_df.iterrows():
+        sig_class = ' class="sig-row"' if row.get("Sig.") == "✓" else ""
+        go_id = row.get("GO ID", "")
+        cells = ""
+        for col, val in row.items():
+            if col == "GO ID" and go_id in plot_index:
+                cells += '<td><a href="#" class="go-link" data-goid="%s">%s</a></td>' \
+                         % (go_id, val)
+            else:
+                cells += "<td>%s</td>" % str(val)
+        rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
+
+    html = (
+        '<table id="results-table" class="display compact" style="width:100%%">'
+        "<thead><tr>%s</tr><tr class=\"filter-row\">%s</tr></thead>"
+        "<tbody>%s</tbody></table>"
+    ) % (header_cells, filter_cells, rows)
+
+    return html, numeric_col_indices
+
+
+def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
+    html = ""
+    for stem, caption in names:
+        svg_path = os.path.join(plots_dir, stem + ".svg")
+        png_path = os.path.join(plots_dir, stem + ".png")
+        if os.path.isfile(svg_path):
+            with open(svg_path, encoding="utf-8") as fh:
+                svg_content = fh.read()
+            html += (
+                '<div class="plot-block">'
+                '<p class="plot-caption">%s (hover bars for GO definitions)</p>'
+                '%s</div>'
+            ) % (caption, svg_content)
+        elif os.path.isfile(png_path):
+            uri = _img_to_base64(png_path)
+            html += (
+                '<div class="plot-block">'
+                '<p class="plot-caption">%s</p>'
+                '<img src="%s" alt="%s"/></div>'
+            ) % (caption, uri, caption)
+    return html
+
+
+def build_report(
+    results_dir: str,
+    plots_dir: str,
+    report_path: str,
+    obo_path: str | None = None,
+    mode: str = "single",
+    metric: str = "zscore",
+    fdr_threshold: float = 0.25,
+):
+    """Build a self-contained HTML report for ENHYDRA results."""
+    logger.info("Building HTML report...")
+
+    obo_names = {}
+    if obo_path and os.path.isfile(obo_path):
+        obo_names = _parse_obo_names(obo_path)
+        logger.info("Loaded %d GO term names from OBO.", len(obo_names))
+
+    df = _load_gsea_results(results_dir)
+    if df is None:
+        logger.warning("Cannot build report: no GSEA results found.")
+        return
+
+    cache_dir = os.path.dirname(obo_path) if obo_path else None
+    logger.info("Fetching DataTables assets (cached after first download)...")
+    jquery_js = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
+    dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
+    dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
+
+    plot_index = _build_enrichment_plot_index(results_dir)
+    plot_data_js = "var enrichmentPlots = {%s};" % ",".join(
+        '"%s": "%s"' % (go_id, uri) for go_id, uri in plot_index.items()
+    )
+
+    if mode == "single":
+        plot_names = [
+            ("identity_distribution", "Distribution of mean alignment identity"),
+            ("gsea_barplot",          "Top enriched gene sets (NES)"),
+        ]
+        title = "ENHYDRA Single-List Enrichment Report"
+    else:
+        plot_names = [
+            ("identity_scatter",          "Identity comparison between lists"),
+            ("differential_distribution", "Differential conservation score distribution"),
+            ("identity_distribution",     "Distribution of differential scores"),
+            ("gsea_barplot",              "Top differentially enriched gene sets (NES)"),
+        ]
+        title = "ENHYDRA Differential Enrichment Report"
+
+    plots_html = _plot_section(plots_dir, plot_names)
+    table_html, numeric_col_indices = _results_table_html(
+        df, obo_names, plot_index, fdr_threshold
+    )
+
+    html = _TEMPLATE.format(
+        title=title,
+        dt_css=dt_css,
+        plots_html=plots_html,
+        table_html=table_html,
+        jquery_js=jquery_js,
+        dt_js=dt_js,
+        plot_data_js=plot_data_js,
+        numeric_col_indices=numeric_col_indices,
+    )
+
+    with open(report_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    logger.info("HTML report written to: %s", report_path)
+</file>
+
+<file path="pyproject.toml">
+[tool.setuptools.packages.find]
+include = ["enhydra*"]
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enhydra"
+version = "0.1.0"
+description = "Gene Set Enrichment Analysis for evolutionary genomics"
+requires-python = ">=3.9"
+dependencies = [
+    "biopython>=1.81",
+    "numpy>=1.24",
+    "gseapy>=1.0",
+    "pandas>=2.0",
+    "gprofiler-official>=1.0",
+    "matplotlib>=3.7",
+    "pdf2image>=1.16",
+]
+
+[project.scripts]
+enhydra = "enhydra.cli:main"
+</file>
+
+<file path="enhydra/alignment.py">
+from __future__ import annotations
+
+import os
+import subprocess
+import logging
+from .exceptions import EnhydraToolError
+
+logger = logging.getLogger(__name__)
+
+ALIGNERS = ("mafft", "muscle", "prank")
+
+
+def run_mafft(
+    group_filter_dir: str,
+    alignment_dir: str,
+    mafft_path: str,
+    threads: int = 1,
+    mode: str = "auto",
+):
+    """Align each group FASTA file using MAFFT.
+
+    Args:
+        group_filter_dir: Directory of group-filtered FASTA files.
+        alignment_dir:    Directory where alignments are written.
+        mafft_path:       Path to the MAFFT executable.
+        threads:          Number of threads.
+        mode:             MAFFT alignment mode (auto | linsi | ginsi | einsi |
+                          fftnsi | fftns | nwnsi | nwns). Default: auto.
+    """
+    os.makedirs(alignment_dir, exist_ok=True)
+    for file in os.listdir(group_filter_dir):
+        input_seq  = os.path.join(group_filter_dir, file)
+        output_seq = os.path.join(alignment_dir, file + ".aln")
+
+        if mode == "auto":
+            cmd = [mafft_path, "--auto", "--quiet",
+                   "--thread", str(threads), input_seq]
+        else:
+            # Named modes are standalone executables or flags in newer MAFFT
+            cmd = [mafft_path, "--%s" % mode, "--quiet",
+                   "--thread", str(threads), input_seq]
+
+        try:
+            with open(output_seq, "w") as outfile:
+                subprocess.run(cmd, stdout=outfile, stderr=subprocess.PIPE, check=True)
+        except subprocess.CalledProcessError as e:
+            raise EnhydraToolError("mafft failed on %s:\n%s" % (file, e.stderr.decode()))
+
+
+def run_muscle(
+    group_filter_dir: str,
+    alignment_dir: str,
+    muscle_path: str,
+    threads: int = 1,
+):
+    """Align each group FASTA file using MUSCLE.
+
+    Args:
+        group_filter_dir: Directory of group-filtered FASTA files.
+        alignment_dir:    Directory where alignments are written.
+        muscle_path:      Path to the MUSCLE executable.
+        threads:          Number of threads.
+    """
+    os.makedirs(alignment_dir, exist_ok=True)
+    for file in os.listdir(group_filter_dir):
+        input_seq  = os.path.join(group_filter_dir, file)
+        output_seq = os.path.join(alignment_dir, file + ".aln")
+        try:
+            subprocess.run(
+                [muscle_path, "-align", input_seq, "-output", output_seq,
+                 "-threads", str(threads)],
+                stderr=subprocess.PIPE, check=True
+            )
+        except subprocess.CalledProcessError as e:
+            raise EnhydraToolError("muscle failed on %s:\n%s" % (file, e.stderr.decode()))
+
+
+def run_prank(
+    group_filter_dir: str,
+    alignment_dir: str,
+    prank_path: str,
+):
+    """Align each group FASTA file using PRANK.
+
+    Args:
+        group_filter_dir: Directory of group-filtered FASTA files.
+        alignment_dir:    Directory where alignments are written.
+        prank_path:       Path to the PRANK executable.
+    """
+    os.makedirs(alignment_dir, exist_ok=True)
+    for file in os.listdir(group_filter_dir):
+        input_seq  = os.path.join(group_filter_dir, file)
+        output_stem = os.path.join(alignment_dir, file)
+        try:
+            subprocess.run(
+                [prank_path, "-d=%s" % input_seq, "-o=%s" % output_stem,
+                 "-protein", "-quiet"],
+                stderr=subprocess.PIPE, check=True
+            )
+            # PRANK appends .best.fas to the output stem
+            prank_out = output_stem + ".best.fas"
+            final_out = output_stem + ".aln"
+            if os.path.isfile(prank_out):
+                os.rename(prank_out, final_out)
+        except subprocess.CalledProcessError as e:
+            raise EnhydraToolError("prank failed on %s:\n%s" % (file, e.stderr.decode()))
+
+
+def run_aligner(
+    group_filter_dir: str,
+    alignment_dir: str,
+    aligner: str,
+    parameters: dict,
+):
+    """Dispatch alignment to the configured aligner.
+
+    Args:
+        group_filter_dir: Directory of group-filtered FASTA files.
+        alignment_dir:    Directory where alignments are written.
+        aligner:          Aligner name ('mafft', 'muscle', 'prank').
+        parameters:       Full parameters dict from config.
+    """
+    if aligner not in ALIGNERS:
+        raise ValueError(
+            "Unknown aligner '%s'. Choose from: %s" % (aligner, ALIGNERS)
+        )
+
+    if aligner == "mafft":
+        if not parameters.get('mafft'):
+            raise EnhydraToolError("No path to mafft specified in code config.")
+        run_mafft(
+            group_filter_dir=group_filter_dir,
+            alignment_dir=alignment_dir,
+            mafft_path=parameters['mafft'],
+            threads=parameters['max_process'],
+            mode=parameters.get('mafft_mode', 'auto'),
+        )
+    elif aligner == "muscle":
+        if not parameters.get('muscle'):
+            raise EnhydraToolError("No path to muscle specified in code config.")
+        run_muscle(
+            group_filter_dir=group_filter_dir,
+            alignment_dir=alignment_dir,
+            muscle_path=parameters['muscle'],
+            threads=parameters['max_process'],
+        )
+    elif aligner == "prank":
+        if not parameters.get('prank'):
+            raise EnhydraToolError("No path to prank specified in code config.")
+        run_prank(
+            group_filter_dir=group_filter_dir,
+            alignment_dir=alignment_dir,
+            prank_path=parameters['prank'],
+        )
+
+    logger.info("Alignment complete using %s.", aligner)
+
+
+def run_trimal(alignment_dir: str, ident_dir: str, trimal_path: str):
+    """Compute alignment identity for each alignment using trimAl."""
+    os.makedirs(ident_dir, exist_ok=True)
+    for file in os.listdir(alignment_dir):
+        input_seq = os.path.join(alignment_dir, file)
+        outident  = os.path.join(ident_dir, file + ".ident")
+        try:
+            with open(outident, "w") as outfile:
+                subprocess.run(
+                    [trimal_path, "-sident", "-in", input_seq],
+                    stdout=outfile, stderr=subprocess.PIPE, check=True
+                )
+        except subprocess.CalledProcessError as e:
+            raise EnhydraToolError("trimal failed on %s:\n%s" % (file, e.stderr.decode()))
+</file>
+
+<file path="enhydra/gsea.py">
+from __future__ import annotations
+
+import os
+import logging
+import pandas as pd
+import gseapy as gp
+from gprofiler import GProfiler
+
+from .exceptions import EnhydraIOError
+
+logger = logging.getLogger(__name__)
+
+
+def _load_ranked(anchor2mean_path: str) -> pd.DataFrame:
+    """Load and sort the anchor2mean table by identity (descending)."""
+    if not os.path.isfile(anchor2mean_path):
+        raise EnhydraIOError("anchor2mean file not found: %s" % anchor2mean_path)
+    ranked = pd.read_csv(
+        anchor2mean_path,
+        sep="\t",
+        header=None,
+        names=["gene_id", "identity"],
+    )
+    ranked["identity"] = pd.to_numeric(ranked["identity"], errors="coerce")
+    ranked = ranked.dropna(subset=["identity"])
+    return ranked.sort_values("identity", ascending=False)
+
+
+def _convert_gsea_plots_to_png(results_dir: str):
+    """Convert GSEApy-generated PDFs to PNGs for HTML embedding.
+
+    Requires pdf2image and poppler:
+        pip install pdf2image
+        brew install poppler  # macOS
+        apt install poppler-utils  # Linux
+
+    Args:
+        results_dir: Directory containing the GSEApy prerank/ subdirectory.
+    """
+    prerank_dir = os.path.join(results_dir, "prerank")
+    if not os.path.isdir(prerank_dir):
+        return
+
+    pdfs = [f for f in os.listdir(prerank_dir) if f.endswith(".pdf")]
+    if not pdfs:
+        return
+
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        logger.warning(
+            "pdf2image not installed — enrichment plots will not be embedded "
+            "in the HTML report. Install with: pip install pdf2image\n"
+            "Also requires poppler: brew install poppler (macOS) or "
+            "apt install poppler-utils (Linux)."
+        )
+        return
+
+    logger.info("Converting %d GSEApy PDF plots to PNG...", len(pdfs))
+    for pdf_file in pdfs:
+        pdf_path = os.path.join(prerank_dir, pdf_file)
+        png_path = pdf_path.replace(".pdf", ".png")
+        if os.path.isfile(png_path):
+            continue
+        try:
+            images = convert_from_path(pdf_path, dpi=150)
+            if images:
+                images[0].save(png_path, "PNG")
+        except Exception as e:
+            logger.warning("Failed to convert %s: %s", pdf_file, e)
+
+
+def build_gmt_from_gprofiler(
+    gene_ids: list[str],
+    organism: str,
+    gmt_path: str,
+    sources: list[str] | None = None,
+) -> str:
+    """Fetch annotations from g:Profiler and write a GMT file.
+
+    Args:
+        gene_ids: List of anchor gene IDs (Ensembl format).
+        organism: g:Profiler organism name (e.g. 'hsapiens', 'athaliana').
+        gmt_path: Path where the GMT file will be written.
+        sources:  Data sources to query. Defaults to GO:BP, GO:MF, GO:CC,
+                  KEGG, and Reactome.
+
+    Returns:
+        Path to the written GMT file.
+    """
+    if sources is None:
+        sources = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]
+
+    logger.info(
+        "Fetching annotations from g:Profiler for %d genes, organism: %s, sources: %s",
+        len(gene_ids), organism, sources,
+    )
+
+    gprofiler = GProfiler(user_agent="ENHYDRA", return_dataframe=True)
+    results = gprofiler.profile(
+        organism=organism,
+        query=gene_ids,
+        sources=sources,
+        user_threshold=1.0,
+        no_evidences=False,
+    )
+
+    if results.empty:
+        raise EnhydraIOError(
+            "g:Profiler returned no annotations for organism '%s'. "
+            "Please check the organism name at https://biit.cs.ut.ee/gprofiler."
+            % organism
+        )
+
+    n_terms = 0
+    with open(gmt_path, "w") as fh:
+        for _, row in results.iterrows():
+            genes = row.get("intersections")
+            if not genes:
+                continue
+            gene_str = "\t".join(genes)
+            fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], gene_str))
+            n_terms += 1
+
+    logger.info("GMT file written: %d terms, path: %s", n_terms, gmt_path)
+    return gmt_path
+
+
+def run_gsea(
+    anchor2mean_path: str,
+    results_dir: str,
+    gene_sets: str,
+    organism: str | None = None,
+    sources: list[str] | None = None,
+    permutations: int = 1000,
+    min_size: int = 5,
+    max_size: int = 500,
+    seed: int = 42,
+    fdr_threshold: float = 0.25,
+) -> gp.Prerank:
+    """Run GSEApy prerank, optionally fetching annotations from g:Profiler.
+
+    Args:
+        anchor2mean_path: Path to anchor2mean.tsv (gene_id, mean_identity).
+        results_dir:      Directory where results are written.
+        gene_sets:        Path to a local GMT file. Used when organism is None.
+        organism:         g:Profiler organism name. When provided, annotations
+                          are fetched via the API and gene_sets is ignored.
+        sources:          Data sources for g:Profiler (only used with organism).
+        permutations:     Number of GSEA permutations.
+        min_size:         Minimum gene set size to test.
+        max_size:         Maximum gene set size to test.
+        seed:             Random seed for reproducibility.
+
+    Returns:
+        A gseapy Prerank result object.
+    """
+    os.makedirs(results_dir, exist_ok=True)
+    ranked = _load_ranked(anchor2mean_path)
+
+    if organism is not None:
+        gmt_path = os.path.join(results_dir, "gprofiler_%s.gmt" % organism)
+        if os.path.isfile(gmt_path):
+            logger.info("GMT file already exists, skipping API call: %s", gmt_path)
+        else:
+            build_gmt_from_gprofiler(
+                gene_ids=ranked["gene_id"].tolist(),
+                organism=organism,
+                gmt_path=gmt_path,
+                sources=sources,
+            )
+        gene_sets = gmt_path
+
+    logger.info(
+        "Running GSEApy prerank: %d genes, gene sets: %s, permutations: %d",
+        len(ranked), gene_sets, permutations,
+    )
+
+    results = gp.prerank(
+        rnk=ranked,
+        gene_sets=gene_sets,
+        outdir=results_dir,
+        permutation_num=permutations,
+        min_size=min_size,
+        max_size=max_size,
+        seed=seed,
+        graph_num=0,   # no plots on first pass — we count significant terms first
+        verbose=False,
+    )
+
+    n_sig = (results.res2d["FDR q-val"] < fdr_threshold).sum()
+    logger.info("GSEA complete. %d significant gene sets (FDR < %s).", n_sig, fdr_threshold)
+
+    if n_sig > 0:
+        logger.info("Generating enrichment plots for %d significant gene sets...", n_sig)
+        gp.prerank(
+            rnk=ranked,
+            gene_sets=gene_sets,
+            outdir=results_dir,
+            permutation_num=permutations,
+            min_size=min_size,
+            max_size=max_size,
+            seed=seed,
+            graph_num=int(n_sig),
+            verbose=False,
+        )
+        _convert_gsea_plots_to_png(results_dir)
+
+    return results
+</file>
+
+<file path="enhydra/__init__.py">
+import logging
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+from .io import read_config_file, read_species_list
+from .utils import check_parameters
+from .filtering import filter_length, filter_groups, subset_groups
+from .alignment import run_mafft, run_trimal
+from .tables import make_tables
+from .gsea import run_gsea
+from .orthofinder import preprocess_orthofinder
+from .differential import compute_differential, normalise_scores
+from .plotting import make_single_list_plots, make_differential_plots
+from .report import build_report
+from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
+</file>
+
+<file path="enhydra/filtering.py">
+from __future__ import annotations
+
+import os
+import random
+import shutil
+import logging
+import statistics
+import numpy as np
+from Bio import SeqIO
+
+logger = logging.getLogger(__name__)
+
+PARALOG_MODES = ("all", "remove", "longest")
+
+
+def subset_groups(inputdir: str, subset_dir: str, species: list[str]):
+    """Subset orthogroup FASTAs to sequences from a given species list.
+
+    Reads each FASTA in inputdir and writes a new FASTA containing only
+    sequences whose speciesID (the part before '|') is in the species list.
+    Groups with no matching sequences are skipped.
+
+    Args:
+        inputdir:   Directory of input FASTA files (one per orthogroup).
+        subset_dir: Directory where subsetted FASTAs are written.
+        species:    List of species IDs to retain.
+    """
+    species_set = set(species)
+    os.makedirs(subset_dir, exist_ok=True)
+    n_written = 0
+    n_empty = 0
+    for filename in os.listdir(inputdir):
+        in_path = os.path.join(inputdir, filename)
+        out_path = os.path.join(subset_dir, filename)
+        records = [
+            r for r in SeqIO.parse(in_path, "fasta")
+            if r.id.split("|")[0] in species_set
+        ]
+        if not records:
+            n_empty += 1
+            continue
+        with open(out_path, "w") as fh:
+            for r in records:
+                fh.write(">%s\n%s\n" % (r.id, r.seq))
+        n_written += 1
+    logger.info(
+        "Subset complete: %d groups written, %d groups had no matching species.",
+        n_written, n_empty
+    )
+
+
+def filter_length(
+    input_path: str,
+    length_stats_dir: str,
+    length_filter_dir: str,
+    sd_multiplier: float = 2.0,
+):
+    """Filter sequences in a single FASTA file by length (mean ± sd_multiplier * SD).
+
+    Args:
+        input_path:        Path to the input FASTA file.
+        length_stats_dir:  Directory where per-group length stats are written.
+        length_filter_dir: Directory where filtered FASTA files are written.
+        sd_multiplier:     Number of SDs from the mean beyond which sequences
+                           are removed (default: 2.0).
+    """
+    if os.stat(input_path).st_size == 0:
+        return
+    file = os.path.basename(input_path)
+    outfile_s_path = os.path.join(length_stats_dir, file + "_lengthstats")
+    outfile_f_path = os.path.join(length_filter_dir, file + "_lengthfilter")
+    lengths = []
+    length_data = {}
+    for seq_record in SeqIO.parse(input_path, "fasta"):
+        length = len(seq_record.seq)
+        length_data[seq_record.id] = length
+        lengths.append(length)
+    mean = statistics.mean(lengths)
+    median = statistics.median(lengths)
+    stddev = statistics.stdev(lengths) if len(lengths) > 1 else 0
+    sorted_idx = np.argsort(list(length_data.values()))
+    keys, values = list(length_data.keys()), list(length_data.values())
+    length_data_sorted = {keys[i]: values[i] for i in sorted_idx}
+    with open(outfile_s_path, "a") as outstats:
+        outstats.write("##Overall sequence length stats\n")
+        outstats.write("Total seqs: %s\nAverage: %s\nMedian: %s\nSD: %s\n" % (
+            len(lengths), mean, median, stddev))
+        outstats.write("##Sequence lengths (sorted from smallest to largest)\n")
+        outstats.write("#SequenceID\tLength\tPercentageDifFromAvg\n")
+        for key, value in length_data_sorted.items():
+            outstats.write("%s\t%s\t%s\n" % (key, value, value / mean))
+    with open(outfile_f_path, "a") as outfile:
+        for seq_record in SeqIO.parse(input_path, "fasta"):
+            seq = seq_record.seq
+            if (len(seq) < mean - sd_multiplier * stddev) or \
+               (len(seq) > mean + sd_multiplier * stddev):
+                logger.warning(
+                    "Sequence %s in group %s removed by length filter",
+                    seq_record.id, file
+                )
+            else:
+                outfile.write(">%s\n%s\n" % (seq_record.id, seq))
+
+
+def _resolve_paralogs_longest(records: list) -> list:
+    """Keep one sequence per species — the longest, with random tiebreaking.
+
+    Args:
+        records: List of SeqRecord objects.
+
+    Returns:
+        Filtered list with at most one record per species.
+    """
+    best: dict[str, object] = {}
+    for record in records:
+        species_id = record.id.split("|")[0]
+        current = best.get(species_id)
+        if current is None:
+            best[species_id] = record
+        else:
+            current_len = len(current.seq)
+            new_len = len(record.seq)
+            if new_len > current_len or (
+                new_len == current_len and random.random() < 0.5
+            ):
+                best[species_id] = record
+    return list(best.values())
+
+
+def filter_groups(
+    length_filter_dir: str,
+    group_filter_dir: str,
+    anchor: str,
+    min_species: int,
+    min_sequences: int = 2,
+    paralog_mode: str = "all",
+    require_anchor: bool = True,
+):
+    """Filter groups lacking the anchor species or below the minimum species count.
+
+    Args:
+        length_filter_dir: Directory of length-filtered FASTA files.
+        group_filter_dir:  Directory where passing groups are written.
+        anchor:            Species ID used for annotation mapping.
+        min_species:       Minimum number of distinct species required.
+        paralog_mode:      How to handle paralogs:
+                           'all'     — keep all sequences (default).
+                           'remove'  — discard any group containing paralogs.
+                           'longest' — keep only the longest per species.
+        require_anchor:    If True (single-list mode), discard groups that do
+                           not contain the anchor species. If False (two-list
+                           mode), anchor presence is not required.
+    """
+    if paralog_mode not in PARALOG_MODES:
+        raise ValueError(
+            "Invalid paralog_mode '%s'. Choose from: %s" % (paralog_mode, PARALOG_MODES)
+        )
+
+    os.makedirs(group_filter_dir, exist_ok=True)
+    for file in os.listdir(length_filter_dir):
+        group_name = file.split(".")[0]
+        path_to_file = os.path.join(length_filter_dir, file)
+        outfile_path = os.path.join(group_filter_dir, file)
+
+        records = list(SeqIO.parse(path_to_file, "fasta"))
+        if len(records) < min_sequences:
+            logger.warning(
+                "Group %s has fewer than %d sequences. Group removed.",
+                group_name, min_sequences
+            )
+            continue
+
+        species_ids = [r.id.split("|")[0] for r in records]
+        uniq_ids = set(species_ids)
+
+        if require_anchor and anchor not in uniq_ids:
+            logger.warning(
+                "Group %s does not contain anchor species %s. Group removed.",
+                group_name, anchor
+            )
+            continue
+
+        if len(uniq_ids) < min_species:
+            logger.warning(
+                "Group %s has fewer species than minimum required (%s). Group removed.",
+                group_name, min_species
+            )
+            continue
+
+        has_paralogs = len(species_ids) > len(uniq_ids)
+        if has_paralogs:
+            if paralog_mode == "remove":
+                logger.warning(
+                    "Group %s contains paralogs and will be removed (--paralogs remove).",
+                    group_name
+                )
+                continue
+            elif paralog_mode == "longest":
+                records = _resolve_paralogs_longest(records)
+                logger.info(
+                    "Group %s: paralogs resolved by keeping longest per species.",
+                    group_name
+                )
+
+        with open(outfile_path, "w") as out_fh:
+            for record in records:
+                out_fh.write(">%s\n%s\n" % (record.id, record.seq))
+</file>
+
+<file path="enhydra/cli.py">
+import os
+import sys
+import logging
+import argparse
+import multiprocessing
+
+from .io import read_config_file, read_species_list
+from .utils import check_parameters
+from .filtering import filter_length, filter_groups, subset_groups
+from .alignment import run_aligner, run_trimal
+from .tables import make_tables
+from .gsea import run_gsea
+from .orthofinder import preprocess_orthofinder
+from .differential import compute_differential, normalise_scores
+from .plotting import make_single_list_plots, make_differential_plots
+from .report import build_report
+from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
+
+
+def _setup_logging(outdir: str):
+    """Configure logging to both console and a log file in outdir."""
+    log_path = os.path.join(outdir, "enhydra.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout),
+        ]
+    )
+
+
+def _resolve(cli_val, config_val, default=None):
+    """Return CLI value if explicitly set, otherwise config value, then default."""
+    if cli_val is not None:
+        return cli_val
+    if config_val not in (None, ''):
+        return config_val
+    return default
+
+
+def _run_single_list(
+    inputdir: str,
+    listdir: str,
+    anchor: str,
+    min_species: int,
+    min_sequences: int,
+    mafft_path: str,
+    trimal_path: str,
+    max_process: int,
+    paralog_mode: str,
+    require_anchor: bool,
+    resume: bool,
+    sd_multiplier: float = 2.0,
+    aligner: str = "mafft",
+    mafft_mode: str = "auto",
+    parameters: dict = None,
+    species: list[str] | None = None,
+):
+    """Run steps 1–5 (filter, align, identity, tables) for one species list."""
+    logger = logging.getLogger(__name__)
+
+    def _should_skip(step_dir: str, step_name: str) -> bool:
+        if resume and os.path.isdir(step_dir):
+            logger.info(
+                "Skipping %s (output already exists: %s)", step_name, step_dir
+            )
+            return True
+        return False
+
+    subset_dir        = os.path.join(listdir, "subset")
+    length_stats_dir  = os.path.join(listdir, "length_stats")
+    length_filter_dir = os.path.join(listdir, "length_filter")
+    group_filter_dir  = os.path.join(listdir, "group_filter")
+    alignment_dir     = os.path.join(listdir, "alignment")
+    ident_dir         = os.path.join(listdir, "ident_alignment")
+    tables_dir        = os.path.join(listdir, "tables")
+
+    os.makedirs(listdir, exist_ok=True)
+
+    # Step 0 (two-list mode only): subset groups to species list
+    if species is not None:
+        if not _should_skip(subset_dir, "subsetting"):
+            subset_groups(inputdir, subset_dir, species)
+        source_dir = subset_dir
+    else:
+        source_dir = inputdir
+
+    inputfiles = os.listdir(source_dir)
+
+    logger.info("Step 1: Length filtering")
+    if not _should_skip(length_filter_dir, "length filtering"):
+        os.makedirs(length_stats_dir, exist_ok=True)
+        os.makedirs(length_filter_dir, exist_ok=True)
+        args_list = [
+            (os.path.join(source_dir, f), length_stats_dir,
+             length_filter_dir, sd_multiplier)
+            for f in inputfiles
+        ]
+        with multiprocessing.Pool(processes=max_process) as pool:
+            pool.starmap(filter_length, args_list)
+
+    logger.info("Step 2: Group filtering")
+    if not _should_skip(group_filter_dir, "group filtering"):
+        filter_groups(
+            length_filter_dir=length_filter_dir,
+            group_filter_dir=group_filter_dir,
+            anchor=anchor,
+            min_species=min_species,
+            min_sequences=min_sequences,
+            paralog_mode=paralog_mode,
+            require_anchor=require_anchor,
+        )
+
+    logger.info("Step 3: Alignment with %s", aligner.upper())
+    if not _should_skip(alignment_dir, "alignment"):
+        run_aligner(
+            group_filter_dir=group_filter_dir,
+            alignment_dir=alignment_dir,
+            aligner=aligner,
+            parameters=parameters,
+        )
+
+    logger.info("Step 4: Identity estimation with trimAl")
+    if not _should_skip(ident_dir, "identity estimation"):
+        run_trimal(
+            alignment_dir=alignment_dir,
+            ident_dir=ident_dir,
+            trimal_path=trimal_path,
+        )
+
+    logger.info("Step 5: Generating tables")
+    if not _should_skip(tables_dir, "table generation"):
+        make_tables(
+            alignment_dir=alignment_dir,
+            ident_dir=ident_dir,
+            tables_dir=tables_dir,
+            anchor=anchor,
+        )
+
+    return tables_dir
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="enhydra",
+        description="Gene Set Enrichment Analysis for evolutionary genomics."
+    )
+
+    # --- Positional arguments ---
+    parser.add_argument("code_config",    help="Path to the code configuration file.")
+    parser.add_argument("project_config", help="Path to the project configuration file.")
+
+    # --- Input mode ---
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "--orthofinder-dir",
+        help="Path to an OrthoFinder 3 output directory."
+    )
+
+    # --- Run control ---
+    parser.add_argument(
+        "--resume", action="store_true", default=False,
+        help="Resume a previously interrupted run."
+    )
+
+    # --- Filtering (override config) ---
+    parser.add_argument(
+        "--paralogs", choices=["all", "remove", "longest"], default=None,
+        help="Paralog handling strategy. Overrides config 'paralogs'."
+    )
+    parser.add_argument(
+        "--min-species", type=int, default=None,
+        help="Minimum species per group. Overrides config 'min_species'."
+    )
+
+    # --- Two-list differential mode ---
+    diff_group = parser.add_argument_group("two-list differential mode")
+    diff_group.add_argument(
+        "--list1", default=None,
+        help="Path to species list file for list 1. Overrides config 'list1'."
+    )
+    diff_group.add_argument(
+        "--list2", default=None,
+        help="Path to species list file for list 2. Overrides config 'list2'."
+    )
+    diff_group.add_argument(
+        "--metric", choices=["zscore", "identity", "rank"], default=None,
+        help="Differential/ranking metric. Overrides config 'metric'."
+    )
+
+    # --- Gene set source (override config) ---
+    gmt_group = parser.add_mutually_exclusive_group()
+    gmt_group.add_argument(
+        "--organism", default=None,
+        help="g:Profiler organism name. Overrides config 'organism'."
+    )
+    gmt_group.add_argument(
+        "--gene-sets", default=None,
+        help="Path to a local .gmt file. Overrides config 'gene_sets'."
+    )
+
+    # --- GSEA options (override config) ---
+    parser.add_argument(
+        "--sources", nargs="+", default=None,
+        help="g:Profiler data sources. Overrides config 'sources'."
+    )
+    parser.add_argument(
+        "--permutations", type=int, default=None,
+        help="Number of GSEA permutations. Overrides config 'permutations'."
+    )
+    parser.add_argument(
+        "--min-size", type=int, default=None,
+        help="Minimum gene set size. Overrides config 'min_size'."
+    )
+    parser.add_argument(
+        "--max-size", type=int, default=None,
+        help="Maximum gene set size. Overrides config 'max_size'."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed. Overrides config 'seed'."
+    )
+    parser.add_argument(
+        "--fdr-threshold", type=float, default=None,
+        help="FDR significance threshold. Overrides config 'fdr_threshold'."
+    )
+
+    # --- Report ---
+    parser.add_argument(
+        "--obo-cache", default=None,
+        help="Directory containing cached go-basic.obo file."
+    )
+
+    return parser
+
+
+def main():
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    # --- Read config ---
+    try:
+        with open(args.project_config, "r") as fh_project, \
+             open(args.code_config, "r") as fh_code:
+            parameters = read_config_file(fh_project, fh_code)
+    except OSError as e:
+        sys.exit("Could not open configuration file: %s" % e)
+
+    try:
+        check_parameters(parameters, args.code_config)
+    except (EnhydraConfigError, EnhydraIOError, EnhydraToolError) as e:
+        sys.exit("Configuration error: %s" % e)
+
+    # --- Resolve parameters: CLI overrides config ---
+    min_species    = _resolve(args.min_species,   parameters['min_species'],   4)
+    min_sequences  = parameters['min_sequences']
+    paralogs       = _resolve(args.paralogs,      parameters['paralogs'],      'all')
+    metric         = _resolve(args.metric,        parameters['metric'],        'zscore')
+    gene_sets      = _resolve(args.gene_sets,     parameters['gene_sets'],     None)
+    organism       = _resolve(args.organism,      parameters['organism'],      None)
+    permutations   = _resolve(args.permutations,  parameters['permutations'],  1000)
+    min_size       = _resolve(args.min_size,      parameters['min_size'],      5)
+    max_size       = _resolve(args.max_size,      parameters['max_size'],      500)
+    seed           = _resolve(args.seed,          parameters['seed'],          42)
+    fdr_threshold  = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
+    list1_path     = _resolve(args.list1,         parameters['list1'],         None)
+    list2_path     = _resolve(args.list2,         parameters['list2'],         None)
+    sources_raw    = _resolve(args.sources,       parameters['sources'],
+                              'GO:BP GO:MF GO:CC KEGG REAC')
+    sources        = sources_raw if isinstance(sources_raw, list) \
+                     else sources_raw.split()
+    sd_multiplier  = parameters['length_filter_sd']
+    aligner        = parameters['aligner']
+    mafft_mode     = parameters['mafft_mode']
+    top_n          = parameters['top_n']
+    obo_cache      = _resolve(args.obo_cache, parameters['obo_cache'], None)
+
+    # Validate gene set source
+    if not gene_sets and not organism:
+        parser.error(
+            "A gene set source is required. Set 'gene_sets' or 'organism' "
+            "in your project config, or use --gene-sets / --organism."
+        )
+
+    # Validate two-list mode
+    two_list_mode = bool(list1_path or list2_path)
+    if two_list_mode and not (list1_path and list2_path):
+        parser.error(
+            "Two-list mode requires both list1 and list2 to be specified "
+            "(in config or via --list1/--list2)."
+        )
+
+    # --- Set up output directory and logging ---
+    outdir = parameters['outdir']
+    if os.path.isdir(outdir) and not args.resume:
+        sys.exit(
+            "Output directory '%s' already exists. Use --resume to continue "
+            "a previous run, or change 'outdir' in your project config." % outdir
+        )
+    os.makedirs(outdir, exist_ok=True)
+
+    _setup_logging(outdir)
+    logger = logging.getLogger(__name__)
+    logger.info("Welcome to Enhydra")
+    logger.info("Resolved parameters: metric=%s, paralogs=%s, min_species=%d, "
+                "permutations=%d, min_size=%d, max_size=%d, fdr_threshold=%.2f",
+                metric, paralogs, min_species, permutations,
+                min_size, max_size, fdr_threshold)
+
+    # --- OrthoFinder preprocessing (optional) ---
+    if args.orthofinder_dir:
+        logger.info("OrthoFinder mode: preprocessing Orthogroup_Sequences/")
+        preprocess_orthofinder(
+            orthofinder_dir=args.orthofinder_dir,
+            inputdir=parameters['inputdir'],
+        )
+
+    # --- Common kwargs for _run_single_list ---
+    common_kwargs = dict(
+        inputdir=parameters['inputdir'],
+        min_species=min_species,
+        min_sequences=min_sequences,
+        mafft_path=parameters['mafft'],
+        trimal_path=parameters['trimal'],
+        max_process=parameters['max_process'],
+        paralog_mode=paralogs,
+        sd_multiplier=sd_multiplier,
+        aligner=aligner,
+        mafft_mode=mafft_mode,
+        parameters=parameters,
+        resume=args.resume,
+    )
+
+    # --- Single-list mode ---
+    if not two_list_mode:
+        logger.info("Running in single-list mode.")
+        tables_dir = _run_single_list(
+            listdir=outdir,
+            anchor=parameters['anchor'],
+            require_anchor=True,
+            species=None,
+            **common_kwargs,
+        )
+        results_dir = os.path.join(outdir, "enrichment")
+
+        def _should_skip_gsea():
+            if args.resume and os.path.isdir(results_dir):
+                logger.info("Skipping enrichment analysis (output already exists).")
+                return True
+            return False
+
+        # Apply metric normalisation
+        raw_anchor2mean = os.path.join(outdir, "tables", "anchor2mean.tsv")
+        if metric == "identity":
+            gsea_anchor2mean = raw_anchor2mean
+        else:
+            import pandas as _pd
+            df = _pd.read_csv(raw_anchor2mean, sep="\t", header=None,
+                              names=["gene_id", "score"])
+            df["score"] = _pd.to_numeric(df["score"], errors="coerce")
+            df = df.dropna(subset=["score"])
+            df["score"] = normalise_scores(
+                df.set_index("gene_id")["score"], metric
+            ).values
+            gsea_anchor2mean = os.path.join(
+                outdir, "tables", "anchor2mean_%s.tsv" % metric
+            )
+            df.to_csv(gsea_anchor2mean, sep="\t", index=False, header=False)
+            logger.info("Scores normalised using metric: %s", metric)
+
+        logger.info("Step 6: Enrichment analysis")
+        if not _should_skip_gsea():
+            run_gsea(
+                anchor2mean_path=gsea_anchor2mean,
+                results_dir=results_dir,
+                gene_sets=gene_sets,
+                organism=organism,
+                sources=sources,
+                permutations=permutations,
+                min_size=min_size,
+                max_size=max_size,
+                seed=seed,
+                fdr_threshold=fdr_threshold,
+            )
+
+        logger.info("Generating plots")
+        obo_path = os.path.join(obo_cache, "go-basic.obo") \
+            if obo_cache else None
+        from .report import _parse_obo_names
+        obo_names = _parse_obo_names(obo_path) \
+            if obo_path and os.path.isfile(obo_path) else {}
+        make_single_list_plots(
+            anchor2mean_path=raw_anchor2mean,
+            results_dir=results_dir,
+            plots_dir=os.path.join(outdir, "plots"),
+            obo_names=obo_names,
+            fdr_threshold=fdr_threshold,
+            top_n=top_n,
+        )
+
+        logger.info("Building HTML report")
+        build_report(
+            results_dir=results_dir,
+            plots_dir=os.path.join(outdir, "plots"),
+            report_path=os.path.join(outdir, "report.html"),
+            obo_path=obo_path,
+            mode="single",
+            fdr_threshold=fdr_threshold,
+        )
+
+    # --- Two-list differential mode ---
+    else:
+        logger.info("Running in two-list differential mode.")
+        species1 = read_species_list(list1_path)
+        species2 = read_species_list(list2_path)
+        logger.info("List 1: %d species", len(species1))
+        logger.info("List 2: %d species", len(species2))
+        logger.info("Anchor: %s", parameters['anchor'])
+
+        logger.info("--- Processing list 1 ---")
+        tables_dir1 = _run_single_list(
+            listdir=os.path.join(outdir, "list1"),
+            anchor=parameters['anchor'],
+            require_anchor=False,
+            species=species1,
+            **common_kwargs,
+        )
+
+        logger.info("--- Processing list 2 ---")
+        tables_dir2 = _run_single_list(
+            listdir=os.path.join(outdir, "list2"),
+            anchor=parameters['anchor'],
+            require_anchor=False,
+            species=species2,
+            **common_kwargs,
+        )
+
+        diff_dir    = os.path.join(outdir, "differential")
+        results_dir = os.path.join(diff_dir, "enrichment")
+
+        def _should_skip_diff(step_dir, step_name):
+            if args.resume and os.path.isdir(step_dir):
+                logger.info("Skipping %s (output already exists).", step_name)
+                return True
+            return False
+
+        logger.info("--- Computing differential scores ---")
+        anchor2mean_path = os.path.join(diff_dir, "anchor2mean.tsv")
+        if not _should_skip_diff(diff_dir, "differential ranking"):
+            compute_differential(
+                tables_dir1=tables_dir1,
+                tables_dir2=tables_dir2,
+                diff_dir=diff_dir,
+                metric=metric,
+            )
+
+        logger.info("Step 6: Enrichment analysis (differential)")
+        if not _should_skip_diff(results_dir, "enrichment analysis"):
+            run_gsea(
+                anchor2mean_path=anchor2mean_path,
+                results_dir=results_dir,
+                gene_sets=gene_sets,
+                organism=organism,
+                sources=sources,
+                permutations=permutations,
+                min_size=min_size,
+                max_size=max_size,
+                seed=seed,
+                fdr_threshold=fdr_threshold,
+            )
+
+        logger.info("Generating differential plots")
+        obo_path = os.path.join(obo_cache, "go-basic.obo") \
+            if obo_cache else None
+        from .report import _parse_obo_names
+        obo_names = _parse_obo_names(obo_path) \
+            if obo_path and os.path.isfile(obo_path) else {}
+        make_differential_plots(
+            tables_dir1=tables_dir1,
+            tables_dir2=tables_dir2,
+            diff_dir=diff_dir,
+            plots_dir=os.path.join(diff_dir, "plots"),
+            metric=metric,
+            obo_names=obo_names,
+            fdr_threshold=fdr_threshold,
+            top_n=top_n,
+        )
+
+        logger.info("Building HTML report")
+        build_report(
+            results_dir=results_dir,
+            plots_dir=os.path.join(diff_dir, "plots"),
+            report_path=os.path.join(diff_dir, "report.html"),
+            obo_path=obo_path,
+            mode="differential",
+            metric=metric,
+            fdr_threshold=fdr_threshold,
+        )
+
+    logger.info("Enhydra finished successfully.")
+</file>
+
+</files>

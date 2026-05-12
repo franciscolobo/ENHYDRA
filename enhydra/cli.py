@@ -7,7 +7,7 @@ import multiprocessing
 from tqdm import tqdm
 
 from .io import read_config_file, read_species_list, parse_obo_names
-from .utils import check_parameters
+from .utils import check_parameters, check_lists
 from .filtering import filter_length, filter_groups, subset_groups
 from .alignment import run_aligner, run_trimal
 from .tables import make_tables
@@ -230,7 +230,6 @@ def _run_single_list(
                 alignment_dir=alignment_dir,
                 ident_dir=ident_dir,
                 trimal_path=trimal_path,
-                n_proc=max_process,
                 show_progress=show_progress,
             )
         sbar.update(1)
@@ -490,13 +489,24 @@ def main():
         logger.info("Running in two-list differential mode.")
         species1 = read_species_list(list1_path)
         species2 = read_species_list(list2_path)
+        anchor = parameters['anchor']
+        check_lists(species1, species2, anchor)
+        if anchor not in species1:
+            logger.warning(
+                "Anchor species '%s' is not in list 1 — adding it automatically "
+                "so that orthogroups can be mapped to anchor gene IDs for GSEA. "
+                "It will not affect the differential score calculation.",
+                anchor,
+            )
+            species1 = list(species1) + [anchor]
+
         logger.info("List 1: %d species. List 2: %d species. Anchor: %s",
-                    len(species1), len(species2), parameters['anchor'])
+                    len(species1), len(species2), anchor)
 
         logger.info("--- Processing list 1 ---")
         tables_dir1, stats1 = _run_single_list(
             listdir=os.path.join(outdir, "list1"),
-            anchor=parameters['anchor'],
+            anchor=anchor,
             require_anchor=False,
             species=species1,
             label="list 1",

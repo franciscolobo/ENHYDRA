@@ -7,13 +7,14 @@ import logging
 import statistics
 import numpy as np
 from Bio import SeqIO
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 PARALOG_MODES = ("all", "remove", "longest")
 
 
-def subset_groups(inputdir: str, subset_dir: str, species: list[str]):
+def subset_groups(inputdir, subset_dir, species, show_progress: bool = False):
     """Subset orthogroup FASTAs to sequences from a given species list.
 
     Reads each FASTA in inputdir and writes a new FASTA containing only
@@ -24,12 +25,14 @@ def subset_groups(inputdir: str, subset_dir: str, species: list[str]):
         inputdir:   Directory of input FASTA files (one per orthogroup).
         subset_dir: Directory where subsetted FASTAs are written.
         species:    List of species IDs to retain.
+        show_progress: Whether show progress bar or not
     """
     species_set = set(species)
     os.makedirs(subset_dir, exist_ok=True)
     n_written = 0
     n_empty = 0
-    for filename in os.listdir(inputdir):
+    for filename in tqdm(os.listdir(inputdir), desc="  groups",
+                         unit="group", leave=False, disable=not show_progress):
         in_path = os.path.join(inputdir, filename)
         out_path = os.path.join(subset_dir, filename)
         records = [
@@ -132,8 +135,10 @@ def filter_groups(
     group_filter_dir: str,
     anchor: str,
     min_species: int,
+    min_sequences: int = 2,
     paralog_mode: str = "all",
     require_anchor: bool = True,
+    show_progress: bool = False,
 ):
     """Filter groups lacking the anchor species or below the minimum species count.
 
@@ -149,6 +154,7 @@ def filter_groups(
         require_anchor:    If True (single-list mode), discard groups that do
                            not contain the anchor species. If False (two-list
                            mode), anchor presence is not required.
+        show_progress:     If True, progress bar is shown. If False, verbose log.
     """
     if paralog_mode not in PARALOG_MODES:
         raise ValueError(
@@ -156,7 +162,9 @@ def filter_groups(
         )
 
     os.makedirs(group_filter_dir, exist_ok=True)
-    for file in os.listdir(length_filter_dir):
+    for file in tqdm(os.listdir(length_filter_dir), desc="  groups",
+                     unit="group", leave=False, disable=not show_progress):
+
         group_name = file.split(".")[0]
         path_to_file = os.path.join(length_filter_dir, file)
         outfile_path = os.path.join(group_filter_dir, file)

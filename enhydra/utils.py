@@ -1,5 +1,8 @@
 import os
+import logging
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
+
+logger = logging.getLogger(__name__)
 
 
 def _check_tool(path: str, name: str, code_config: str):
@@ -56,3 +59,34 @@ def check_parameters(parameters, code_config):
     else:
         raise EnhydraConfigError(
             "Unknown aligner '%s'. Choose from: mafft, muscle, prank." % aligner)
+
+
+def check_lists(
+    species1: list[str],
+    species2: list[str],
+    anchor: str,
+):
+    """Warn if the anchor is absent from list 1 or present in list 2.
+
+    In two-list mode the anchor must be present in list 1 (or will be
+    injected automatically) because group→gene ID mapping is derived
+    exclusively from list 1 alignments.
+
+    Args:
+        species1: Species IDs in list 1.
+        species2: Species IDs in list 2.
+        anchor:   Anchor species ID.
+    """
+    if anchor not in species1:
+        logger.warning(
+            "Anchor species '%s' is not in list 1. It will be added "
+            "automatically, but consider using an anchor that belongs "
+            "to list 1 to avoid potential bias in group filtering.",
+            anchor,
+        )
+    if anchor in species2:
+        logger.warning(
+            "Anchor species '%s' is present in list 2. This is unusual — "
+            "the anchor is expected to belong to list 1.",
+            anchor,
+        )
