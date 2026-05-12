@@ -8,7 +8,8 @@ from tqdm import tqdm
 
 from .io import read_config_file, read_species_list, parse_obo_names
 from .utils import check_parameters, check_lists
-from .filtering import filter_length, filter_groups, subset_groups
+from .filtering import filter_length, filter_groups, subset_groups, \
+    strip_species_from_alignments
 from .alignment import run_aligner, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
@@ -51,11 +52,6 @@ def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bo
     If sentinel_files is provided, every named file must exist inside
     step_dir and be non-empty. Otherwise the directory itself must exist
     and contain at least one file.
-
-    Args:
-        step_dir:       Directory written by the step.
-        sentinel_files: Specific filenames that must be present and
-                        non-empty. If None, any non-empty directory suffices.
     """
     if not os.path.isdir(step_dir):
         return False
@@ -120,8 +116,15 @@ def _run_single_list(
     species: list[str] | None = None,
     show_progress: bool = False,
     label: str = "",
+    exclude_from_identity: set[str] | None = None,
 ) -> tuple[str, dict]:
     """Run steps 1–5 (filter, align, identity, tables) for one species list.
+
+    Args:
+        exclude_from_identity: Species IDs to strip from alignments before
+                               trimAl runs. Used in two-list mode when the
+                               anchor was injected into list 1 to avoid biasing
+                               group2mean scores with a non-list-1 species.
 
     Returns:
         Tuple of (tables_dir, stats) where stats contains group counts
@@ -145,12 +148,15 @@ def _run_single_list(
     length_filter_dir = os.path.join(listdir, "length_filter")
     group_filter_dir  = os.path.join(listdir, "group_filter")
     alignment_dir     = os.path.join(listdir, "alignment")
+    stripped_dir      = os.path.join(listdir, "alignment_stripped")
     ident_dir         = os.path.join(listdir, "ident_alignment")
     tables_dir        = os.path.join(listdir, "tables")
 
     os.makedirs(listdir, exist_ok=True)
 
-    n_steps = 6 if species is not None else 5
+    n_steps = 7 if (species is not None and exclude_from_identity) \
+              else 6 if (species is not None or exclude_from_identity) \
+              else 5
 
     with tqdm(total=n_steps, desc=_desc("starting"),
               unit="step", disable=not show_progress, leave=True) as sbar:
@@ -222,19 +228,43 @@ def _run_single_list(
             )
         sbar.update(1)
 
+        # Step 3b (optional): strip injected anchor from alignments before
+        # identity estimation so that group2mean scores are not biased by
+        # a species that does not belong to this list.
+        trimal_input_dir = alignment_dir
+        if exclude_from_identity:
+            sbar.set_description(_desc("stripping anchor"))
+            logger.info(
+                "Step 3b: Stripping injected species from alignments "
+                "before identity estimation: %s", exclude_from_identity
+            )
+            if not _skip(stripped_dir, "stripping anchor from alignments"):
+                strip_species_from_alignments(
+                    alignment_dir=alignment_dir,
+                    stripped_dir=stripped_dir,
+                    exclude=exclude_from_identity,
+                    show_progress=show_progress,
+                )
+            trimal_input_dir = stripped_dir
+            sbar.update(1)
+
         # Step 4: identity estimation
         sbar.set_description(_desc("identity"))
         logger.info("Step 4: Identity estimation with trimAl")
         if not _skip(ident_dir, "identity estimation"):
             run_trimal(
-                alignment_dir=alignment_dir,
+                alignment_dir=trimal_input_dir,
                 ident_dir=ident_dir,
                 trimal_path=trimal_path,
+                n_proc=max_process,
                 show_progress=show_progress,
             )
         sbar.update(1)
 
         # Step 5: tables
+        # Note: make_tables always reads the original alignment_dir (not
+        # stripped_dir) so that the anchor sequence is available for
+        # group→gene ID mapping.
         sbar.set_description(_desc("tables"))
         logger.info("Step 5: Generating tables")
         if not _skip(tables_dir, "table generation",
@@ -487,18 +517,18 @@ def main():
     # --- Two-list differential mode ---
     else:
         logger.info("Running in two-list differential mode.")
+        anchor = parameters['anchor']
         species1 = read_species_list(list1_path)
         species2 = read_species_list(list2_path)
-        anchor = parameters['anchor']
         check_lists(species1, species2, anchor)
+
+        # Inject anchor into list 1 if absent, and track whether we did so
+        # so that we can strip it from alignments before identity estimation.
         if anchor not in species1:
-            logger.warning(
-                "Anchor species '%s' is not in list 1 — adding it automatically "
-                "so that orthogroups can be mapped to anchor gene IDs for GSEA. "
-                "It will not affect the differential score calculation.",
-                anchor,
-            )
             species1 = list(species1) + [anchor]
+            anchor_injected = True
+        else:
+            anchor_injected = False
 
         logger.info("List 1: %d species. List 2: %d species. Anchor: %s",
                     len(species1), len(species2), anchor)
@@ -510,13 +540,14 @@ def main():
             require_anchor=False,
             species=species1,
             label="list 1",
+            exclude_from_identity={anchor} if anchor_injected else None,
             **common_kwargs,
         )
 
         logger.info("--- Processing list 2 ---")
         tables_dir2, stats2 = _run_single_list(
             listdir=os.path.join(outdir, "list2"),
-            anchor=parameters['anchor'],
+            anchor=anchor,
             require_anchor=False,
             species=species2,
             label="list 2",

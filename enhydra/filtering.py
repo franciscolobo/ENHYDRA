@@ -13,6 +13,42 @@ logger = logging.getLogger(__name__)
 
 PARALOG_MODES = ("all", "remove", "longest")
 
+def strip_species_from_alignments(
+    alignment_dir: str,
+    stripped_dir: str,
+    exclude: set[str],
+    show_progress: bool = False,
+):
+    """Write copies of alignments with sequences from specified species removed.
+
+    Used in two-list mode to remove an injected anchor species from list 1
+    alignments before identity estimation, so that group2mean scores reflect
+    only genuine list 1 species.
+
+    Args:
+        alignment_dir: Directory of alignment files.
+        stripped_dir:  Directory where stripped alignments are written.
+        exclude:       Set of species IDs to remove.
+        show_progress: Show a tqdm progress bar.
+    """
+    os.makedirs(stripped_dir, exist_ok=True)
+    files = os.listdir(alignment_dir)
+    for file in tqdm(files, desc="  stripping", unit="group",
+                     leave=False, disable=not show_progress):
+        in_path  = os.path.join(alignment_dir, file)
+        out_path = os.path.join(stripped_dir, file)
+        records  = [
+            r for r in SeqIO.parse(in_path, "fasta")
+            if r.id.split("|")[0] not in exclude
+        ]
+        if not records:
+            logger.warning(
+                "All sequences removed from %s after stripping — skipping.", file
+            )
+            continue
+        with open(out_path, "w") as fh:
+            for r in records:
+                fh.write(">%s\n%s\n" % (r.id, r.seq))
 
 def subset_groups(inputdir, subset_dir, species, show_progress: bool = False):
     """Subset orthogroup FASTAs to sequences from a given species list.

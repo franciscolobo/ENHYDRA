@@ -4,7 +4,7 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 from .io import read_config_file, read_species_list, parse_obo_names
 from .utils import check_parameters
-from .filtering import filter_length, filter_groups, subset_groups
+from .filtering import filter_length, filter_groups, subset_groups, strip_species_from_alignments
 from .alignment import run_mafft, run_trimal
 from .tables import make_tables
 from .gsea import run_gsea
