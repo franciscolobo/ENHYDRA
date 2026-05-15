@@ -26,6 +26,9 @@ dev   = ["pytest>=7.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: end-to-end pipeline tests; require GSEApy but no external tools",
+]
 
 [project.scripts]
 enhydra = "enhydra.cli:main"
