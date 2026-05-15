@@ -1,7 +1,7 @@
 # --- Input/Output ---
 inputdir    = test_data/ecoli_orthogroups/all
-outdir      = test_data/ecoli_output_all_zscore_non_patho_anchor
-anchor      = NC_004431
+outdir      = test_data/ecoli_output_all_non_patho_anchor
+anchor      = NZ_CP016546
 max_process = 8
 
 # --- Filtering ---
@@ -14,16 +14,13 @@ length_filter_sd = 2.0      # sequences beyond mean ± (sd * length_filter_sd) a
 aligner     = mafft         # mafft | muscle | prank
 mafft_mode  = auto          # auto | linsi | ginsi | einsi | fftnsi | fftns | nwnsi | nwns
 
-# --- Ranking metric ---
-metric      = zscore        # zscore | identity | rank
-
 # --- Gene set enrichment ---
-gene_sets     = test_data/gmt/NC_004431_GO_BP.gmt
+gene_sets     = test_data/gmt/NZ_CP016546_GO_BP.gmt
 min_size      = 5
 max_size      = 500
 permutations  = 1000
 seed          = 42
-fdr_threshold = 0.2
+fdr_threshold = 0.1
 
 # --- Report ---
 top_n       = 20            # number of gene sets shown in barplot

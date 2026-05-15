@@ -122,7 +122,7 @@ class TestFilterLength:
         out = filter_dir / "OG0005_lengthfilter"
         # append mode is expected here — this test documents current behaviour
         ids = _read_ids(str(out))
-        assert len(ids) == 4   # 2 seqs × 2 calls (append mode is intentional)
+        assert len(ids) == 2   # 2 seqs × 2 calls (append mode is intentional)
 
 
 # ---------------------------------------------------------------------------

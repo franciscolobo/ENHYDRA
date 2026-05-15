@@ -1,6 +1,6 @@
 # --- Input/Output ---
 inputdir    = test_data/ecoli_orthogroups/all
-outdir      = test_data/ecoli_output_all
+outdir      = test_data/ecoli_output_all_patho_anchor
 anchor      = NC_004431
 max_process = 8
 
@@ -14,7 +14,7 @@ min_size    = 5         # minimum number of genes per gene set
 max_size    = 500       # maximum number of genes per gene set
 permutations = 1000
 seed        = 42
-fdr_threshold = 0.2    # significance threshold for plots and report
+fdr_threshold = 0.1    # significance threshold for plots and report
 
 # --- Two-list differential mode (optional) ---
 # list1      = tests/pathogenic_strains.txt

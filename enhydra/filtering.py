@@ -60,6 +60,9 @@ def filter_length(
     Groups with fewer than 2 sequences before filtering are skipped entirely —
     a single sequence cannot be aligned and would cause downstream failures.
 
+    Both output files are opened in write mode so that re-runs produce clean
+    output rather than appending duplicate entries.
+
     Args:
         input_path:        Path to the input FASTA file.
         length_stats_dir:  Directory where per-group length stats are written.
@@ -95,7 +98,7 @@ def filter_length(
     keys, values = list(length_data.keys()), list(length_data.values())
     length_data_sorted = {keys[i]: values[i] for i in sorted_idx}
 
-    with open(outfile_s_path, "a") as outstats:
+    with open(outfile_s_path, "w") as outstats:
         outstats.write("##Overall sequence length stats\n")
         outstats.write("Total seqs: %s\nAverage: %s\nMedian: %s\nSD: %s\n" % (
             len(lengths), mean, median, stddev))
@@ -104,7 +107,7 @@ def filter_length(
         for key, value in length_data_sorted.items():
             outstats.write("%s\t%s\t%s\n" % (key, value, value / mean))
 
-    with open(outfile_f_path, "a") as outfile:
+    with open(outfile_f_path, "w") as outfile:
         for seq_record in SeqIO.parse(input_path, "fasta"):
             seq = seq_record.seq
             if (len(seq) < mean - sd_multiplier * stddev) or \
