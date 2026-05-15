@@ -208,9 +208,7 @@ def _run_single_list(
 
     os.makedirs(listdir, exist_ok=True)
 
-    n_steps = (7 if (species is not None and exclude_from_identity)
-               else 6 if (species is not None or exclude_from_identity)
-               else 5)
+    n_steps = 5 + (species is not None) + bool(exclude_from_identity)
 
     with tqdm(total=n_steps, desc=_desc("starting"),
               unit="step", disable=not show_progress, leave=True) as sbar:
