@@ -238,18 +238,20 @@ def _run_single_list(
                  length_filter_dir, sd_multiplier)
                 for f in files
             ]
-            with multiprocessing.Pool(processes=max_process) as pool:
-                try:
-                    list(tqdm(
-                        pool.imap_unordered(_filter_length_star, args_list),
-                        total=len(args_list), desc="  groups", unit="group",
-                        leave=False, disable=not show_progress,
-                    ))
-                except Exception as e:
-                    pool.terminate()
-                    raise EnhydraToolError(
-                        "Length filtering failed: %s" % e
-                    ) from e
+            pool = multiprocessing.Pool(processes=max_process)
+            try:
+                list(tqdm(
+                    pool.imap_unordered(_filter_length_star, args_list),
+                    total=len(args_list), desc="  groups", unit="group",
+                    leave=False, disable=not show_progress,
+                ))
+            except Exception as e:
+                raise EnhydraToolError(
+                    "Length filtering failed: %s" % e
+                ) from e
+            finally:
+                pool.terminate()
+                pool.join()
         sbar.update(1)
 
         # Step 2: group filtering

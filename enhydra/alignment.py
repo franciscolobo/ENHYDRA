@@ -84,18 +84,26 @@ def _trimal_worker(args: tuple) -> None:
 # ---------------------------------------------------------------------------
 
 def _run_pool(worker, args_list: list, n_proc: int, show_progress: bool) -> None:
-    """Run worker over args_list in parallel, with optional tqdm progress."""
-    with multiprocessing.Pool(processes=n_proc) as pool:
-        try:
-            list(tqdm(
-                pool.imap_unordered(worker, args_list),
-                total=len(args_list),
-                desc="  groups", unit="group",
-                leave=False, disable=not show_progress,
-            ))
-        except Exception as e:
-            pool.terminate()
-            raise EnhydraToolError(str(e)) from e
+    """Run worker over args_list in parallel with optional tqdm progress.
+
+    Uses an explicit try/finally rather than the Pool context manager so that
+    pool.terminate() is guaranteed to run — and in-flight worker processes are
+    killed — whether the tqdm iteration completes normally, raises an
+    exception, or is interrupted externally.
+    """
+    pool = multiprocessing.Pool(processes=n_proc)
+    try:
+        list(tqdm(
+            pool.imap_unordered(worker, args_list),
+            total=len(args_list),
+            desc="  groups", unit="group",
+            leave=False, disable=not show_progress,
+        ))
+    except Exception as e:
+        raise EnhydraToolError(str(e)) from e
+    finally:
+        pool.terminate()
+        pool.join()
 
 
 def run_mafft(
@@ -107,10 +115,6 @@ def run_mafft(
     show_progress: bool = False,
 ):
     """Align each group FASTA in parallel using MAFFT.
-
-    Each group is aligned by a separate worker process using a single
-    thread, which is more efficient than multi-threading within a single
-    alignment when processing many small-to-medium groups.
 
     Args:
         group_filter_dir: Directory of group-filtered FASTA files.
