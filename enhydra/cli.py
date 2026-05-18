@@ -567,6 +567,7 @@ def main():
                 obo_path=obo_path,
                 fdr_threshold=fdr_threshold,
                 mode="single",
+                gmt_path=gene_sets,
             )
         else:
             build_report(
@@ -576,6 +577,7 @@ def main():
                 obo_path=obo_path,
                 mode="single",
                 fdr_threshold=fdr_threshold,
+                gmt_path=gene_sets,
             )
 
         for m in metrics_to_run:
@@ -676,6 +678,7 @@ def main():
                 obo_path=obo_path,
                 fdr_threshold=fdr_threshold,
                 mode="differential",
+                gmt_path=gene_sets,
             )
         else:
             build_report(
@@ -686,6 +689,7 @@ def main():
                 mode="differential",
                 metric=metric,
                 fdr_threshold=fdr_threshold,
+                gmt_path=gene_sets,
             )
 
         for m in metrics_to_run:

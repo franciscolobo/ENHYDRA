@@ -326,8 +326,6 @@ var numericColsMap = {numeric_cols_map};
 var dtInstances   = {{}};
 var colFiltersMap  = {{}};
 
-// Single shared column-filter extension; keyed by table ID so multiple
-// DataTables instances on the same page filter independently.
 $.fn.dataTable.ext.search.push(function(settings, data) {{
     var metric = settings.nTable.id.replace('results-table-', '');
     var cf = colFiltersMap[metric] || {{}};
@@ -350,7 +348,7 @@ $.fn.dataTable.ext.search.push(function(settings, data) {{
 }});
 
 function initTable(metric) {{
-    if (dtInstances[metric]) return;   // already initialised
+    if (dtInstances[metric]) return;
     colFiltersMap[metric] = {{}};
     var numericCols = numericColsMap[metric] || [];
     var dt = $('#results-table-' + metric).DataTable({{
@@ -384,7 +382,6 @@ function initTable(metric) {{
 }}
 
 $(document).ready(function() {{
-    // SVG bar tooltips
     var svgTip = document.getElementById('svg-tooltip');
     document.querySelectorAll('[data-tip]').forEach(function(el) {{
         el.addEventListener('mousemove', function(e) {{
@@ -398,7 +395,6 @@ $(document).ready(function() {{
         }});
     }});
 
-    // Tab switching with lazy DataTable initialisation
     document.querySelectorAll('.tab-btn').forEach(function(btn) {{
         btn.addEventListener('click', function() {{
             var metric = this.dataset.metric;
@@ -410,11 +406,10 @@ $(document).ready(function() {{
             }});
             this.classList.add('active');
             document.getElementById('tab-' + metric).classList.add('active');
-            initTable(metric);   // no-op if already initialised
+            initTable(metric);
         }});
     }});
 
-    // GO enrichment plot modal — data-metric disambiguates across tabs
     $(document).on('click', '.go-link', function(e) {{
         e.preventDefault();
         var goId   = $(this).data('goid');
@@ -431,13 +426,50 @@ $(document).ready(function() {{
         if (e.target === this) $('#modal-overlay').removeClass('active');
     }});
 
-    // Activate first tab on load
     var firstBtn = document.querySelector('.tab-btn');
     if (firstBtn) firstBtn.click();
 }});
 </script>
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
+    """Parse term_id → term_name from the second column of a GMT file.
+
+    The GMT format is:
+        term_id <TAB> term_name <TAB> gene1 <TAB> gene2 ...
+
+    Returns an empty dict if the path is None, missing, or unreadable.
+    Used as a fallback source of term names when no OBO file is available.
+    """
+    if not gmt_path or not os.path.isfile(gmt_path):
+        return {}
+    names: dict[str, str] = {}
+    with open(gmt_path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) >= 2 and fields[0] and fields[1]:
+                names[fields[0]] = fields[1]
+    return names
+
+
+def _find_gmt_in_dir(directory: str) -> str | None:
+    """Return the path to the first .gmt file found in directory, or None.
+
+    Used to locate the GMT written by run_gsea when --organism is used
+    (saved as results_dir/gprofiler_<organism>.gmt).
+    """
+    if not os.path.isdir(directory):
+        return None
+    for fname in os.listdir(directory):
+        if fname.endswith(".gmt"):
+            return os.path.join(directory, fname)
+    return None
 
 
 def _fetch(url: str) -> str:
@@ -479,7 +511,6 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
 
     df = pd.read_csv(path)
 
-    # Convert Tag% (e.g. "1/10") to 0-1 float
     if "Tag %" in df.columns:
         def _tag(v):
             try:
@@ -492,7 +523,6 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
                 return None
         df["Tag %"] = df["Tag %"].apply(_tag)
 
-    # Convert Gene% (e.g. "9.55%") to 0-1 float
     if "Gene %" in df.columns:
         def _gene(v):
             try:
@@ -531,17 +561,15 @@ def _results_table_html(
 
     Args:
         df:            GSEA results DataFrame.
-        obo_names:     GO ID → term name mapping.
+        obo_names:     GO ID → term name mapping (may already include names
+                       merged from the GMT file by the caller).
         plot_index:    GO ID → base64 PNG URI mapping.
         fdr_threshold: FDR threshold for row highlighting.
-        metric:        Metric name used to generate a unique table ID and
-                       to tag go-link anchors with data-metric so the modal
+        metric:        Metric name used to generate a unique table ID and to
+                       tag go-link anchors with data-metric so the modal
                        handler can look up the correct enrichment plot when
                        multiple tabs share one page.  None preserves the
                        original single-metric behaviour.
-
-    Returns:
-        Tuple of (html_string, numeric_column_indices).
     """
     df = df.copy()
 
@@ -579,9 +607,9 @@ def _results_table_html(
     tooltips      = [t for _, _, t in col_defs]
     table_df.columns = display_names
 
-    numeric_display_names  = {"NES", "p-value", "FDR", "Tag %", "Gene %"}
-    numeric_col_indices    = [i for i, n in enumerate(display_names)
-                              if n in numeric_display_names]
+    numeric_display_names = {"NES", "p-value", "FDR", "Tag %", "Gene %"}
+    numeric_col_indices   = [i for i, n in enumerate(display_names)
+                             if n in numeric_display_names]
 
     header_cells = "".join(
         '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
@@ -590,9 +618,8 @@ def _results_table_html(
     )
     filter_cells = "<th></th>" * len(display_names)
 
-    # Unique table id — required when multiple tables coexist on one page.
-    table_id     = ("results-table-%s" % metric) if metric else "results-table"
-    metric_attr  = (' data-metric="%s"' % metric) if metric else ""
+    table_id    = ("results-table-%s" % metric) if metric else "results-table"
+    metric_attr = (' data-metric="%s"' % metric) if metric else ""
 
     rows = ""
     for _, row in table_df.iterrows():
@@ -641,6 +668,34 @@ def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
     return html
 
 
+def _resolve_term_names(
+    results_dir: str,
+    obo_path: str | None,
+    gmt_path: str | None,
+) -> dict[str, str]:
+    """Build the term name lookup used by _results_table_html.
+
+    Merges two sources, with OBO names taking precedence:
+    1. GMT second column — always available when a GMT file was used; provides
+       term names even when no OBO file has been downloaded.
+    2. go-basic.obo — canonical GO term names; used when --obo-cache is set.
+
+    If gmt_path is not provided, the results_dir is scanned for a .gmt file
+    written by run_gsea in --organism mode.
+    """
+    effective_gmt = gmt_path or _find_gmt_in_dir(results_dir)
+    gmt_names     = _gmt_term_names(effective_gmt)
+
+    obo_names: dict[str, str] = {}
+    if obo_path and os.path.isfile(obo_path):
+        obo_names = _parse_obo_names(obo_path)
+        logger.info("Loaded %d GO term names from OBO.", len(obo_names))
+
+    # OBO takes precedence: its names are more carefully curated and
+    # consistent across tool versions.
+    return {**gmt_names, **obo_names}
+
+
 # ---------------------------------------------------------------------------
 # Single-metric report (backward-compatible)
 # ---------------------------------------------------------------------------
@@ -653,14 +708,27 @@ def build_report(
     mode: str = "single",
     metric: str = "zscore",
     fdr_threshold: float = 0.25,
+    gmt_path: str | None = None,
 ):
-    """Build a self-contained HTML report for a single-metric ENHYDRA run."""
+    """Build a self-contained HTML report for a single-metric ENHYDRA run.
+
+    Args:
+        results_dir:   Directory containing GSEApy results.
+        plots_dir:     Directory containing plot files.
+        report_path:   Output path for the HTML file.
+        obo_path:      Path to go-basic.obo (optional; used for canonical
+                       GO term names).
+        mode:          "single" or "differential".
+        metric:        Ranking metric label for the report title.
+        fdr_threshold: FDR threshold for significance highlighting.
+        gmt_path:      Path to the GMT file used for GSEA.  Term names are
+                       read from its second column and used when an OBO file
+                       is not available.  If None, results_dir is scanned
+                       for a .gmt file written by --organism mode.
+    """
     logger.info("Building HTML report...")
 
-    obo_names = {}
-    if obo_path and os.path.isfile(obo_path):
-        obo_names = _parse_obo_names(obo_path)
-        logger.info("Loaded %d GO term names from OBO.", len(obo_names))
+    term_names = _resolve_term_names(results_dir, obo_path, gmt_path)
 
     df = _load_gsea_results(results_dir)
     if df is None:
@@ -694,9 +762,8 @@ def build_report(
         title = "ENHYDRA Differential Enrichment Report"
 
     plots_html = _plot_section(plots_dir, plot_names)
-    # metric=None preserves original table id "results-table"
     table_html, numeric_col_indices = _results_table_html(
-        df, obo_names, plot_index, fdr_threshold, metric=None
+        df, term_names, plot_index, fdr_threshold, metric=None
     )
 
     html = _TEMPLATE.format(
@@ -725,6 +792,7 @@ def build_multi_metric_report(
     obo_path: str | None = None,
     fdr_threshold: float = 0.25,
     mode: str = "single",
+    gmt_path: str | None = None,
 ):
     """Build a self-contained tabbed HTML report covering all ranking metrics.
 
@@ -739,15 +807,26 @@ def build_multi_metric_report(
         obo_path:      Path to go-basic.obo for GO term name lookup (optional).
         fdr_threshold: FDR threshold used for row highlighting.
         mode:          "single" or "differential" — controls plot set and title.
+        gmt_path:      Path to the GMT file used for GSEA.  Term names from its
+                       second column are used as a fallback when an OBO file is
+                       not available.  If None, the first metric's results_dir
+                       is scanned for a .gmt file written by --organism mode.
     """
     logger.info(
         "Building multi-metric HTML report (%d metrics)...", len(metric_data)
     )
 
-    obo_names = {}
-    if obo_path and os.path.isfile(obo_path):
-        obo_names = _parse_obo_names(obo_path)
-        logger.info("Loaded %d GO term names from OBO.", len(obo_names))
+    # If no explicit GMT path, scan the first metric's results_dir.
+    effective_gmt = gmt_path
+    if not effective_gmt and metric_data:
+        first_results = next(iter(metric_data.values()))["results_dir"]
+        effective_gmt = _find_gmt_in_dir(first_results)
+
+    term_names = _resolve_term_names(
+        results_dir=next(iter(metric_data.values()))["results_dir"] if metric_data else "",
+        obo_path=obo_path,
+        gmt_path=effective_gmt,
+    )
 
     cache_dir = os.path.dirname(obo_path) if obo_path else None
     jquery_js = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
@@ -772,8 +851,8 @@ def build_multi_metric_report(
 
     tab_buttons_parts    = []
     tab_panels_parts     = []
-    enrichment_plots_map = {}   # metric → {go_id → base64 uri}
-    numeric_cols_map     = {}   # metric → [col_indices]
+    enrichment_plots_map = {}
+    numeric_cols_map     = {}
 
     first = True
     for metric, paths in metric_data.items():
@@ -794,7 +873,7 @@ def build_multi_metric_report(
         df = _load_gsea_results(results_dir)
         if df is not None:
             tbl_html, num_cols = _results_table_html(
-                df, obo_names, plot_idx, fdr_threshold, metric=metric
+                df, term_names, plot_idx, fdr_threshold, metric=metric
             )
             numeric_cols_map[metric] = num_cols
         else:
