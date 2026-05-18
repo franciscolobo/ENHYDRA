@@ -1,0 +1,21 @@
+# --- Input/Output ---
+inputdir    = test_data/ecoli_orthogroups/all
+outdir      = test_data/ecoli_output_list_patho_anchor
+anchor      = NC_004431
+max_process = 8
+
+# --- Filtering ---
+min_species = 10        # minimum number of species per orthogroup
+paralogs    = all       # all | remove | longest
+
+# --- Gene set enrichment ---
+gene_sets   = test_data/gmt/NC_004431_GO_BP.gmt
+min_size    = 5         # minimum number of genes per gene set
+max_size    = 500       # maximum number of genes per gene set
+permutations = 1000
+seed        = 42
+fdr_threshold = 0.1    # significance threshold for plots and report
+
+# --- Two-list differential mode (optional) ---
+list1      = tests/E_coli_pathogenic.txt
+list2      = tests/E_coli_non_pathogenic.txt

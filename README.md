@@ -75,9 +75,7 @@ python tests/prepare_ecoli_proteomes.py strain_table.tsv proteomes/
 python tests/remove_pseudogenes.py proteomes/
 ```
 
-The strain table should be a TSV file with columns `genomeID`, `Phenotype`, and `plasmidIDs` (pipe-separated, or `-` if none):
-
-Phenotypes are used in the two-list mode.
+The strain table should be a TSV file with columns `genomeID`, `Pathogenicity`, and `plasmidIDs` (pipe-separated, or `-` if none):
 
 ```
 genomeID    Pathogenicity   plasmidIDs
@@ -125,6 +123,8 @@ python tests/build_gmt_interproscan.py \
 
 The GO OBO file is downloaded automatically and cached for reuse across runs and anchors.
 
+Alternatively, annotations can be fetched from g:Profiler at runtime using `--organism` instead of `--gene-sets` (see [Usage](#usage)). This requires a stable internet connection and a g:Profiler-recognised organism code.
+
 ---
 
 ## Configuration
@@ -148,7 +148,7 @@ max_process = 8
 | `min_species` | Minimum number of distinct species required to retain a group |
 | `aligner` | Alignment tool to use: `mafft` (default), `muscle`, or `prank` |
 | `anchor` | Species ID of the anchor genome used for annotation mapping |
-| `max_process` | Number of parallel processes for the length filtering step |
+| `max_process` | Number of parallel processes for alignment and length filtering |
 
 ### Code configuration file
 
@@ -189,6 +189,23 @@ enhydra code_config project_config \
     --resume
 ```
 
+Alignment, identity estimation, and table generation are skipped if their
+output already exists. Plots and the HTML report are always regenerated so
+that changes to `--fdr-threshold` or `--top-n` take effect without
+rerunning the full pipeline.
+
+### Run all three ranking metrics in one pass
+
+```bash
+enhydra code_config project_config \
+    --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --all-metrics
+```
+
+Runs GSEA for identity, z-score, and rank in a single pipeline execution
+and produces a single tabbed HTML report (`report.html`) with one tab per
+metric. See [Ranking metrics](#ranking-metrics) for details.
+
 ### Paralog handling
 
 ```bash
@@ -204,6 +221,27 @@ enhydra code_config project_config --gene-sets gmt/NC_004431_GO_BP.gmt \
     --paralogs longest
 ```
 
+### Two-list differential mode
+
+```bash
+enhydra code_config project_config \
+    --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --list1 pathogenic.txt \
+    --list2 non_pathogenic.txt \
+    --metric zscore
+```
+
+Combine with `--all-metrics` to run differential GSEA for all three metrics
+at once:
+
+```bash
+enhydra code_config project_config \
+    --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --list1 pathogenic.txt \
+    --list2 non_pathogenic.txt \
+    --all-metrics
+```
+
 ### Full options
 
 ```
@@ -214,38 +252,101 @@ positional arguments:
 options:
   --orthofinder-dir     Path to an OrthoFinder 3 output directory.
   --resume              Resume a previously interrupted run.
+  --quiet               Suppress INFO/WARNING on the console; show progress
+                        bars instead. All messages are still written to
+                        enhydra.log.
   --paralogs {all,remove,longest}
                         How to handle paralogs (default: all).
   --gene-sets           Path to a local .gmt file.
   --organism            g:Profiler organism name (alternative to --gene-sets).
   --sources             g:Profiler data sources (default: GO:BP GO:MF GO:CC KEGG REAC).
+  --all-metrics         Run GSEA for all three ranking metrics (identity,
+                        zscore, rank) in a single pass and produce a tabbed
+                        HTML report. When set, --metric is ignored.
+  --metric {identity,zscore,rank}
+                        Ranking metric to use when --all-metrics is not set
+                        (default: zscore). See Ranking metrics below.
   --permutations        Number of GSEA permutations (default: 1000).
   --min-size            Minimum gene set size (default: 5).
   --max-size            Maximum gene set size (default: 500).
   --seed                Random seed (default: 42).
+  --fdr-threshold       FDR threshold for significance and plot filtering
+                        (default: 0.25).
+  --top-n               Maximum number of gene sets shown in bar plots
+                        (default: 20).
+
+two-list differential mode:
+  --list1               Path to a file listing species IDs for group 1.
+  --list2               Path to a file listing species IDs for group 2.
 ```
 
 ---
 
 ## Output
 
+### Single-metric run
+
 ```
 outdir/
-├── enhydra.log                   # Run log
-├── length_stats/                 # Per-group length distribution statistics
-├── length_filter/                # FASTA files after length filtering
-├── group_filter/                 # FASTA files after group filtering
-├── alignment/                    # MAFFT alignments
-├── ident_alignment/              # trimAl identity reports
+├── enhydra.log
+├── length_stats/
+├── length_filter/
+├── group_filter/
+├── alignment/
+├── ident_alignment/
 ├── tables/
-│   ├── group2mean.tsv            # Homolog group → mean alignment identity
-│   ├── anchor2mean.tsv           # Anchor gene ID → mean alignment identity
-│   └── group2anchor.tsv          # Homolog group → anchor gene ID
-└── enrichment/
-    └── gseapy.gene_set.prerank.report.csv   # GSEA results
+│   ├── group2mean.tsv
+│   ├── anchor2mean.tsv
+│   └── group2anchor.tsv
+├── enrichment/
+│   └── gseapy.gene_set.prerank.report.csv
+├── plots/
+│   ├── identity_distribution.png
+│   └── gsea_barplot.png/.svg
+└── report.html
 ```
 
-### Interpreting GSEA results
+### Multi-metric run (`--all-metrics`)
+
+Alignment, filtering, and table generation run once. GSEA and plots are
+produced separately for each metric in suffixed directories. A single tabbed
+`report.html` collects all three.
+
+```
+outdir/
+├── enhydra.log
+├── length_stats/
+├── length_filter/
+├── group_filter/
+├── alignment/
+├── ident_alignment/
+├── tables/
+├── enrichment_identity/   enrichment_zscore/   enrichment_rank/
+├── plots_identity/        plots_zscore/        plots_rank/
+└── report.html            ← single tabbed report
+```
+
+### Two-list differential run
+
+```
+outdir/
+├── list1/   list2/        ← per-list filter/align/tables trees
+├── differential/
+│   ├── anchor2mean.tsv
+│   ├── differential_scores.tsv
+│   ├── enrichment/
+│   ├── plots/
+│   └── report.html
+└── enhydra.log
+```
+
+With `--all-metrics` the `differential/` directory is replaced by
+`differential_identity/`, `differential_zscore/`, and `differential_rank/`,
+and a single tabbed `report.html` is written at the root of `outdir/`.
+
+---
+
+## Interpreting GSEA results
 
 The results table contains one row per tested gene set with the following key columns:
 
@@ -269,11 +370,33 @@ Or in R:
 
 ```r
 library(tidyverse)
-read_csv("outdir/enrichment/gseapy.gene_set.prerank.report.csv") %>%
-    filter(`FDR q-val` < 0.25) %>%
-    arrange(`FDR q-val`) %>%
+read_csv("outdir/enrichment/gseapy.gene_set.prerank.report.csv") |>
+    filter(`FDR q-val` < 0.25) |>
+    arrange(`FDR q-val`) |>
     select(Name, Term, NES, `NOM p-val`, `FDR q-val`, Lead_genes)
 ```
+
+The HTML report (`report.html`) provides an interactive table with per-column
+filtering and clickable GO IDs that open individual enrichment plots. When
+generated with `--all-metrics`, the report presents results for all three
+metrics in separate tabs so they can be compared side by side.
+
+---
+
+## Ranking metrics
+
+Three ranking metrics are available, selectable via `--metric` or all run
+together with `--all-metrics`:
+
+| Metric | Description |
+|---|---|
+| `identity` | Raw mean pairwise sequence identity. No normalisation applied. |
+| `zscore` | Z-score normalised identity: (score − mean) / SD across all groups. Positive = more conserved than average. **Default.** |
+| `rank` | Normalised rank: groups ranked by identity; most conserved group receives score 1.0, least conserved receives 1/*N*. |
+
+All three metrics rank genes such that the most conserved appear at the top
+of the GSEA input list, consistent with a positive NES indicating functional
+conservation.
 
 ---
 
