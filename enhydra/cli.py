@@ -84,15 +84,6 @@ def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
     highest score.  GSEApy prerank sorts its input descending, so this
     ensures that conserved genes appear at the top of the ranked list —
     the same direction as identity and zscore modes.
-
-    Args:
-        raw_path:   Path to the raw anchor2mean.tsv (column 1 = gene_id,
-                    column 2 = raw mean identity).
-        metric:     One of 'identity', 'zscore', 'rank'.
-        tables_dir: Directory where the normalised TSV is written.
-
-    Returns:
-        Path to the file that should be passed to run_gsea().
     """
     logger = logging.getLogger(__name__)
     if metric == "identity":
@@ -106,9 +97,7 @@ def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
 
     if metric == "zscore":
         normed = normalise_scores(series, "zscore")
-    else:  # rank
-        # ascending=True: highest identity → rank N → score N/N = 1.0
-        # (most conserved ends up at the top when prerank sorts descending)
+    else:  # rank: highest identity → score 1.0
         n      = len(series)
         normed = series.rank(ascending=True) / n
 
@@ -134,7 +123,7 @@ def _log_summary(
     gsea_csv = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
     if os.path.isfile(gsea_csv):
         import pandas as _pd
-        df      = _pd.read_csv(gsea_csv)
+        df       = _pd.read_csv(gsea_csv)
         n_tested = len(df)
         n_sig    = int((df["FDR q-val"] < fdr_threshold).sum())
     logger.info("")
@@ -360,7 +349,17 @@ def _build_arg_parser():
 
     parser.add_argument(
         "--resume", action="store_true", default=False,
-        help="Resume a previously interrupted run.",
+        help="Resume a previously interrupted run, skipping steps whose "
+             "output already exists. Plots and the HTML report are always "
+             "regenerated.",
+    )
+    parser.add_argument(
+        "--replot", action="store_true", default=False,
+        help="Re-run GSEA, plots, and the HTML report on an existing output "
+             "directory without repeating alignment or identity estimation. "
+             "Use this to apply a new --fdr-threshold, --top-n, "
+             "--permutations, or --all-metrics to a completed run. "
+             "Implies --resume for all pipeline steps preceding GSEA.",
     )
     parser.add_argument(
         "--quiet", action="store_true", default=False,
@@ -377,8 +376,8 @@ def _build_arg_parser():
     )
     parser.add_argument(
         "--all-metrics", action="store_true", default=False,
-        help="Run GSEA for all three ranking metrics (identity, zscore, rank) in "
-             "a single pass and produce a single tabbed HTML report. "
+        help="Run GSEA for all three ranking metrics (identity, zscore, rank) "
+             "in a single pass and produce a single tabbed HTML report. "
              "When set, --metric is ignored.",
     )
 
@@ -400,6 +399,7 @@ def _build_arg_parser():
     parser.add_argument("--max-size",      type=int,   default=None)
     parser.add_argument("--seed",          type=int,   default=None)
     parser.add_argument("--fdr-threshold", type=float, default=None)
+    parser.add_argument("--top-n",         type=int,   default=None)
     parser.add_argument("--obo-cache",     default=None)
 
     return parser
@@ -432,6 +432,7 @@ def main():
     max_size      = _resolve(args.max_size,      parameters['max_size'],      500)
     seed          = _resolve(args.seed,          parameters['seed'],          42)
     fdr_threshold = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
+    top_n         = _resolve(args.top_n,         parameters['top_n'],         20)
     list1_path    = _resolve(args.list1,         parameters['list1'],         None)
     list2_path    = _resolve(args.list2,         parameters['list2'],         None)
     sources_raw   = _resolve(args.sources,       parameters['sources'],
@@ -441,9 +442,12 @@ def main():
     sd_multiplier = parameters['length_filter_sd']
     aligner       = parameters['aligner']
     mafft_mode    = parameters['mafft_mode']
-    top_n         = parameters['top_n']
     obo_cache     = _resolve(args.obo_cache, parameters['obo_cache'], None)
     all_metrics   = args.all_metrics
+    replot        = args.replot
+
+    # --replot implies resume for all pre-GSEA steps.
+    resume = args.resume or replot
 
     if not gene_sets and not organism:
         parser.error(
@@ -459,10 +463,11 @@ def main():
         )
 
     outdir = parameters['outdir']
-    if os.path.isdir(outdir) and not args.resume:
+    if os.path.isdir(outdir) and not resume:
         sys.exit(
             "Output directory '%s' already exists. Use --resume to continue "
-            "a previous run, or change 'outdir' in your project config." % outdir
+            "a previous run, --replot to re-run GSEA and regenerate plots, "
+            "or change 'outdir' in your project config." % outdir
         )
     os.makedirs(outdir, exist_ok=True)
 
@@ -470,9 +475,10 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info("Welcome to Enhydra")
     logger.info(
-        "Resolved parameters: metric=%s, all_metrics=%s, paralogs=%s, "
-        "min_species=%d, permutations=%d, fdr_threshold=%.2f",
-        metric, all_metrics, paralogs, min_species, permutations, fdr_threshold,
+        "Resolved parameters: metric=%s, all_metrics=%s, replot=%s, "
+        "paralogs=%s, min_species=%d, permutations=%d, fdr_threshold=%.2f",
+        metric, all_metrics, replot, paralogs,
+        min_species, permutations, fdr_threshold,
     )
 
     if args.orthofinder_dir:
@@ -498,14 +504,12 @@ def main():
         aligner=aligner,
         mafft_mode=mafft_mode,
         parameters=parameters,
-        resume=args.resume,
+        resume=resume,
         show_progress=args.quiet,
     )
 
-    # Which metrics to run: all three or just the chosen one.
     metrics_to_run = ALL_METRICS if all_metrics else (metric,)
 
-    # Common GSEA kwargs — identical across metrics and modes.
     gsea_kwargs = dict(
         gene_sets=gene_sets, organism=organism, sources=sources,
         permutations=permutations, min_size=min_size, max_size=max_size,
@@ -527,19 +531,17 @@ def main():
         )
 
         raw_anchor2mean = os.path.join(tables_dir, "anchor2mean.tsv")
-        metric_outputs  = {}   # metric → {"results_dir": …, "plots_dir": …}
+        metric_outputs  = {}
 
         for m in metrics_to_run:
-            # Backward-compatible directory names: plain suffix when single-metric,
-            # metric-suffixed when --all-metrics.
             sfx           = ("_%s" % m) if all_metrics else ""
             results_dir_m = os.path.join(outdir, "enrichment%s" % sfx)
             plots_dir_m   = os.path.join(outdir, "plots%s" % sfx)
             gsea_input    = _normalise_anchor2mean(raw_anchor2mean, m, tables_dir)
 
             logger.info("Step 6 [%s]: Enrichment analysis", m)
-            if not _step_complete(results_dir_m,
-                                  ["gseapy.gene_set.prerank.report.csv"]):
+            if replot or not _step_complete(results_dir_m,
+                                            ["gseapy.gene_set.prerank.report.csv"]):
                 run_gsea(anchor2mean_path=gsea_input,
                          results_dir=results_dir_m, **gsea_kwargs)
             else:
@@ -616,7 +618,7 @@ def main():
             **common_kwargs,
         )
 
-        metric_outputs = {}   # metric → {"results_dir": …, "plots_dir": …}
+        metric_outputs = {}
 
         for m in metrics_to_run:
             sfx           = ("_%s" % m) if all_metrics else ""
@@ -625,8 +627,9 @@ def main():
             plots_dir_m   = os.path.join(diff_dir_m, "plots")
 
             logger.info("--- Computing differential scores [metric=%s] ---", m)
-            if not _step_complete(diff_dir_m,
-                                  ["anchor2mean.tsv", "differential_scores.tsv"]):
+            if replot or not _step_complete(diff_dir_m,
+                                            ["anchor2mean.tsv",
+                                             "differential_scores.tsv"]):
                 compute_differential(
                     tables_dir1=tables_dir1,
                     tables_dir2=tables_dir2,
@@ -639,8 +642,8 @@ def main():
                 )
 
             logger.info("Step 6 [%s]: Enrichment analysis (differential)", m)
-            if not _step_complete(results_dir_m,
-                                  ["gseapy.gene_set.prerank.report.csv"]):
+            if replot or not _step_complete(results_dir_m,
+                                            ["gseapy.gene_set.prerank.report.csv"]):
                 run_gsea(
                     anchor2mean_path=os.path.join(diff_dir_m, "anchor2mean.tsv"),
                     results_dir=results_dir_m,
@@ -675,7 +678,6 @@ def main():
                 mode="differential",
             )
         else:
-            # Backward compat: single-metric report lives inside differential/
             build_report(
                 results_dir=metric_outputs[metric]["results_dir"],
                 plots_dir=metric_outputs[metric]["plots_dir"],

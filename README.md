@@ -194,6 +194,21 @@ output already exists. Plots and the HTML report are always regenerated so
 that changes to `--fdr-threshold` or `--top-n` take effect without
 rerunning the full pipeline.
 
+### Re-run GSEA and regenerate plots on a completed run
+
+```bash
+enhydra code_config project_config \
+    --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --replot \
+    --fdr-threshold 0.10 \
+    --top-n 30
+```
+
+Skips alignment, identity estimation, and table generation (treating them
+as already complete), then re-runs GSEA, plots, and the HTML report with
+the new parameters.  Combine with `--all-metrics` to switch between
+single-metric and multi-metric output on an existing run.
+
 ### Run all three ranking metrics in one pass
 
 ```bash
@@ -251,7 +266,15 @@ positional arguments:
 
 options:
   --orthofinder-dir     Path to an OrthoFinder 3 output directory.
-  --resume              Resume a previously interrupted run.
+  --resume              Resume a previously interrupted run, skipping steps
+                        whose output already exists. Plots and the HTML
+                        report are always regenerated.
+  --replot              Re-run GSEA, plots, and the HTML report on an
+                        existing output directory without repeating
+                        alignment or identity estimation. Use this to apply
+                        a new --fdr-threshold, --top-n, --permutations, or
+                        --all-metrics to a completed run. Implies --resume
+                        for all pipeline steps preceding GSEA.
   --quiet               Suppress INFO/WARNING on the console; show progress
                         bars instead. All messages are still written to
                         enhydra.log.
