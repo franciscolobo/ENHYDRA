@@ -505,6 +505,8 @@ def make_differential_plots(
     obo_names: dict[str, str] | None = None,
     fdr_threshold: float = 0.25,
     top_n: int = 20,
+    name1: str = "List 1",
+    name2: str = "List 2",
 ):
     os.makedirs(plots_dir, exist_ok=True)
     diff_scores = os.path.join(diff_dir, "differential_scores.tsv")
@@ -520,8 +522,8 @@ def make_differential_plots(
     )
     plot_identity_scatter(
         tables_dir1, tables_dir2, diff_scores, plots_dir,
-        label1="List 1 %s" % mlabel,
-        label2="List 2 %s" % mlabel,
+        label1="%s %s" % (name1, mlabel),
+        label2="%s %s" % (name2, mlabel),
         metric=metric,
     )
     plot_differential_distribution(diff_scores, plots_dir, metric=metric)

@@ -19,7 +19,6 @@ from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
-# All supported ranking metrics, in display order.
 ALL_METRICS = ("identity", "zscore", "rank")
 
 
@@ -28,13 +27,8 @@ ALL_METRICS = ("identity", "zscore", "rank")
 # ---------------------------------------------------------------------------
 
 def _setup_logging(outdir: str, quiet: bool = False):
-    """Configure logging to console and enhydra.log.
-
-    In quiet mode the console handler is raised to ERROR so that only errors
-    appear on stdout; INFO/WARNING are still written to the log file.
-    """
-    log_path = os.path.join(outdir, "enhydra.log")
-    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    log_path        = os.path.join(outdir, "enhydra.log")
+    fmt             = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     file_handler    = logging.FileHandler(log_path)
     file_handler.setLevel(logging.INFO)
     console_handler = logging.StreamHandler(sys.stdout)
@@ -48,7 +42,6 @@ def _setup_logging(outdir: str, quiet: bool = False):
 # ---------------------------------------------------------------------------
 
 def _resolve(cli_val, config_val, default=None):
-    """Return the first non-None/non-empty value among CLI arg, config, default."""
     if cli_val is not None:
         return cli_val
     if config_val not in (None, ''):
@@ -57,7 +50,6 @@ def _resolve(cli_val, config_val, default=None):
 
 
 def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bool:
-    """Return True if a pipeline step's output is present and non-empty."""
     if not os.path.isdir(step_dir):
         return False
     if sentinel_files:
@@ -70,21 +62,11 @@ def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bo
 
 
 def _filter_length_star(args):
-    """Unpack args and call filter_length (required for pool.imap_unordered)."""
     return filter_length(*args)
 
 
 def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
-    """Normalise anchor2mean.tsv scores for a given metric; return scored path.
-
-    For 'identity', returns raw_path unchanged.  For 'zscore' and 'rank' a
-    normalised copy is written to tables_dir/anchor2mean_{metric}.tsv.
-
-    Rank scores are flipped so that the most-conserved gene receives the
-    highest score.  GSEApy prerank sorts its input descending, so this
-    ensures that conserved genes appear at the top of the ranked list —
-    the same direction as identity and zscore modes.
-    """
+    """Normalise anchor2mean.tsv scores for a given metric; return scored path."""
     logger = logging.getLogger(__name__)
     if metric == "identity":
         return raw_path
@@ -97,7 +79,7 @@ def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
 
     if metric == "zscore":
         normed = normalise_scores(series, "zscore")
-    else:  # rank: highest identity → score 1.0
+    else:
         n      = len(series)
         normed = series.rank(ascending=True) / n
 
@@ -116,7 +98,6 @@ def _log_summary(
     fdr_threshold: float,
     label: str = "",
 ):
-    """Log a concise end-of-run summary block."""
     logger = logging.getLogger(__name__)
     prefix = ("[%s] " % label) if label else ""
     n_tested = n_sig = 0
@@ -139,7 +120,7 @@ def _log_summary(
 
 
 # ---------------------------------------------------------------------------
-# Core pipeline: filter → align → identity → tables (one species list)
+# Core pipeline: filter → align → identity → tables
 # ---------------------------------------------------------------------------
 
 def _run_single_list(
@@ -163,26 +144,14 @@ def _run_single_list(
     label: str = "",
     exclude_from_identity: set[str] | None = None,
 ) -> tuple[str, dict]:
-    """Run steps 1–5 (filter, align, identity, tables) for one species list.
-
-    Args:
-        exclude_from_identity: Species IDs to strip from alignments before
-                               trimAl runs (two-list mode, injected anchor).
-
-    Returns:
-        Tuple of (tables_dir, stats) where stats contains group counts at
-        each filtering stage.
-    """
     logger = logging.getLogger(__name__)
 
-    def _desc(step: str) -> str:
+    def _desc(step):
         return ("%s: %s" % (label, step)) if label else step
 
     def _skip(step_dir, step_name, sentinel_files=None):
         if resume and _step_complete(step_dir, sentinel_files):
-            logger.info(
-                "Skipping %s (output already exists: %s)", step_name, step_dir
-            )
+            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
             return True
         return False
 
@@ -196,13 +165,11 @@ def _run_single_list(
     tables_dir        = os.path.join(listdir, "tables")
 
     os.makedirs(listdir, exist_ok=True)
-
     n_steps = 5 + (species is not None) + bool(exclude_from_identity)
 
     with tqdm(total=n_steps, desc=_desc("starting"),
               unit="step", disable=not show_progress, leave=True) as sbar:
 
-        # Step 0 (two-list only): subset groups to this list's species
         if species is not None:
             sbar.set_description(_desc("subsetting"))
             if not _skip(subset_dir, "subsetting"):
@@ -213,17 +180,15 @@ def _run_single_list(
         else:
             source_dir = inputdir
 
-        # Step 1: length filtering
         sbar.set_description(_desc("length filter"))
         logger.info("Step 1: Length filtering")
         if not _skip(length_filter_dir, "length filtering"):
             os.makedirs(length_stats_dir, exist_ok=True)
             os.makedirs(length_filter_dir, exist_ok=True)
-            files     = os.listdir(source_dir)
             args_list = [
                 (os.path.join(source_dir, f), length_stats_dir,
                  length_filter_dir, sd_multiplier)
-                for f in files
+                for f in os.listdir(source_dir)
             ]
             pool = multiprocessing.Pool(processes=max_process)
             try:
@@ -233,15 +198,12 @@ def _run_single_list(
                     leave=False, disable=not show_progress,
                 ))
             except Exception as e:
-                raise EnhydraToolError(
-                    "Length filtering failed: %s" % e
-                ) from e
+                raise EnhydraToolError("Length filtering failed: %s" % e) from e
             finally:
                 pool.terminate()
                 pool.join()
         sbar.update(1)
 
-        # Step 2: group filtering
         sbar.set_description(_desc("group filter"))
         logger.info("Step 2: Group filtering")
         if not _skip(group_filter_dir, "group filtering"):
@@ -257,7 +219,6 @@ def _run_single_list(
             )
         sbar.update(1)
 
-        # Step 3: alignment
         sbar.set_description(_desc("alignment"))
         logger.info("Step 3: Alignment with %s", aligner.upper())
         if not _skip(alignment_dir, "alignment"):
@@ -270,14 +231,11 @@ def _run_single_list(
             )
         sbar.update(1)
 
-        # Step 3b (optional): strip injected anchor before identity estimation
         trimal_input_dir = alignment_dir
         if exclude_from_identity:
             sbar.set_description(_desc("stripping anchor"))
-            logger.info(
-                "Step 3b: Stripping injected species from alignments "
-                "before identity estimation: %s", exclude_from_identity,
-            )
+            logger.info("Step 3b: Stripping injected species from alignments: %s",
+                        exclude_from_identity)
             if not _skip(stripped_dir, "stripping anchor from alignments"):
                 strip_species_from_alignments(
                     alignment_dir=alignment_dir,
@@ -288,7 +246,6 @@ def _run_single_list(
             trimal_input_dir = stripped_dir
             sbar.update(1)
 
-        # Step 4: identity estimation
         sbar.set_description(_desc("identity"))
         logger.info("Step 4: Identity estimation with trimAl")
         if not _skip(ident_dir, "identity estimation"):
@@ -301,8 +258,6 @@ def _run_single_list(
             )
         sbar.update(1)
 
-        # Step 5: tables (always reads original alignment_dir so the anchor
-        # sequence is available for group → gene ID mapping)
         sbar.set_description(_desc("tables"))
         logger.info("Step 5: Generating tables")
         if not _skip(tables_dir, "table generation",
@@ -320,10 +275,10 @@ def _run_single_list(
 
     stats = {
         "n_input":         len(os.listdir(source_dir)),
-        "n_length_filter": (len(os.listdir(length_filter_dir))
-                            if os.path.isdir(length_filter_dir) else 0),
-        "n_group_filter":  (len(os.listdir(group_filter_dir))
-                            if os.path.isdir(group_filter_dir) else 0),
+        "n_length_filter": len(os.listdir(length_filter_dir))
+                           if os.path.isdir(length_filter_dir) else 0,
+        "n_group_filter":  len(os.listdir(group_filter_dir))
+                           if os.path.isdir(group_filter_dir) else 0,
     }
     return tables_dir, stats
 
@@ -337,57 +292,32 @@ def _build_arg_parser():
         prog="enhydra",
         description="Gene Set Enrichment Analysis for evolutionary genomics.",
     )
-
     parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
 
     input_group = parser.add_mutually_exclusive_group()
-    input_group.add_argument(
-        "--orthofinder-dir",
-        help="Path to an OrthoFinder 3 output directory.",
-    )
+    input_group.add_argument("--orthofinder-dir",
+                             help="Path to an OrthoFinder 3 output directory.")
 
-    parser.add_argument(
-        "--resume", action="store_true", default=False,
-        help="Resume a previously interrupted run, skipping steps whose "
-             "output already exists. Plots and the HTML report are always "
-             "regenerated.",
-    )
-    parser.add_argument(
-        "--replot", action="store_true", default=False,
-        help="Re-run GSEA, plots, and the HTML report on an existing output "
-             "directory without repeating alignment or identity estimation. "
-             "Use this to apply a new --fdr-threshold, --top-n, "
-             "--permutations, or --all-metrics to a completed run. "
-             "Implies --resume for all pipeline steps preceding GSEA.",
-    )
-    parser.add_argument(
-        "--quiet", action="store_true", default=False,
-        help="Suppress INFO/WARNING on the console; show progress bars instead. "
-             "All messages are still written to enhydra.log.",
-    )
-    parser.add_argument(
-        "--paralogs", choices=["all", "remove", "longest"], default=None,
-        help="Paralog handling strategy. Overrides config 'paralogs'.",
-    )
-    parser.add_argument(
-        "--min-species", type=int, default=None,
-        help="Minimum species per group. Overrides config 'min_species'.",
-    )
-    parser.add_argument(
-        "--all-metrics", action="store_true", default=False,
-        help="Run GSEA for all three ranking metrics (identity, zscore, rank) "
-             "in a single pass and produce a single tabbed HTML report. "
-             "When set, --metric is ignored.",
-    )
+    parser.add_argument("--resume",  action="store_true", default=False,
+                        help="Resume a previously interrupted run.")
+    parser.add_argument("--replot",  action="store_true", default=False,
+                        help="Re-run GSEA, plots, and the HTML report without "
+                             "repeating alignment. Implies --resume.")
+    parser.add_argument("--quiet",   action="store_true", default=False,
+                        help="Suppress INFO/WARNING on the console; show progress "
+                             "bars instead.")
+    parser.add_argument("--paralogs", choices=["all", "remove", "longest"], default=None)
+    parser.add_argument("--min-species", type=int, default=None)
+    parser.add_argument("--all-metrics", action="store_true", default=False,
+                        help="Run GSEA for all three ranking metrics and produce "
+                             "a tabbed HTML report.")
 
     diff_group = parser.add_argument_group("two-list differential mode")
-    diff_group.add_argument("--list1", default=None)
-    diff_group.add_argument("--list2", default=None)
-    diff_group.add_argument(
-        "--metric", choices=["zscore", "identity", "rank"], default=None,
-        help="Ranking/differential metric. Ignored when --all-metrics is set.",
-    )
+    diff_group.add_argument("--list1",   default=None)
+    diff_group.add_argument("--list2",   default=None)
+    diff_group.add_argument("--metric",  choices=["zscore", "identity", "rank"],
+                            default=None)
 
     gmt_group = parser.add_mutually_exclusive_group()
     gmt_group.add_argument("--organism",  default=None)
@@ -435,19 +365,19 @@ def main():
     top_n         = _resolve(args.top_n,         parameters['top_n'],         20)
     list1_path    = _resolve(args.list1,         parameters['list1'],         None)
     list2_path    = _resolve(args.list2,         parameters['list2'],         None)
+    list1_name    = parameters['list1_name']
+    list2_name    = parameters['list2_name']
     sources_raw   = _resolve(args.sources,       parameters['sources'],
                              'GO:BP GO:MF GO:CC KEGG REAC')
-    sources       = (sources_raw if isinstance(sources_raw, list)
-                     else sources_raw.split())
+    sources       = sources_raw if isinstance(sources_raw, list) \
+                    else sources_raw.split()
     sd_multiplier = parameters['length_filter_sd']
     aligner       = parameters['aligner']
     mafft_mode    = parameters['mafft_mode']
     obo_cache     = _resolve(args.obo_cache, parameters['obo_cache'], None)
     all_metrics   = args.all_metrics
     replot        = args.replot
-
-    # --replot implies resume for all pre-GSEA steps.
-    resume = args.resume or replot
+    resume        = args.resume or replot
 
     if not gene_sets and not organism:
         parser.error(
@@ -457,10 +387,7 @@ def main():
 
     two_list_mode = bool(list1_path or list2_path)
     if two_list_mode and not (list1_path and list2_path):
-        parser.error(
-            "Two-list mode requires both list1 and list2 "
-            "(in config or via --list1/--list2)."
-        )
+        parser.error("Two-list mode requires both list1 and list2.")
 
     outdir = parameters['outdir']
     if os.path.isdir(outdir) and not resume:
@@ -489,8 +416,8 @@ def main():
         )
 
     obo_path  = os.path.join(obo_cache, "go-basic.obo") if obo_cache else None
-    obo_names = (parse_obo_names(obo_path)
-                 if obo_path and os.path.isfile(obo_path) else {})
+    obo_names = parse_obo_names(obo_path) \
+                if obo_path and os.path.isfile(obo_path) else {}
 
     common_kwargs = dict(
         inputdir=parameters['inputdir'],
@@ -508,9 +435,8 @@ def main():
         show_progress=args.quiet,
     )
 
-    # In two-list differential mode, default to running all three metrics so
-    # the report always shows a tabbed comparison.  An explicit --metric flag
-    # overrides this and produces a single-metric report instead.
+    # In two-list mode, default to all three metrics for a tabbed comparison.
+    # An explicit --metric flag overrides this.
     if two_list_mode and not all_metrics and args.metric is None:
         all_metrics = True
         logger.info(
@@ -599,6 +525,7 @@ def main():
     # ------------------------------------------------------------------ #
     else:
         logger.info("Running in two-list differential mode.")
+        logger.info("List names: '%s' vs '%s'", list1_name, list2_name)
         anchor   = parameters['anchor']
         species1 = read_species_list(list1_path)
         species2 = read_species_list(list2_path)
@@ -610,23 +537,25 @@ def main():
         else:
             anchor_injected = False
 
-        logger.info("List 1: %d species. List 2: %d species. Anchor: %s",
-                    len(species1), len(species2), anchor)
+        logger.info(
+            "%s: %d species. %s: %d species. Anchor: %s",
+            list1_name, len(species1), list2_name, len(species2), anchor,
+        )
 
-        logger.info("--- Processing list 1 ---")
+        logger.info("--- Processing %s ---", list1_name)
         tables_dir1, stats1 = _run_single_list(
             listdir=os.path.join(outdir, "list1"),
             anchor=anchor, require_anchor=False,
-            species=species1, label="list 1",
+            species=species1, label=list1_name,
             exclude_from_identity={anchor} if anchor_injected else None,
             **common_kwargs,
         )
 
-        logger.info("--- Processing list 2 ---")
+        logger.info("--- Processing %s ---", list2_name)
         tables_dir2, stats2 = _run_single_list(
             listdir=os.path.join(outdir, "list2"),
             anchor=anchor, require_anchor=False,
-            species=species2, label="list 2",
+            species=species2, label=list2_name,
             **common_kwargs,
         )
 
@@ -649,9 +578,7 @@ def main():
                     metric=m,
                 )
             else:
-                logger.info(
-                    "Skipping differential ranking for metric '%s' (output exists).", m
-                )
+                logger.info("Skipping differential ranking for '%s' (output exists).", m)
 
             logger.info("Step 6 [%s]: Enrichment analysis (differential)", m)
             if replot or not _step_complete(results_dir_m,
@@ -662,9 +589,7 @@ def main():
                     **gsea_kwargs,
                 )
             else:
-                logger.info(
-                    "Skipping GSEA for metric '%s' (output exists).", m
-                )
+                logger.info("Skipping GSEA for metric '%s' (output exists).", m)
 
             logger.info("Generating differential plots [%s]", m)
             make_differential_plots(
@@ -676,6 +601,8 @@ def main():
                 obo_names=obo_names,
                 fdr_threshold=fdr_threshold,
                 top_n=top_n,
+                name1=list1_name,
+                name2=list2_name,
             )
             metric_outputs[m] = {"results_dir": results_dir_m,
                                   "plots_dir":   plots_dir_m}
@@ -691,6 +618,8 @@ def main():
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir1,
                 tables_dir2=tables_dir2,
+                label1=list1_name,
+                label2=list2_name,
             )
         else:
             build_report(
@@ -704,11 +633,13 @@ def main():
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir1,
                 tables_dir2=tables_dir2,
+                label1=list1_name,
+                label2=list2_name,
             )
 
         for m in metrics_to_run:
-            lbl1 = ("list 1 [%s]" % m) if all_metrics else "list 1"
-            lbl2 = ("list 2 [%s]" % m) if all_metrics else "list 2"
+            lbl1 = ("%s [%s]" % (list1_name, m)) if all_metrics else list1_name
+            lbl2 = ("%s [%s]" % (list2_name, m)) if all_metrics else list2_name
             _log_summary(stats1, metric_outputs[m]["results_dir"],
                          fdr_threshold, label=lbl1)
             _log_summary(stats2, metric_outputs[m]["results_dir"],

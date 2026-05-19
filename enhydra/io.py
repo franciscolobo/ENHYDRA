@@ -54,6 +54,8 @@ def read_config_file(fh_project, fh_code) -> dict:
         # Two-list mode
         'list1':            project.get('list1', ''),
         'list2':            project.get('list2', ''),
+        'list1_name':       project.get('list1_name', 'List 1'),
+        'list2_name':       project.get('list2_name', 'List 2'),
         'sources':          project.get('sources', 'GO:BP GO:MF GO:CC KEGG REAC'),
     }
     return parameters

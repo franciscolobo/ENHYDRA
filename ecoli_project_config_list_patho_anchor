@@ -19,3 +19,5 @@ fdr_threshold = 0.1    # significance threshold for plots and report
 # --- Two-list differential mode (optional) ---
 list1      = tests/E_coli_pathogenic.txt
 list2      = tests/E_coli_non_pathogenic.txt
+list1_name = Pathogenic
+list2_name = Non-pathogenic

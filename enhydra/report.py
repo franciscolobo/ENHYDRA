@@ -682,8 +682,10 @@ def _results_table_html(
     col_defs = [
         ("Term",          "GO ID",        "Gene Ontology term identifier."),
         ("GO Term",       "Term name",    "Human-readable name of the GO term."),
-        ("List 1 score",  "List 1 score", "Mean metric score for genes in this set in list 1."),
-        ("List 2 score",  "List 2 score", "Mean metric score for genes in this set in list 2."),
+        ("List 1 score",  col1_label + " score",
+         "Mean metric score for genes in this set in %s." % col1_label),
+        ("List 2 score",  col2_label + " score",
+         "Mean metric score for genes in this set in %s." % col2_label),
         ("NES",           "NES",          "Normalised Enrichment Score. Positive = more conserved, negative = faster evolving."),
         ("NOM p-val",     "p-value",      "Nominal p-value from permutation testing."),
         ("FDR q-val",     "FDR",          "False Discovery Rate q-value. Significant below %.2f." % fdr_threshold),
@@ -804,6 +806,8 @@ def build_report(
     gmt_path: str | None = None,
     tables_dir1: str | None = None,
     tables_dir2: str | None = None,
+    label1: str = "List 1",
+    label2: str = "List 2",
 ):
     """Build a self-contained HTML report for a single-metric ENHYDRA run.
 
@@ -818,10 +822,9 @@ def build_report(
         gmt_path:      Path to the GMT file. Term names are read from its
                        second column. If None, results_dir is scanned.
         tables_dir1:   Path to list 1's tables/ directory (differential mode).
-                       When provided alongside tables_dir2 and gmt_path, a
-                       "List 1 score" and "List 2 score" column are added to
-                       the results table.
         tables_dir2:   Path to list 2's tables/ directory (differential mode).
+        label1:        Display name for list 1 (e.g. "Pathogenic").
+        label2:        Display name for list 2 (e.g. "Non-pathogenic").
     """
     logger.info("Building HTML report...")
 
@@ -862,7 +865,8 @@ def build_report(
 
     plots_html = _plot_section(plots_dir, plot_names)
     table_html, numeric_col_indices = _results_table_html(
-        df, term_names, plot_index, fdr_threshold, metric=None
+        df, term_names, plot_index, fdr_threshold,
+        metric=None, col1_label=label1, col2_label=label2,
     )
 
     html = _TEMPLATE.format(
