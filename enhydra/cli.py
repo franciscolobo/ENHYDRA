@@ -508,6 +508,16 @@ def main():
         show_progress=args.quiet,
     )
 
+    # In two-list differential mode, default to running all three metrics so
+    # the report always shows a tabbed comparison.  An explicit --metric flag
+    # overrides this and produces a single-metric report instead.
+    if two_list_mode and not all_metrics and args.metric is None:
+        all_metrics = True
+        logger.info(
+            "Two-list mode: defaulting to --all-metrics for a tabbed report. "
+            "Pass an explicit --metric flag to run a single metric instead."
+        )
+
     metrics_to_run = ALL_METRICS if all_metrics else (metric,)
 
     gsea_kwargs = dict(
@@ -679,6 +689,8 @@ def main():
                 fdr_threshold=fdr_threshold,
                 mode="differential",
                 gmt_path=gene_sets,
+                tables_dir1=tables_dir1,
+                tables_dir2=tables_dir2,
             )
         else:
             build_report(
@@ -690,6 +702,8 @@ def main():
                 metric=metric,
                 fdr_threshold=fdr_threshold,
                 gmt_path=gene_sets,
+                tables_dir1=tables_dir1,
+                tables_dir2=tables_dir2,
             )
 
         for m in metrics_to_run:
