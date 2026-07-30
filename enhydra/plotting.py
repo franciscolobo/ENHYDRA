@@ -452,23 +452,27 @@ def plot_differential_distribution(
     diff_scores_path: str,
     plots_dir: str,
     metric: str = "zscore",
+    name1: str = "list 1",
+    name2: str = "list 2",
 ):
     diff   = pd.read_csv(diff_scores_path, sep="\t")
     scores = pd.to_numeric(diff["score"], errors="coerce").dropna()
 
     label_map = {
-        "zscore":   "Z-score difference (list 1 \u2212 list 2)",
-        "identity": "Identity difference (list 1 \u2212 list 2)",
-        "rank":     "Normalised rank difference (list 1 \u2212 list 2)",
+        "zscore":   "Z-score difference (%s \u2212 %s)",
+        "identity": "Identity difference (%s \u2212 %s)",
+        "rank":     "Normalised rank difference (%s \u2212 %s)",
     }
-    xlabel = label_map.get(metric, "Differential score")
+    xlabel = label_map.get(metric, "Differential score (%s \u2212 %s)") % (name1, name2)
 
     with plt.style.context(FIGURE_STYLE):
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.hist(scores[scores >= 0], bins=40, color=PALETTE["positive"],
-                edgecolor="white", linewidth=0.5, label="More conserved in list 1")
+                edgecolor="white", linewidth=0.5,
+                label="More conserved in %s" % name1)
         ax.hist(scores[scores < 0], bins=40, color=PALETTE["negative"],
-                edgecolor="white", linewidth=0.5, label="More conserved in list 2")
+                edgecolor="white", linewidth=0.5,
+                label="More conserved in %s" % name2)
         ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
         ax.set_xlabel(xlabel, fontsize=12)
         ax.set_ylabel("Number of orthogroups", fontsize=12)
@@ -526,7 +530,8 @@ def make_differential_plots(
         label2="%s %s" % (name2, mlabel),
         metric=metric,
     )
-    plot_differential_distribution(diff_scores, plots_dir, metric=metric)
+    plot_differential_distribution(diff_scores, plots_dir, metric=metric,
+                                   name1=name1, name2=name2)
     plot_gsea_barplot(
         results_dir, plots_dir,
         obo_names=obo_names, fdr_threshold=fdr_threshold, top_n=top_n,

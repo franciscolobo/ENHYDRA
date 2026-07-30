@@ -504,6 +504,7 @@ def main():
                 fdr_threshold=fdr_threshold,
                 mode="single",
                 gmt_path=gene_sets,
+                tables_dir1=tables_dir,
             )
         else:
             build_report(
@@ -514,6 +515,7 @@ def main():
                 mode="single",
                 fdr_threshold=fdr_threshold,
                 gmt_path=gene_sets,
+                tables_dir1=tables_dir,
             )
 
         for m in metrics_to_run:
