@@ -50,7 +50,7 @@ def _load_group2mean(tables_dir: str) -> pd.Series:
     path = os.path.join(tables_dir, "group2mean.tsv")
     if not os.path.isfile(path):
         raise EnhydraIOError("group2mean.tsv not found: %s" % path)
-    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "identity"])
+    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "identity"], dtype={"group_id": str})
     df["identity"] = pd.to_numeric(df["identity"], errors="coerce")
     df = df.dropna(subset=["identity"])
     return df.set_index("group_id")["identity"]
@@ -68,7 +68,7 @@ def _load_group2anchor(tables_dir: str) -> pd.Series:
     path = os.path.join(tables_dir, "group2anchor.tsv")
     if not os.path.isfile(path):
         raise EnhydraIOError("group2anchor.tsv not found: %s" % path)
-    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "gene_id"])
+    df = pd.read_csv(path, sep="\t", header=None, names=["group_id", "gene_id"], dtype=str)
     return df.set_index("group_id")["gene_id"]
 
 

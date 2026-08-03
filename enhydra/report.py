@@ -507,7 +507,8 @@ def _per_term_scores(
         if not os.path.isfile(path):
             logger.warning("anchor2mean.tsv not found in %s", tables_dir)
             return {}
-        df = pd.read_csv(path, sep="\t", header=None, names=["gene_id", "score"])
+        df = pd.read_csv(path, sep="\t", header=None,
+                         names=["gene_id", "score"], dtype={"gene_id": str})
         df["score"] = pd.to_numeric(df["score"], errors="coerce")
         df = df.dropna(subset=["score"]).drop_duplicates("gene_id")
         return dict(_normalise_series(df.set_index("gene_id")["score"], metric))

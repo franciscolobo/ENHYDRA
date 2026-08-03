@@ -20,6 +20,7 @@ def _load_ranked(anchor2mean_path: str) -> pd.DataFrame:
         sep="\t",
         header=None,
         names=["gene_id", "identity"],
+        dtype={"gene_id": str},
     )
     ranked["identity"] = pd.to_numeric(ranked["identity"], errors="coerce")
     ranked = ranked.dropna(subset=["identity"])
