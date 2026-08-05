@@ -166,12 +166,15 @@ def filter_groups(
         )
 
     os.makedirs(group_filter_dir, exist_ok=True)
-    files = os.listdir(length_filter_dir)
+    files = [
+        f for f in os.listdir(length_filter_dir)
+        if not f.startswith(".")]
     for file in tqdm(files, desc="  groups", unit="group",
                      leave=False, disable=not show_progress):
         group_name    = file.split(".")[0]
         path_to_file  = os.path.join(length_filter_dir, file)
         outfile_path  = os.path.join(group_filter_dir, file)
+        print(path_to_file)
 
         records = list(SeqIO.parse(path_to_file, "fasta"))
         if len(records) < min_sequences:
