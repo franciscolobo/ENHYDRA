@@ -8,6 +8,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
+logging.getLogger("fontTools").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 FIGURE_DPI   = 300

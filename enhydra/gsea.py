@@ -8,6 +8,7 @@ from gprofiler import GProfiler
 
 from .exceptions import EnhydraIOError
 
+logging.getLogger("fontTools").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 
@@ -157,6 +158,8 @@ def run_gsea(
     max_size: int = 500,
     seed: int = 42,
     fdr_threshold: float = 0.25,
+    weight: float = 1.0,
+    max_process: int = 1,
 ) -> gp.Prerank:
     """Run GSEApy prerank, optionally fetching annotations from g:Profiler."""
     os.makedirs(results_dir, exist_ok=True)
@@ -191,26 +194,28 @@ def run_gsea(
         min_size=min_size,
         max_size=max_size,
         seed=seed,
+        weight=weight,
         graph_num=0,
         verbose=False,
     )
 
-    n_sig = (results.res2d["FDR q-val"] < fdr_threshold).sum()
+    sig_rows = results.res2d[results.res2d["FDR q-val"] < fdr_threshold]
+    n_sig = len(sig_rows)
     logger.info("GSEA complete. %d significant gene sets (FDR < %s).", n_sig, fdr_threshold)
 
     if n_sig > 0:
         logger.info("Generating enrichment plots for %d significant gene sets...", n_sig)
-        gp.prerank(
-            rnk=ranked,
-            gene_sets=gene_sets,
-            outdir=results_dir,
-            permutation_num=permutations,
-            min_size=min_size,
-            max_size=max_size,
-            seed=seed,
-            graph_num=int(n_sig),
-            verbose=False,
-        )
-        _convert_gsea_plots_to_png(results_dir)
+        plots_dir = f"{results_dir}/prerank"
+        os.makedirs(plots_dir, exist_ok=True)
+        for term in sig_rows["Term"]:
+            safe_term_name = term.replace("/", "_").replace("\\", "_")
+            output_path = f"{results_dir}/prerank/{safe_term_name}.png"
+            
+            fig = gp.gseaplot(
+                rank_metric=results.ranking,
+                term=term,
+                **results.results[term],
+                ofname=output_path,
+            )
 
     return results
