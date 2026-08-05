@@ -166,8 +166,7 @@ def filter_groups(
         )
 
     os.makedirs(group_filter_dir, exist_ok=True)
-    files = [
-        f for f in os.listdir(length_filter_dir)]
+    files = os.listdir(length_filter_dir)
     for file in tqdm(files, desc="  groups", unit="group",
                      leave=False, disable=not show_progress):
         group_name    = file.split(".")[0]
