@@ -193,7 +193,7 @@ def run_gsea(
         min_size=min_size,
         max_size=max_size,
         seed=seed,
-        weight=0,
+        weight=weight,
         graph_num=0,
         verbose=False,
     )
