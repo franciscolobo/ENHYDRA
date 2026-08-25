@@ -5,7 +5,7 @@ import argparse
 import multiprocessing
 
 from tqdm import tqdm
-
+from datetime import datetime
 from .io import read_config_file, read_species_list, parse_obo_names
 from .utils import check_parameters, check_lists
 from .filtering import filter_length, filter_groups, subset_groups, \
@@ -49,16 +49,22 @@ def _resolve(cli_val, config_val, default=None):
     return default
 
 
-def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bool:
-    if not os.path.isdir(step_dir):
-        return False
-    if sentinel_files:
-        return all(
-            os.path.isfile(os.path.join(step_dir, f)) and
-            os.path.getsize(os.path.join(step_dir, f)) > 0
-            for f in sentinel_files
-        )
-    return len(os.listdir(step_dir)) > 0
+def _mark_complete(completed_dir: str, step_check: str) -> bool:
+    os.makedirs(completed_dir, exist_ok=True)
+    with open(os.path.join(completed_dir, f"{step_check}.completed"), "w") as f:
+                    f.write("OK\n")
+
+def _step_complete(completed_dir: str, step_check: str,) -> bool:
+    
+    return os.path.isfile(os.path.join(completed_dir, f"{step_check}.completed"))
+
+
+def _skip(resume: str, completed_dir: str, step_dir: str, step_name: str, step_check: str) -> bool:
+    logger = logging.getLogger(__name__)
+    if resume and _step_complete(completed_dir, step_check):
+        logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
+        return True
+    return False
 
 
 def _filter_length_star(args):
@@ -149,12 +155,6 @@ def _run_single_list(
     def _desc(step):
         return ("%s: %s" % (label, step)) if label else step
 
-    def _skip(step_dir, step_name, sentinel_files=None):
-        if resume and _step_complete(step_dir, sentinel_files):
-            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
-            return True
-        return False
-
     subset_dir        = os.path.join(listdir, "subset")
     length_stats_dir  = os.path.join(listdir, "length_stats")
     length_filter_dir = os.path.join(listdir, "length_filter")
@@ -163,6 +163,7 @@ def _run_single_list(
     stripped_dir      = os.path.join(listdir, "alignment_stripped")
     ident_dir         = os.path.join(listdir, "ident_alignment")
     tables_dir        = os.path.join(listdir, "tables")
+    completed_dir     = os.path.join(listdir, ".completed")
 
     os.makedirs(listdir, exist_ok=True)
     n_steps = 5 + (species is not None) + bool(exclude_from_identity)
@@ -172,9 +173,10 @@ def _run_single_list(
 
         if species is not None:
             sbar.set_description(_desc("subsetting"))
-            if not _skip(subset_dir, "subsetting"):
+            if not _skip(resume, completed_dir, subset_dir, "subsetting", "subset"):
                 subset_groups(inputdir, subset_dir, species,
                               show_progress=show_progress)
+            _step_complete(completed_dir, "subset")
             source_dir = subset_dir
             sbar.update(1)
         else:
@@ -182,7 +184,7 @@ def _run_single_list(
 
         sbar.set_description(_desc("length filter"))
         logger.info("Step 1: Length filtering")
-        if not _skip(length_filter_dir, "length filtering"):
+        if not _skip(resume, completed_dir, length_filter_dir, "length filtering", "length_filter"):
             os.makedirs(length_stats_dir, exist_ok=True)
             os.makedirs(length_filter_dir, exist_ok=True)
             args_list = [
@@ -202,11 +204,12 @@ def _run_single_list(
             finally:
                 pool.terminate()
                 pool.join()
+                _mark_complete(completed_dir, "length_filter")
         sbar.update(1)
 
         sbar.set_description(_desc("group filter"))
         logger.info("Step 2: Group filtering")
-        if not _skip(group_filter_dir, "group filtering"):
+        if not _skip(resume, completed_dir, group_filter_dir, "group filtering", "group_filter"):
             filter_groups(
                 length_filter_dir=length_filter_dir,
                 group_filter_dir=group_filter_dir,
@@ -217,11 +220,13 @@ def _run_single_list(
                 require_anchor=require_anchor,
                 show_progress=show_progress,
             )
+            _mark_complete(completed_dir, "group_filter")
+
         sbar.update(1)
 
         sbar.set_description(_desc("alignment"))
         logger.info("Step 3: Alignment with %s", aligner.upper())
-        if not _skip(alignment_dir, "alignment"):
+        if not _skip(resume, completed_dir, alignment_dir, "alignment", "alignment"):
             run_aligner(
                 group_filter_dir=group_filter_dir,
                 alignment_dir=alignment_dir,
@@ -229,6 +234,8 @@ def _run_single_list(
                 parameters=parameters,
                 show_progress=show_progress,
             )
+            _mark_complete(completed_dir, "alignment")
+
         sbar.update(1)
 
         trimal_input_dir = alignment_dir
@@ -236,19 +243,21 @@ def _run_single_list(
             sbar.set_description(_desc("stripping anchor"))
             logger.info("Step 3b: Stripping injected species from alignments: %s",
                         exclude_from_identity)
-            if not _skip(stripped_dir, "stripping anchor from alignments"):
+            if not _skip(resume, completed_dir, stripped_dir, "stripping anchor from alignments", "stripped"):
                 strip_species_from_alignments(
                     alignment_dir=alignment_dir,
                     stripped_dir=stripped_dir,
                     exclude=exclude_from_identity,
                     show_progress=show_progress,
                 )
+            _mark_complete(completed_dir, "stripped")
+                
             trimal_input_dir = stripped_dir
             sbar.update(1)
 
         sbar.set_description(_desc("identity"))
         logger.info("Step 4: Identity estimation with trimAl")
-        if not _skip(ident_dir, "identity estimation"):
+        if not _skip(resume, completed_dir, ident_dir, "identity estimation", "identity_estimation"):
             run_trimal(
                 alignment_dir=trimal_input_dir,
                 ident_dir=ident_dir,
@@ -256,13 +265,13 @@ def _run_single_list(
                 n_proc=max_process,
                 show_progress=show_progress,
             )
+            _mark_complete(completed_dir, "identity_estimation")
+
         sbar.update(1)
 
         sbar.set_description(_desc("tables"))
         logger.info("Step 5: Generating tables")
-        if not _skip(tables_dir, "table generation",
-                     sentinel_files=["group2mean.tsv", "anchor2mean.tsv",
-                                     "group2anchor.tsv"]):
+        if not _skip(resume, completed_dir, tables_dir, "table generation", "table_generation"):
             make_tables(
                 alignment_dir=alignment_dir,
                 ident_dir=ident_dir,
@@ -270,6 +279,8 @@ def _run_single_list(
                 anchor=anchor,
                 show_progress=show_progress,
             )
+            _mark_complete(completed_dir, "table_generation")
+
         sbar.update(1)
         sbar.set_description(_desc("done"))
 
@@ -449,7 +460,7 @@ def main():
     gsea_kwargs = dict(
         gene_sets=gene_sets, organism=organism, sources=sources,
         permutations=permutations, min_size=min_size, max_size=max_size,
-        seed=seed, fdr_threshold=fdr_threshold,
+        seed=seed, fdr_threshold=fdr_threshold, max_process=parameters['max_process'],
     )
 
     # ------------------------------------------------------------------ #
@@ -474,12 +485,17 @@ def main():
             results_dir_m = os.path.join(outdir, "enrichment%s" % sfx)
             plots_dir_m   = os.path.join(outdir, "plots%s" % sfx)
             gsea_input    = _normalise_anchor2mean(raw_anchor2mean, m, tables_dir)
+            gsea_kwargs_m = {
+                **gsea_kwargs,
+                **({"weight": 0} if m in ("identity", "rank") else {})
+            }
+            completed_dir = os.path.join(outdir, ".completed")
 
             logger.info("Step 6 [%s]: Enrichment analysis", m)
-            if replot or not _step_complete(results_dir_m,
-                                            ["gseapy.gene_set.prerank.report.csv"]):
+            if replot or not _skip(resume, completed_dir, results_dir_m, "enrichment", f"enrichment_{m}"):
                 run_gsea(anchor2mean_path=gsea_input,
-                         results_dir=results_dir_m, **gsea_kwargs)
+                         results_dir=results_dir_m, **gsea_kwargs_m)
+                _mark_complete(completed_dir, f"enrichment_{m}")
             else:
                 logger.info("Skipping GSEA for metric '%s' (output exists).", m)
 
@@ -562,34 +578,37 @@ def main():
         )
 
         metric_outputs = {}
+        completed_dir = os.path.join(outdir, ".completed")
 
         for m in metrics_to_run:
             sfx           = ("_%s" % m) if all_metrics else ""
             diff_dir_m    = os.path.join(outdir, "differential%s" % sfx)
             results_dir_m = os.path.join(diff_dir_m, "enrichment")
             plots_dir_m   = os.path.join(diff_dir_m, "plots")
+            gsea_kwargs_m = {
+                **gsea_kwargs
+            }
 
             logger.info("--- Computing differential scores [metric=%s] ---", m)
-            if replot or not _step_complete(diff_dir_m,
-                                            ["anchor2mean.tsv",
-                                             "differential_scores.tsv"]):
+            if replot or not _skip(resume, completed_dir, diff_dir_m, "differential", f"differential{m}"):
                 compute_differential(
                     tables_dir1=tables_dir1,
                     tables_dir2=tables_dir2,
                     diff_dir=diff_dir_m,
                     metric=m,
                 )
+                _mark_complete(completed_dir, f"differential_{m}")
             else:
                 logger.info("Skipping differential ranking for '%s' (output exists).", m)
 
             logger.info("Step 6 [%s]: Enrichment analysis (differential)", m)
-            if replot or not _step_complete(results_dir_m,
-                                            ["gseapy.gene_set.prerank.report.csv"]):
+            if replot or not _skip(resume, completed_dir, results_dir_m, "enrichment", f"enrichment_{m}"):
                 run_gsea(
                     anchor2mean_path=os.path.join(diff_dir_m, "anchor2mean.tsv"),
                     results_dir=results_dir_m,
-                    **gsea_kwargs,
+                    **gsea_kwargs_m,
                 )
+                _mark_complete(completed_dir, f"enrichment_{m}")
             else:
                 logger.info("Skipping GSEA for metric '%s' (output exists).", m)
 
