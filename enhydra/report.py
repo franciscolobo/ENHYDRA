@@ -141,10 +141,8 @@ $(document).ready(function() {{
         }});
         el.addEventListener('mouseleave', function() {{ tip.style.display = 'none'; }});
     }});
-
     var numericCols = {numeric_col_indices};
     var colFilters  = {{}};
-
     $.fn.dataTable.ext.search.push(function(settings, data) {{
         for (var i in colFilters) {{
             var f = colFilters[i];
@@ -163,12 +161,10 @@ $(document).ready(function() {{
         }}
         return true;
     }});
-
     var table = $('#results-table').DataTable({{
         pageLength: 25, orderCellsTop: true, order: [[4, 'asc']],
         columnDefs: [{{ targets: numericCols, type: 'num' }}]
     }});
-
     $('#results-table thead tr.filter-row th').each(function(i) {{
         var isNumeric   = numericCols.indexOf(i) !== -1;
         var placeholder = isNumeric ? "e.g. < 0.05" : "Filter...";
@@ -188,7 +184,6 @@ $(document).ready(function() {{
             table.draw();
         }});
     }});
-
     $(document).on('click', '.go-link', function(e) {{
         e.preventDefault();
         var goId = $(this).data('goid');
@@ -309,7 +304,6 @@ var enrichmentPlotsMap = {enrichment_plots_map};
 var numericColsMap     = {numeric_cols_map};
 var dtInstances        = {{}};
 var colFiltersMap      = {{}};
-
 $.fn.dataTable.ext.search.push(function(settings, data) {{
     var metric = settings.nTable.id.replace('results-table-', '');
     var cf     = colFiltersMap[metric] || {{}};
@@ -330,7 +324,6 @@ $.fn.dataTable.ext.search.push(function(settings, data) {{
     }}
     return true;
 }});
-
 function initTable(metric) {{
     if (dtInstances[metric]) return;
     colFiltersMap[metric] = {{}};
@@ -362,7 +355,6 @@ function initTable(metric) {{
     }});
     dtInstances[metric] = dt;
 }}
-
 $(document).ready(function() {{
     var svgTip = document.getElementById('svg-tooltip');
     document.querySelectorAll('[data-tip]').forEach(function(el) {{
@@ -374,7 +366,6 @@ $(document).ready(function() {{
         }});
         el.addEventListener('mouseleave', function() {{ svgTip.style.display = 'none'; }});
     }});
-
     document.querySelectorAll('.tab-btn').forEach(function(btn) {{
         btn.addEventListener('click', function() {{
             var metric = this.dataset.metric;
@@ -389,7 +380,6 @@ $(document).ready(function() {{
             initTable(metric);
         }});
     }});
-
     $(document).on('click', '.go-link', function(e) {{
         e.preventDefault();
         var goId   = $(this).data('goid');
@@ -405,7 +395,6 @@ $(document).ready(function() {{
     $('#modal-close, #modal-overlay').on('click', function(e) {{
         if (e.target === this) $('#modal-overlay').removeClass('active');
     }});
-
     var firstBtn = document.querySelector('.tab-btn');
     if (firstBtn) firstBtn.click();
 }});
@@ -419,7 +408,6 @@ $(document).ready(function() {{
 # ---------------------------------------------------------------------------
 
 def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
-    """Parse term_id → term_name from the second column of a GMT file."""
     if not gmt_path or not os.path.isfile(gmt_path):
         return {}
     names: dict[str, str] = {}
@@ -432,7 +420,6 @@ def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
 
 
 def _find_gmt_in_dir(directory: str) -> str | None:
-    """Return the path to the first .gmt file found in directory, or None."""
     if not os.path.isdir(directory):
         return None
     for fname in os.listdir(directory):
@@ -446,34 +433,22 @@ def _resolve_term_names(
     obo_path: str | None,
     gmt_path: str | None,
 ) -> dict[str, str]:
-    """Merge term names from GMT (fallback) and OBO file (authoritative)."""
     effective_gmt = gmt_path or _find_gmt_in_dir(results_dir)
     gmt_names     = _gmt_term_names(effective_gmt)
     if effective_gmt and not gmt_names:
-        logger.warning(
-            "GMT file found at '%s' but no term names could be parsed. "
-            "Check that it is tab-separated with term descriptions in column 2.",
-            effective_gmt,
-        )
+        logger.warning("GMT at '%s' had no parseable term names.", effective_gmt)
     elif not effective_gmt:
-        logger.warning(
-            "No GMT file path provided and none found in '%s'. "
-            "Term names will fall back to raw GO IDs unless --obo-cache is set.",
-            results_dir,
-        )
+        logger.warning("No GMT file found; term names will show as GO IDs.")
     else:
-        logger.info("Loaded %d term names from GMT: %s", len(gmt_names), effective_gmt)
-
+        logger.info("Loaded %d term names from GMT.", len(gmt_names))
     obo_names: dict[str, str] = {}
     if obo_path and os.path.isfile(obo_path):
         obo_names = _parse_obo_names(obo_path)
         logger.info("Loaded %d GO term names from OBO.", len(obo_names))
-
     return {**gmt_names, **obo_names}
 
 
 def _normalise_series(scores: pd.Series, metric: str) -> pd.Series:
-    """Normalise a gene-level score Series by the given metric."""
     if metric == "identity":
         return scores
     elif metric == "zscore":
@@ -492,77 +467,63 @@ def _per_term_scores(
 ) -> pd.DataFrame:
     """Compute mean metric scores per GO term.
 
-    Loads gene-level scores from anchor2mean.tsv for list 1.  For list 2,
-    which typically lacks anchor sequences in its alignments, falls back to
-    mapping orthogroup scores from list 2's group2mean.tsv back to anchor
-    gene IDs using list 1's group2anchor.tsv — the same approach used by
-    compute_differential.
+    Single-list mode (tables_dir2=None) → "Mean score" column.
+    Two-list mode → "List 1 score", "List 2 score", "Score diff".
 
-    In single-list mode (tables_dir2=None) returns a "Mean score" column.
-    In two-list mode returns "List 1 score" and "List 2 score".
+    Gene IDs are always read as str to prevent pandas inferring numeric
+    columns as int/float, which would break matching against GMT identifiers.
     """
     def _load_anchor2mean(tables_dir: str) -> dict[str, float]:
-        """gene_id → normalised score from anchor2mean.tsv."""
         path = os.path.join(tables_dir, "anchor2mean.tsv")
         if not os.path.isfile(path):
-            logger.warning("anchor2mean.tsv not found in %s", tables_dir)
             return {}
         df = pd.read_csv(path, sep="\t", header=None,
-                         names=["gene_id", "score"], dtype={"gene_id": str})
+                         names=["gene_id", "score"],
+                         dtype={"gene_id": str})          # always str
         df["score"] = pd.to_numeric(df["score"], errors="coerce")
         df = df.dropna(subset=["score"]).drop_duplicates("gene_id")
         return dict(_normalise_series(df.set_index("gene_id")["score"], metric))
 
-    def _load_via_group_mapping(tables_dir_scores: str, tables_dir_mapping: str) -> dict[str, float]:
-        """gene_id → normalised score for a list without anchor sequences.
-
-        Uses group2mean.tsv from tables_dir_scores for the raw scores and
-        group2anchor.tsv from tables_dir_mapping (list 1) to convert group
-        IDs to anchor gene IDs.  This mirrors the logic in compute_differential
-        and correctly handles the case where the anchor species is absent from
-        list 2's alignments.
-        """
-        g2m_path = os.path.join(tables_dir_scores, "group2mean.tsv")
+    def _load_via_group_mapping(tables_dir_scores: str,
+                                tables_dir_mapping: str) -> dict[str, float]:
+        """Fallback for lists without anchor sequences."""
+        g2m_path = os.path.join(tables_dir_scores,  "group2mean.tsv")
         g2a_path = os.path.join(tables_dir_mapping, "group2anchor.tsv")
         if not os.path.isfile(g2m_path) or not os.path.isfile(g2a_path):
             return {}
-        g2m = pd.read_csv(g2m_path, sep="\t", header=None, names=["group_id", "score"])
+        g2m = pd.read_csv(g2m_path, sep="\t", header=None,
+                          names=["group_id", "score"],
+                          dtype={"group_id": str})
         g2m["score"] = pd.to_numeric(g2m["score"], errors="coerce")
         g2m = (g2m.dropna(subset=["score"])
                   .drop_duplicates("group_id")
                   .set_index("group_id")["score"])
         g2m = _normalise_series(g2m, metric)
-        g2a = (pd.read_csv(g2a_path, sep="\t", header=None,
-                           names=["group_id", "gene_id"])
-                 .drop_duplicates("group_id")
-                 .set_index("group_id")["gene_id"])
-        common = g2m.index.intersection(g2a.index)
-        return {g2a[gid]: float(g2m[gid]) for gid in common}
+
+        g2a = pd.read_csv(g2a_path, sep="\t", header=None,
+                          names=["group_id", "gene_id"],
+                          dtype={"group_id": str, "gene_id": str})  # always str
+        g2a = (g2a.dropna()
+                  .drop_duplicates("group_id")
+                  .set_index("group_id")["gene_id"])
+
+        merged = (g2m.rename("score")
+                     .reset_index()
+                     .merge(g2a.reset_index(), on="group_id", how="inner")
+                     .dropna(subset=["gene_id", "score"]))
+        return dict(zip(merged["gene_id"], merged["score"]))
 
     scores1 = _load_anchor2mean(tables_dir1)
-
     if tables_dir2 is not None:
         scores2 = _load_anchor2mean(tables_dir2)
         if not scores2:
-            logger.info(
-                "list 2 anchor2mean.tsv is empty — falling back to "
-                "group2mean + list 1 group2anchor mapping for list 2 scores."
-            )
             scores2 = _load_via_group_mapping(tables_dir2, tables_dir1)
     else:
         scores2 = None
 
     if not scores1:
-        logger.warning(
-            "No anchor scores loaded from %s — per-term scores unavailable.",
-            tables_dir1,
-        )
+        logger.warning("No anchor scores loaded from %s.", tables_dir1)
         return pd.DataFrame()
-
-    logger.info(
-        "per-term scores: %d genes in list1, %d genes in list2",
-        len(scores1), len(scores2) if scores2 else 0,
-    )
 
     term_id_set = set(term_ids)
     gmt: dict[str, set[str]] = {}
@@ -571,19 +532,6 @@ def _per_term_scores(
             fields = line.rstrip("\n").split("\t")
             if len(fields) >= 3 and fields[0] in term_id_set:
                 gmt[fields[0]] = set(fields[2:])
-
-    logger.info(
-        "per-term scores: %d/%d terms found in GMT",
-        len(gmt), len(term_id_set),
-    )
-    if gmt:
-        sample_term  = next(iter(gmt))
-        sample_genes = list(gmt[sample_term])[:3]
-        sample_anch  = list(scores1.keys())[:3]
-        logger.info(
-            "per-term scores sample — GMT genes: %s | anchor genes: %s",
-            sample_genes, sample_anch,
-        )
 
     rows = []
     for tid in term_ids:
@@ -595,8 +543,12 @@ def _per_term_scores(
         else:
             s2    = [scores2[g] for g in genes if g in scores2]
             mean2 = round(sum(s2) / len(s2), 4) if s2 else None
-            diff  = round(mean1 - mean2, 4) if (mean1 is not None and mean2 is not None) else None
-            rows.append({"Term": tid, "List 1 score": mean1, "List 2 score": mean2, "Score diff": diff})
+            diff  = (round(mean1 - mean2, 4)
+                     if mean1 is not None and mean2 is not None else None)
+            rows.append({"Term": tid,
+                         "List 1 score": mean1,
+                         "List 2 score": mean2,
+                         "Score diff":   diff})
     return pd.DataFrame(rows).set_index("Term")
 
 
@@ -636,9 +588,7 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
     if not os.path.isfile(path):
         logger.warning("GSEA results not found: %s", path)
         return None
-
     df = pd.read_csv(path)
-
     if "Tag %" in df.columns:
         def _tag(v):
             try:
@@ -650,7 +600,6 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
             except Exception:
                 return None
         df["Tag %"] = df["Tag %"].apply(_tag)
-
     if "Gene %" in df.columns:
         def _gene(v):
             try:
@@ -658,13 +607,37 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
             except Exception:
                 return None
         df["Gene %"] = df["Gene %"].apply(_gene)
-
     df.to_csv(os.path.join(results_dir, "gsea_results_processed.tsv"),
               sep="\t", index=False)
     return df
 
 
-def _build_enrichment_plot_index(results_dir: str) -> dict[str, str]:
+def _build_enrichment_plot_index(results_dir: str, report_dir: str) -> dict[str, str]:
+    """Build a mapping of GO ID -> image path for per-gene-set enrichment plots.
+
+    Rather than reading and base64-encoding every PNG (which used to embed
+    the full binary content of every plot directly into the HTML — the
+    dominant cause of multi-hundred-MB reports on large analyses such as
+    vertebrate genomes), this now records a path *relative to the report's
+    own directory* on disk. The browser then loads each plot on demand,
+    directly from the enrichment/prerank/ folder, only when the user clicks
+    a GO ID. The images are never copied or embedded — the report simply
+    keeps a pointer to where they already live.
+
+    Note: this means the resulting report.html is no longer a single
+    self-contained file. It must stay alongside the output directory
+    structure (specifically the relevant enrichment/prerank/ subfolder) for
+    the modal images to resolve.
+
+    Args:
+        results_dir: Directory passed to run_gsea() for this metric/list
+                     (i.e. the parent of the 'prerank' subfolder).
+        report_dir:  Directory where the report.html file itself will be
+                     written, used as the base for the relative paths.
+
+    Returns:
+        Dict mapping GO ID -> path (relative to report_dir) of its PNG.
+    """
     prerank_dir = os.path.join(results_dir, "prerank")
     if not os.path.isdir(prerank_dir):
         return {}
@@ -672,9 +645,16 @@ def _build_enrichment_plot_index(results_dir: str) -> dict[str, str]:
     for filename in os.listdir(prerank_dir):
         if not filename.endswith(".png"):
             continue
-        go_id = filename.replace(".png", "").replace("_", ":", 1)
-        index[go_id] = _img_to_base64(os.path.join(prerank_dir, filename))
-    logger.info("Indexed %d enrichment plot(s).", len(index))
+        go_id    = filename.replace(".png", "").replace("_", ":", 1)
+        abs_path = os.path.abspath(os.path.join(prerank_dir, filename))
+        rel_path = os.path.relpath(abs_path, start=report_dir)
+        # Use forward slashes regardless of platform, since this path is
+        # used as a URL/src attribute inside the HTML, not a filesystem call.
+        index[go_id] = rel_path.replace(os.sep, "/")
+    logger.info(
+        "Indexed %d enrichment plot(s) as on-disk links (not embedded).",
+        len(index),
+    )
     return index
 
 
@@ -685,16 +665,9 @@ def _augment_with_per_term_scores(
     tables_dir2: str | None,
     metric: str,
 ) -> pd.DataFrame:
-    """Merge per-list mean scores into the GSEA results DataFrame."""
-    logger.info(
-        "per-term scores: gmt_path=%s tables_dir1=%s tables_dir2=%s metric=%s",
-        gmt_path, tables_dir1, tables_dir2, metric,
-    )
     if not (gmt_path and tables_dir1):
-        logger.warning("per-term scores skipped: missing gmt_path or tables_dir1")
         return df
     if not os.path.isfile(gmt_path):
-        logger.warning("per-term scores skipped: GMT file not found at %s", gmt_path)
         return df
     try:
         per_term = _per_term_scores(
@@ -705,18 +678,12 @@ def _augment_with_per_term_scores(
             metric=metric,
         )
         if per_term.empty:
-            logger.warning("per-term scores: result DataFrame is empty — no columns added")
             return df
-        logger.info(
-            "per-term scores: joining %d rows, new columns: %s",
-            len(per_term), list(per_term.columns),
-        )
         df = df.set_index("Term").join(per_term).reset_index()
-    except Exception as exc:
+    except Exception:
         import traceback
-        logger.warning(
-            "per-term scores failed:\n%s", traceback.format_exc()
-        )
+        logger.warning("Could not compute per-term scores:\n%s",
+                       traceback.format_exc())
     return df
 
 
@@ -729,12 +696,6 @@ def _results_table_html(
     col1_label: str = "List 1",
     col2_label: str = "List 2",
 ) -> tuple[str, list[int]]:
-    """Build an HTML results table from a GSEA results DataFrame.
-
-    Columns "Mean score" (single-list), "List 1 score", and "List 2 score"
-    (two-list) are included automatically when present in df.
-    col1_label / col2_label control the header text of the per-list columns.
-    """
     df = df.copy()
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
@@ -743,7 +704,8 @@ def _results_table_html(
     df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
 
     for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val",
-                "Tag %", "Gene %", "Mean score", "List 1 score", "List 2 score"]:
+                "Tag %", "Gene %", "Mean score",
+                "List 1 score", "List 2 score", "Score diff"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").apply(
                 lambda x: "%.4f" % x if pd.notna(x) else ""
@@ -753,6 +715,7 @@ def _results_table_html(
         lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
 
+    diff_label = "%s \u2212 %s" % (col1_label, col2_label)
     col_defs = [
         ("Term",         "GO ID",
          "Gene Ontology term identifier."),
@@ -764,11 +727,10 @@ def _results_table_html(
          "Mean metric score for genes in this set in %s." % col1_label),
         ("List 2 score", "%s score" % col2_label,
          "Mean metric score for genes in this set in %s." % col2_label),
-        ("Score diff",   "%s \u2212 %s" % (col1_label, col2_label),
-         "Difference in mean metric score between %s and %s. "
-         "Positive = more conserved in %s." % (col1_label, col2_label, col1_label)),
+        ("Score diff",   diff_label,
+         "Difference in mean score (%s \u2212 %s)." % (col1_label, col2_label)),
         ("NES",          "NES",
-         "Normalised Enrichment Score. Positive = more conserved, negative = faster evolving."),
+         "Normalised Enrichment Score."),
         ("NOM p-val",    "p-value",
          "Nominal p-value from permutation testing."),
         ("FDR q-val",    "FDR",
@@ -780,7 +742,6 @@ def _results_table_html(
         ("Significant",  "Sig.",
          "Significant at FDR < %.2f." % fdr_threshold),
     ]
-    # Only include columns that are present in the DataFrame.
     col_defs = [(s, d, t) for s, d, t in col_defs
                 if s in df.columns or s in ("GO Term", "Significant")]
 
@@ -790,9 +751,10 @@ def _results_table_html(
     table_df.columns = display_names
 
     numeric_names       = {"NES", "p-value", "FDR", "Tag %", "Gene %",
-                           "Mean score", "Score diff",
+                           "Mean score", diff_label,
                            "%s score" % col1_label, "%s score" % col2_label}
-    numeric_col_indices = [i for i, n in enumerate(display_names) if n in numeric_names]
+    numeric_col_indices = [i for i, n in enumerate(display_names)
+                           if n in numeric_names]
 
     header_cells = "".join(
         '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
@@ -868,48 +830,29 @@ def build_report(
     label1: str = "List 1",
     label2: str = "List 2",
 ):
-    """Build a self-contained HTML report for a single-metric ENHYDRA run.
-
-    Args:
-        results_dir:   Directory containing GSEApy results.
-        plots_dir:     Directory containing plot files.
-        report_path:   Output path for the HTML file.
-        obo_path:      Path to go-basic.obo (optional).
-        mode:          "single" or "differential".
-        metric:        Ranking metric used; controls score normalisation for
-                       the per-term score columns.
-        fdr_threshold: FDR threshold for significance highlighting.
-        gmt_path:      Path to the GMT file; term names read from column 2.
-        tables_dir1:   tables/ directory for list 1 (or the single list).
-                       When provided, a "Mean score" or per-list score column
-                       is added to the results table.
-        tables_dir2:   tables/ directory for list 2 (two-list mode only).
-        label1:        Display name for list 1 (e.g. "Pathogenic").
-        label2:        Display name for list 2 (e.g. "Non-pathogenic").
-    """
     logger.info("Building HTML report...")
-
     effective_gmt = gmt_path or _find_gmt_in_dir(results_dir)
     term_names    = _resolve_term_names(results_dir, obo_path, effective_gmt)
-
     df = _load_gsea_results(results_dir)
     if df is None:
         logger.warning("Cannot build report: no GSEA results found.")
         return
-
     df = _augment_with_per_term_scores(
         df, effective_gmt, tables_dir1, tables_dir2, metric
     )
-
     cache_dir    = os.path.dirname(obo_path) if obo_path else None
     jquery_js    = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
     dt_js        = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
     dt_css       = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
-    plot_index   = _build_enrichment_plot_index(results_dir)
-    plot_data_js = "var enrichmentPlots = {%s};" % ",".join(
-        '"%s": "%s"' % (go_id, uri) for go_id, uri in plot_index.items()
-    )
 
+    # Plot links are resolved relative to the directory the report itself
+    # will be written into, so images are read from disk on click rather
+    # than being embedded as base64 blobs in the HTML.
+    report_dir   = os.path.dirname(os.path.abspath(report_path))
+    plot_index   = _build_enrichment_plot_index(results_dir, report_dir)
+    plot_data_js = "var enrichmentPlots = {%s};" % ",".join(
+        '"%s": "%s"' % (go_id, path) for go_id, path in plot_index.items()
+    )
     if mode == "single":
         plot_names = [
             ("identity_distribution", "Distribution of mean alignment identity"),
@@ -924,19 +867,16 @@ def build_report(
             ("gsea_barplot",              "Top differentially enriched gene sets (NES)"),
         ]
         title = "ENHYDRA Differential Enrichment Report"
-
     plots_html = _plot_section(plots_dir, plot_names)
     table_html, numeric_col_indices = _results_table_html(
         df, term_names, plot_index, fdr_threshold,
         metric=None, col1_label=label1, col2_label=label2,
     )
-
     html = _TEMPLATE.format(
         title=title, dt_css=dt_css, plots_html=plots_html,
         table_html=table_html, jquery_js=jquery_js, dt_js=dt_js,
         plot_data_js=plot_data_js, numeric_col_indices=numeric_col_indices,
     )
-
     with open(report_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     logger.info("HTML report written to: %s", report_path)
@@ -958,36 +898,17 @@ def build_multi_metric_report(
     label1: str = "List 1",
     label2: str = "List 2",
 ):
-    """Build a self-contained tabbed HTML report covering all ranking metrics.
-
-    Args:
-        metric_data:   Dict mapping metric name → {"results_dir", "plots_dir"}.
-        report_path:   Output path for the HTML file.
-        obo_path:      Path to go-basic.obo (optional).
-        fdr_threshold: FDR threshold for row highlighting.
-        mode:          "single" or "differential".
-        gmt_path:      Path to the GMT file; term names read from column 2.
-        tables_dir1:   tables/ directory for list 1 (or the single list).
-                       Enables per-term score columns in the results table.
-        tables_dir2:   tables/ directory for list 2 (two-list mode only).
-        label1:        Display name for list 1 (e.g. "Pathogenic").
-        label2:        Display name for list 2 (e.g. "Non-pathogenic").
-    """
     logger.info("Building multi-metric HTML report (%d metrics)...", len(metric_data))
-
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
     effective_gmt = gmt_path or _find_gmt_in_dir(first_results)
     term_names    = _resolve_term_names(first_results, obo_path, effective_gmt)
-
     cache_dir = os.path.dirname(obo_path) if obo_path else None
     jquery_js = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
     dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
     dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
-
     title = ("ENHYDRA Multi-Metric Differential Enrichment Report"
              if mode == "differential"
              else "ENHYDRA Multi-Metric Enrichment Report")
-
     if mode == "single":
         plot_names = [
             ("identity_distribution", "Distribution of mean alignment identity"),
@@ -1000,27 +921,27 @@ def build_multi_metric_report(
             ("gsea_barplot",              "Top differentially enriched gene sets (NES)"),
         ]
 
+    # Plot links are resolved relative to the directory the report itself
+    # will be written into (see build_report for the rationale).
+    report_dir = os.path.dirname(os.path.abspath(report_path))
+
     tab_buttons_parts    = []
     tab_panels_parts     = []
     enrichment_plots_map = {}
     numeric_cols_map     = {}
-
     first = True
     for metric, paths in metric_data.items():
         label       = METRIC_LABELS.get(metric, metric.capitalize())
         active_cls  = " active" if first else ""
         results_dir = paths["results_dir"]
         plots_dir   = paths["plots_dir"]
-
         tab_buttons_parts.append(
             '    <button class="tab-btn%s" data-metric="%s" '
             'role="tab" aria-controls="tab-%s">%s</button>'
             % (active_cls, metric, metric, label)
         )
-
-        plot_idx = _build_enrichment_plot_index(results_dir)
+        plot_idx = _build_enrichment_plot_index(results_dir, report_dir)
         enrichment_plots_map[metric] = plot_idx
-
         df = _load_gsea_results(results_dir)
         if df is not None:
             df = _augment_with_per_term_scores(
@@ -1034,19 +955,16 @@ def build_multi_metric_report(
         else:
             tbl_html = "<p>No GSEA results found for this metric.</p>"
             numeric_cols_map[metric] = []
-
         plots_html = _plot_section(plots_dir, plot_names)
         desc       = _METRIC_DESCS.get(metric, "")
-
         tab_panels_parts.append(
             '<div id="tab-{m}" class="tab-panel{ac}" role="tabpanel">\n'
             '  <p class="metric-desc">{desc}</p>\n'
             '  <h3>Plots</h3>\n'
             '  <div class="plot-grid">{plots}</div>\n'
             '  <h3>Enrichment results</h3>\n'
-            '  <p>Significant gene sets (FDR&nbsp;&lt;&nbsp;{fdr}) are highlighted '
-            'in blue. Click a GO ID to view its enrichment plot. '
-            'Use the filter boxes beneath each column header to narrow results.</p>\n'
+            '  <p>Significant gene sets (FDR&nbsp;&lt;&nbsp;{fdr}) highlighted '
+            'in blue. Click a GO ID to view its enrichment plot.</p>\n'
             '  {tbl}\n'
             '</div>\n'.format(
                 m=metric, ac=active_cls, desc=desc,
@@ -1054,7 +972,6 @@ def build_multi_metric_report(
             )
         )
         first = False
-
     html = _MULTI_TEMPLATE.format(
         title=title, dt_css=dt_css,
         tab_buttons="\n".join(tab_buttons_parts),
@@ -1063,7 +980,6 @@ def build_multi_metric_report(
         enrichment_plots_map=json.dumps(enrichment_plots_map),
         numeric_cols_map=json.dumps(numeric_cols_map),
     )
-
     with open(report_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     logger.info("Multi-metric HTML report written to: %s", report_path)

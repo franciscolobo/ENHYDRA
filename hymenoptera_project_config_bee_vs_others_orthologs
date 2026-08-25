@@ -1,14 +1,15 @@
 # --- Input/Output ---
 inputdir    = test_data/hymenoptera/groups
-outdir      = validation/hymenoptera_output_all
+outdir      = validation/hymenoptera_output_bee_vs_others_orthologs
+
 anchor      = Apis_mellifera
 max_process = 8
 
 # --- Filtering ---
-min_species     = 50        # minimum number of species per orthogroup
-min_sequences   = 50         # minimum sequences per group after length filtering
-paralogs        = all       # all | remove | longest
-length_filter_sd = 2      # sequences beyond mean ± (sd * length_filter_sd) are removed
+min_species     = 15        # minimum number of species per orthogroup
+min_sequences   = 15        # minimum sequences per group after length filtering
+paralogs        = remove       # all | remove | longest
+length_filter_sd = 1      # sequences beyond mean ± (sd * length_filter_sd) are removed
 
 # --- Alignment ---
 aligner     = mafft         # mafft | muscle | prank
@@ -27,5 +28,7 @@ top_n       = 20            # number of gene sets shown in barplot
 obo_cache   = test_data/obo_cache
 
 # --- Two-list differential mode (optional) ---
-# list1      = tests/pathogenic_strains.txt
-# list2      = tests/non_pathogenic_strains.txt
+list1      = test_data/hymenoptera/metadata/Bees.txt
+list2      = test_data/hymenoptera/metadata/not_Bees.txt
+list1_name = Bees
+list2_name = Others

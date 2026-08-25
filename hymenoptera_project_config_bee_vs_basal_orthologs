@@ -1,14 +1,15 @@
 # --- Input/Output ---
 inputdir    = test_data/hymenoptera/groups
-outdir      = test_data/hymenoptera_output_bee_vs_ant
+outdir      = validation/hymenoptera_output_bee_vs_basal_orthologs
+
 anchor      = Apis_mellifera
 max_process = 8
 
 # --- Filtering ---
 min_species     = 10        # minimum number of species per orthogroup
-min_sequences   = 10         # minimum sequences per group after length filtering
-paralogs        = all       # all | remove | longest
-length_filter_sd = 2      # sequences beyond mean ± (sd * length_filter_sd) are removed
+min_sequences   = 10        # minimum sequences per group after length filtering
+paralogs        = remove       # all | remove | longest
+length_filter_sd = 1      # sequences beyond mean ± (sd * length_filter_sd) are removed
 
 # --- Alignment ---
 aligner     = mafft         # mafft | muscle | prank
@@ -28,4 +29,6 @@ obo_cache   = test_data/obo_cache
 
 # --- Two-list differential mode (optional) ---
 list1      = test_data/hymenoptera/metadata/Bees.txt
-list2      = test_data/hymenoptera/metadata/Ants.txt
+list2      = test_data/hymenoptera/metadata/Basal.txt
+list1_name = Bees
+list2_name = Basal

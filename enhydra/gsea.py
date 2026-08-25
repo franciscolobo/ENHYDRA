@@ -157,6 +157,7 @@ def run_gsea(
     max_size: int = 500,
     seed: int = 42,
     fdr_threshold: float = 0.25,
+    weight: float = 0,
 ) -> gp.Prerank:
     """Run GSEApy prerank, optionally fetching annotations from g:Profiler."""
     os.makedirs(results_dir, exist_ok=True)
@@ -193,6 +194,7 @@ def run_gsea(
         seed=seed,
         graph_num=0,
         verbose=False,
+        weight=weight,
     )
 
     n_sig = (results.res2d["FDR q-val"] < fdr_threshold).sum()
@@ -210,6 +212,7 @@ def run_gsea(
             seed=seed,
             graph_num=int(n_sig),
             verbose=False,
+            weight=weight,
         )
         _convert_gsea_plots_to_png(results_dir)
 
