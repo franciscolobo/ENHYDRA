@@ -35,6 +35,7 @@ def read_config_file(fh_project, fh_code) -> dict:
         'min_sequences':    int(project.get('min_sequences', 2)),
         'paralogs':         project.get('paralogs', 'all'),
         'length_filter_sd': float(project.get('length_filter_sd', 2.0)),
+        'trim':             project.get('trim', ''),
         # Alignment
         'aligner':          project.get('aligner', 'mafft'),
         'mafft_mode':       project.get('mafft_mode', 'auto'),

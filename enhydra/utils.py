@@ -90,3 +90,48 @@ def check_lists(
             "the anchor is expected to belong to list 1.",
             anchor,
         )
+
+def resolve_trim_args(trim: str | float | None) -> list[str] | None:
+    """Translate the 'trim' config parameter into trimAl CLI flags.
+
+    Args:
+        trim: One of:
+            - '' or None         : no column trimming (returns None).
+            - a number in [0, 1] : used as trimAl's gap threshold,
+                                   i.e. ['-gt', str(value)].
+            - 'strict'           : ['-strict'].
+            - 'strictplus'       : ['-strictplus'].
+            - 'automated'        : ['-automated1'].
+        Matching against the keyword values is case-insensitive.
+
+    Returns:
+        List of trimAl CLI arguments, or None if trimming is disabled.
+
+    Raises:
+        EnhydraConfigError: If trim is set but matches none of the
+                            accepted values.
+    """
+    if trim in (None, ""):
+        return None
+
+    keyword_map = {
+        "strict":     ["-strict"],
+        "strictplus": ["-strictplus"],
+        "automated":  ["-automated1"],
+    }
+    if isinstance(trim, str) and trim.strip().lower() in keyword_map:
+        return keyword_map[trim.strip().lower()]
+
+    try:
+        value = float(trim)
+    except (TypeError, ValueError):
+        raise EnhydraConfigError(
+            "Invalid 'trim' value: %r. Must be a number between 0 and 1, "
+            "or one of: strict, strictplus, automated." % (trim,)
+        )
+    if not (0 <= value <= 1):
+        raise EnhydraConfigError(
+            "Invalid 'trim' value: %r. Numeric trim values must be between "
+            "0 and 1 (used as trimAl's -gt gap threshold)." % (trim,)
+        )
+    return ["-gt", str(value)]

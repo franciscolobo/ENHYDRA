@@ -5,12 +5,12 @@ import argparse
 import multiprocessing
 
 from tqdm import tqdm
-from datetime import datetime
+
 from .io import read_config_file, read_species_list, parse_obo_names
-from .utils import check_parameters, check_lists
+from .utils import check_parameters, check_lists, resolve_trim_args
 from .filtering import filter_length, filter_groups, subset_groups, \
     strip_species_from_alignments
-from .alignment import run_aligner, run_trimal
+from .alignment import run_aligner, run_trimal, run_trimal_columns
 from .tables import make_tables
 from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
@@ -49,22 +49,16 @@ def _resolve(cli_val, config_val, default=None):
     return default
 
 
-def _mark_complete(completed_dir: str, step_check: str) -> bool:
-    os.makedirs(completed_dir, exist_ok=True)
-    with open(os.path.join(completed_dir, f"{step_check}.completed"), "w") as f:
-                    f.write("OK\n")
-
-def _step_complete(completed_dir: str, step_check: str,) -> bool:
-    
-    return os.path.isfile(os.path.join(completed_dir, f"{step_check}.completed"))
-
-
-def _skip(resume: str, completed_dir: str, step_dir: str, step_name: str, step_check: str) -> bool:
-    logger = logging.getLogger(__name__)
-    if resume and _step_complete(completed_dir, step_check):
-        logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
-        return True
-    return False
+def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bool:
+    if not os.path.isdir(step_dir):
+        return False
+    if sentinel_files:
+        return all(
+            os.path.isfile(os.path.join(step_dir, f)) and
+            os.path.getsize(os.path.join(step_dir, f)) > 0
+            for f in sentinel_files
+        )
+    return len(os.listdir(step_dir)) > 0
 
 
 def _filter_length_star(args):
@@ -126,7 +120,7 @@ def _log_summary(
 
 
 # ---------------------------------------------------------------------------
-# Core pipeline: filter → align → identity → tables
+# Core pipeline: filter → align → (trim) → identity → tables
 # ---------------------------------------------------------------------------
 
 def _run_single_list(
@@ -149,11 +143,18 @@ def _run_single_list(
     show_progress: bool = False,
     label: str = "",
     exclude_from_identity: set[str] | None = None,
+    trim_args: list[str] | None = None,
 ) -> tuple[str, dict]:
     logger = logging.getLogger(__name__)
 
     def _desc(step):
         return ("%s: %s" % (label, step)) if label else step
+
+    def _skip(step_dir, step_name, sentinel_files=None):
+        if resume and _step_complete(step_dir, sentinel_files):
+            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
+            return True
+        return False
 
     subset_dir        = os.path.join(listdir, "subset")
     length_stats_dir  = os.path.join(listdir, "length_stats")
@@ -161,22 +162,22 @@ def _run_single_list(
     group_filter_dir  = os.path.join(listdir, "group_filter")
     alignment_dir     = os.path.join(listdir, "alignment")
     stripped_dir      = os.path.join(listdir, "alignment_stripped")
+    trimmed_dir       = os.path.join(listdir, "alignment_trimmed")
     ident_dir         = os.path.join(listdir, "ident_alignment")
     tables_dir        = os.path.join(listdir, "tables")
-    completed_dir     = os.path.join(listdir, ".completed")
 
     os.makedirs(listdir, exist_ok=True)
-    n_steps = 5 + (species is not None) + bool(exclude_from_identity)
+    n_steps = (5 + (species is not None) + bool(exclude_from_identity)
+               + bool(trim_args))
 
     with tqdm(total=n_steps, desc=_desc("starting"),
               unit="step", disable=not show_progress, leave=True) as sbar:
 
         if species is not None:
             sbar.set_description(_desc("subsetting"))
-            if not _skip(resume, completed_dir, subset_dir, "subsetting", "subset"):
+            if not _skip(subset_dir, "subsetting"):
                 subset_groups(inputdir, subset_dir, species,
                               show_progress=show_progress)
-            _step_complete(completed_dir, "subset")
             source_dir = subset_dir
             sbar.update(1)
         else:
@@ -184,7 +185,7 @@ def _run_single_list(
 
         sbar.set_description(_desc("length filter"))
         logger.info("Step 1: Length filtering")
-        if not _skip(resume, completed_dir, length_filter_dir, "length filtering", "length_filter"):
+        if not _skip(length_filter_dir, "length filtering"):
             os.makedirs(length_stats_dir, exist_ok=True)
             os.makedirs(length_filter_dir, exist_ok=True)
             args_list = [
@@ -204,12 +205,11 @@ def _run_single_list(
             finally:
                 pool.terminate()
                 pool.join()
-                _mark_complete(completed_dir, "length_filter")
         sbar.update(1)
 
         sbar.set_description(_desc("group filter"))
         logger.info("Step 2: Group filtering")
-        if not _skip(resume, completed_dir, group_filter_dir, "group filtering", "group_filter"):
+        if not _skip(group_filter_dir, "group filtering"):
             filter_groups(
                 length_filter_dir=length_filter_dir,
                 group_filter_dir=group_filter_dir,
@@ -220,13 +220,11 @@ def _run_single_list(
                 require_anchor=require_anchor,
                 show_progress=show_progress,
             )
-            _mark_complete(completed_dir, "group_filter")
-
         sbar.update(1)
 
         sbar.set_description(_desc("alignment"))
         logger.info("Step 3: Alignment with %s", aligner.upper())
-        if not _skip(resume, completed_dir, alignment_dir, "alignment", "alignment"):
+        if not _skip(alignment_dir, "alignment"):
             run_aligner(
                 group_filter_dir=group_filter_dir,
                 alignment_dir=alignment_dir,
@@ -234,30 +232,45 @@ def _run_single_list(
                 parameters=parameters,
                 show_progress=show_progress,
             )
-            _mark_complete(completed_dir, "alignment")
-
         sbar.update(1)
 
         trimal_input_dir = alignment_dir
+
         if exclude_from_identity:
             sbar.set_description(_desc("stripping anchor"))
             logger.info("Step 3b: Stripping injected species from alignments: %s",
                         exclude_from_identity)
-            if not _skip(resume, completed_dir, stripped_dir, "stripping anchor from alignments", "stripped"):
+            if not _skip(stripped_dir, "stripping anchor from alignments"):
                 strip_species_from_alignments(
                     alignment_dir=alignment_dir,
                     stripped_dir=stripped_dir,
                     exclude=exclude_from_identity,
                     show_progress=show_progress,
                 )
-            _mark_complete(completed_dir, "stripped")
-                
             trimal_input_dir = stripped_dir
+            sbar.update(1)
+
+        if trim_args:
+            sbar.set_description(_desc("trimming columns"))
+            logger.info(
+                "Step 3c: Trimming alignment columns with trimAl (%s)",
+                " ".join(trim_args),
+            )
+            if not _skip(trimmed_dir, "column trimming"):
+                run_trimal_columns(
+                    alignment_dir=trimal_input_dir,
+                    trimmed_dir=trimmed_dir,
+                    trimal_path=trimal_path,
+                    trim_args=trim_args,
+                    n_proc=max_process,
+                    show_progress=show_progress,
+                )
+            trimal_input_dir = trimmed_dir
             sbar.update(1)
 
         sbar.set_description(_desc("identity"))
         logger.info("Step 4: Identity estimation with trimAl")
-        if not _skip(resume, completed_dir, ident_dir, "identity estimation", "identity_estimation"):
+        if not _skip(ident_dir, "identity estimation"):
             run_trimal(
                 alignment_dir=trimal_input_dir,
                 ident_dir=ident_dir,
@@ -265,13 +278,13 @@ def _run_single_list(
                 n_proc=max_process,
                 show_progress=show_progress,
             )
-            _mark_complete(completed_dir, "identity_estimation")
-
         sbar.update(1)
 
         sbar.set_description(_desc("tables"))
         logger.info("Step 5: Generating tables")
-        if not _skip(resume, completed_dir, tables_dir, "table generation", "table_generation"):
+        if not _skip(tables_dir, "table generation",
+                     sentinel_files=["group2mean.tsv", "anchor2mean.tsv",
+                                     "group2anchor.tsv"]):
             make_tables(
                 alignment_dir=alignment_dir,
                 ident_dir=ident_dir,
@@ -279,8 +292,6 @@ def _run_single_list(
                 anchor=anchor,
                 show_progress=show_progress,
             )
-            _mark_complete(completed_dir, "table_generation")
-
         sbar.update(1)
         sbar.set_description(_desc("done"))
 
@@ -320,6 +331,14 @@ def _build_arg_parser():
                              "bars instead.")
     parser.add_argument("--paralogs", choices=["all", "remove", "longest"], default=None)
     parser.add_argument("--min-species", type=int, default=None)
+    parser.add_argument("--trim", default=None,
+                        help="Trim alignment columns with trimAl before "
+                             "identity estimation. Accepts a number between "
+                             "0 and 1 (used as trimAl's -gt gap threshold), "
+                             "or one of: strict, strictplus, automated "
+                             "(mapped to trimAl's -strict, -strictplus, "
+                             "-automated1 respectively). If unset (default), "
+                             "no column trimming is performed.")
     parser.add_argument("--all-metrics", action="store_true", default=False,
                         help="Run GSEA for all three ranking metrics and produce "
                              "a tabbed HTML report.")
@@ -365,6 +384,7 @@ def main():
     min_species   = _resolve(args.min_species,   parameters['min_species'],   4)
     min_sequences = parameters['min_sequences']
     paralogs      = _resolve(args.paralogs,      parameters['paralogs'],      'all')
+    trim          = _resolve(args.trim,          parameters['trim'],          '')
     metric        = _resolve(args.metric,        parameters['metric'],        'zscore')
     gene_sets     = _resolve(args.gene_sets,     parameters['gene_sets'],     None)
     organism      = _resolve(args.organism,      parameters['organism'],      None)
@@ -390,6 +410,11 @@ def main():
     replot        = args.replot
     resume        = args.resume or replot
 
+    try:
+        trim_args = resolve_trim_args(trim)
+    except EnhydraConfigError as e:
+        sys.exit("Configuration error: %s" % e)
+
     if not gene_sets and not organism:
         parser.error(
             "A gene set source is required. Set 'gene_sets' or 'organism' in "
@@ -414,8 +439,9 @@ def main():
     logger.info("Welcome to Enhydra")
     logger.info(
         "Resolved parameters: metric=%s, all_metrics=%s, replot=%s, "
-        "paralogs=%s, min_species=%d, permutations=%d, fdr_threshold=%.2f",
-        metric, all_metrics, replot, paralogs,
+        "paralogs=%s, trim=%s, min_species=%d, permutations=%d, "
+        "fdr_threshold=%.2f",
+        metric, all_metrics, replot, paralogs, (trim or "none"),
         min_species, permutations, fdr_threshold,
     )
 
@@ -444,6 +470,7 @@ def main():
         parameters=parameters,
         resume=resume,
         show_progress=args.quiet,
+        trim_args=trim_args,
     )
 
     # In two-list mode, default to all three metrics for a tabbed comparison.
@@ -460,7 +487,7 @@ def main():
     gsea_kwargs = dict(
         gene_sets=gene_sets, organism=organism, sources=sources,
         permutations=permutations, min_size=min_size, max_size=max_size,
-        seed=seed, fdr_threshold=fdr_threshold, max_process=parameters['max_process'],
+        seed=seed, fdr_threshold=fdr_threshold,
     )
 
     # ------------------------------------------------------------------ #
@@ -485,17 +512,12 @@ def main():
             results_dir_m = os.path.join(outdir, "enrichment%s" % sfx)
             plots_dir_m   = os.path.join(outdir, "plots%s" % sfx)
             gsea_input    = _normalise_anchor2mean(raw_anchor2mean, m, tables_dir)
-            gsea_kwargs_m = {
-                **gsea_kwargs,
-                **({"weight": 0} if m in ("identity", "rank") else {})
-            }
-            completed_dir = os.path.join(outdir, ".completed")
 
             logger.info("Step 6 [%s]: Enrichment analysis", m)
-            if replot or not _skip(resume, completed_dir, results_dir_m, "enrichment", f"enrichment_{m}"):
+            if replot or not _step_complete(results_dir_m,
+                                            ["gseapy.gene_set.prerank.report.csv"]):
                 run_gsea(anchor2mean_path=gsea_input,
-                         results_dir=results_dir_m, **gsea_kwargs_m)
-                _mark_complete(completed_dir, f"enrichment_{m}")
+                         results_dir=results_dir_m, **gsea_kwargs)
             else:
                 logger.info("Skipping GSEA for metric '%s' (output exists).", m)
 
@@ -578,37 +600,34 @@ def main():
         )
 
         metric_outputs = {}
-        completed_dir = os.path.join(outdir, ".completed")
 
         for m in metrics_to_run:
             sfx           = ("_%s" % m) if all_metrics else ""
             diff_dir_m    = os.path.join(outdir, "differential%s" % sfx)
             results_dir_m = os.path.join(diff_dir_m, "enrichment")
             plots_dir_m   = os.path.join(diff_dir_m, "plots")
-            gsea_kwargs_m = {
-                **gsea_kwargs
-            }
 
             logger.info("--- Computing differential scores [metric=%s] ---", m)
-            if replot or not _skip(resume, completed_dir, diff_dir_m, "differential", f"differential{m}"):
+            if replot or not _step_complete(diff_dir_m,
+                                            ["anchor2mean.tsv",
+                                             "differential_scores.tsv"]):
                 compute_differential(
                     tables_dir1=tables_dir1,
                     tables_dir2=tables_dir2,
                     diff_dir=diff_dir_m,
                     metric=m,
                 )
-                _mark_complete(completed_dir, f"differential_{m}")
             else:
                 logger.info("Skipping differential ranking for '%s' (output exists).", m)
 
             logger.info("Step 6 [%s]: Enrichment analysis (differential)", m)
-            if replot or not _skip(resume, completed_dir, results_dir_m, "enrichment", f"enrichment_{m}"):
+            if replot or not _step_complete(results_dir_m,
+                                            ["gseapy.gene_set.prerank.report.csv"]):
                 run_gsea(
                     anchor2mean_path=os.path.join(diff_dir_m, "anchor2mean.tsv"),
                     results_dir=results_dir_m,
-                    **gsea_kwargs_m,
+                    **gsea_kwargs,
                 )
-                _mark_complete(completed_dir, f"enrichment_{m}")
             else:
                 logger.info("Skipping GSEA for metric '%s' (output exists).", m)
 

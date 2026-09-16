@@ -79,6 +79,48 @@ def _trimal_worker(args: tuple) -> None:
         )
 
 
+def _trimal_columns_worker(args: tuple) -> None:
+    input_seq, output_seq, trimal_path, trim_args = args
+    cmd = [trimal_path, "-in", input_seq, "-out", output_seq] + list(trim_args)
+    try:
+        subprocess.run(cmd, stderr=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError as e:
+        raise EnhydraToolError(
+            "trimal column trimming failed on %s:\n%s"
+            % (input_seq, e.stderr.decode())
+        )
+
+
+def run_trimal_columns(
+    alignment_dir: str,
+    trimmed_dir: str,
+    trimal_path: str,
+    trim_args: list[str],
+    n_proc: int = 1,
+    show_progress: bool = False,
+):
+    """Trim alignment columns with trimAl before identity estimation.
+
+    Args:
+        alignment_dir: Directory of (untrimmed) alignment files.
+        trimmed_dir:   Directory where column-trimmed alignments are written.
+        trimal_path:   Path to the trimAl executable.
+        trim_args:     trimAl CLI flags controlling the trimming mode, as
+                       returned by utils.resolve_trim_args() — e.g.
+                       ['-gt', '0.5'], ['-strict'], ['-strictplus'], or
+                       ['-automated1'].
+        n_proc:        Number of parallel worker processes.
+        show_progress: Show a tqdm progress bar.
+    """
+    os.makedirs(trimmed_dir, exist_ok=True)
+    args_list = [
+        (os.path.join(alignment_dir, f),
+         os.path.join(trimmed_dir, f),
+         trimal_path, trim_args)
+        for f in os.listdir(alignment_dir)
+    ]
+    _run_pool(_trimal_columns_worker, args_list, n_proc, show_progress)
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------

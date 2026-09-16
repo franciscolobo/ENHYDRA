@@ -64,7 +64,8 @@ h2 {{ margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
 .plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
 .plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
 tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
-a.go-link {{ color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
+a.go-link, a.geneset-link, a.leadedge-link {{
+    color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
 .col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
             font-size: 10px; text-align: center; border-radius: 50%;
             background: #aaa; color: white; cursor: help; margin-left: 3px;
@@ -92,6 +93,11 @@ thead tr.filter-row th {{ padding: 4px 8px; }}
 #modal-title {{ font-size: 1.1em; font-weight: bold; color: #1a3a5c;
                 margin-bottom: 12px; }}
 #modal-img {{ width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
+#modal-text {{ display: none; max-height: 420px; overflow-y: auto;
+               text-align: left; white-space: pre-wrap; word-break: break-word;
+               font-family: 'Courier New', monospace; font-size: 12px;
+               background: #f7f7f7; border: 1px solid #e0e0e0;
+               border-radius: 4px; padding: 10px 14px; margin: 0; }}
 #modal-close {{ position: absolute; top: 12px; right: 16px; font-size: 1.4em;
                 cursor: pointer; color: #555; background: none; border: none; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
@@ -108,6 +114,7 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
     <button id="modal-close" title="Close">&times;</button>
     <div id="modal-title"></div>
     <img id="modal-img" src="" alt="Enrichment plot"/>
+    <pre id="modal-text"></pre>
   </div>
 </div>
 <main>
@@ -120,7 +127,8 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 <section>
   <h2>Enrichment results</h2>
   <p>Significant gene sets are highlighted in blue.
-     Click a GO ID to view its enrichment plot.
+     Click a GO ID to view its enrichment plot, or "View" under
+     Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the gene lists as text.
      Use the filter boxes below each column header to filter by that column.</p>
 {table_html}
 </section>
@@ -130,6 +138,7 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 <script>{dt_js}</script>
 <script>
 {plot_data_js}
+{gene_data_js}
 $(document).ready(function() {{
     var tip = document.getElementById('svg-tooltip');
     document.querySelectorAll('[data-tip]').forEach(function(el) {{
@@ -184,15 +193,35 @@ $(document).ready(function() {{
             table.draw();
         }});
     }});
+    function showImageModal(title, uri) {{
+        $('#modal-title').text(title);
+        $('#modal-text').hide();
+        $('#modal-img').attr('src', uri).show();
+        $('#modal-overlay').addClass('active');
+    }}
+    function showTextModal(title, text) {{
+        $('#modal-title').text(title);
+        $('#modal-img').hide();
+        $('#modal-text').text(text).show();
+        $('#modal-overlay').addClass('active');
+    }}
     $(document).on('click', '.go-link', function(e) {{
         e.preventDefault();
         var goId = $(this).data('goid');
         var uri  = enrichmentPlots[goId];
-        if (uri) {{
-            $('#modal-title').text(goId);
-            $('#modal-img').attr('src', uri);
-            $('#modal-overlay').addClass('active');
-        }}
+        if (uri) showImageModal(goId, uri);
+    }});
+    $(document).on('click', '.geneset-link', function(e) {{
+        e.preventDefault();
+        var goId = $(this).data('goid');
+        var text = fullGeneSets[goId];
+        if (text !== undefined) showTextModal(goId + ' \u2014 full gene set', text);
+    }});
+    $(document).on('click', '.leadedge-link', function(e) {{
+        e.preventDefault();
+        var goId = $(this).data('goid');
+        var text = leadingEdge[goId];
+        if (text !== undefined) showTextModal(goId + ' \u2014 leading edge genes', text);
     }});
     $('#modal-close, #modal-overlay').on('click', function(e) {{
         if (e.target === this) $('#modal-overlay').removeClass('active');
@@ -241,7 +270,8 @@ h3 {{ color: #2c5282; margin: 24px 0 12px; }}
 .plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
 .plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
 tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
-a.go-link {{ color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
+a.go-link, a.geneset-link, a.leadedge-link {{
+    color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
 .col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
             font-size: 10px; text-align: center; border-radius: 50%;
             background: #aaa; color: white; cursor: help; margin-left: 3px;
@@ -269,6 +299,11 @@ thead tr.filter-row th {{ padding: 4px 8px; }}
 #modal-title {{ font-size: 1.1em; font-weight: bold; color: #1a3a5c;
                 margin-bottom: 12px; }}
 #modal-img {{ width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
+#modal-text {{ display: none; max-height: 420px; overflow-y: auto;
+               text-align: left; white-space: pre-wrap; word-break: break-word;
+               font-family: 'Courier New', monospace; font-size: 12px;
+               background: #f7f7f7; border: 1px solid #e0e0e0;
+               border-radius: 4px; padding: 10px 14px; margin: 0; }}
 #modal-close {{ position: absolute; top: 12px; right: 16px; font-size: 1.4em;
                 cursor: pointer; color: #555; background: none; border: none; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
@@ -285,6 +320,7 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
     <button id="modal-close" title="Close">&times;</button>
     <div id="modal-title"></div>
     <img id="modal-img" src="" alt="Enrichment plot"/>
+    <pre id="modal-text"></pre>
   </div>
 </div>
 <main>
@@ -301,6 +337,8 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 <script>{dt_js}</script>
 <script>
 var enrichmentPlotsMap = {enrichment_plots_map};
+var fullGeneSets       = {full_gene_sets_js};
+var leadingEdgeMap     = {leading_edge_map_js};
 var numericColsMap     = {numeric_cols_map};
 var dtInstances        = {{}};
 var colFiltersMap      = {{}};
@@ -355,6 +393,18 @@ function initTable(metric) {{
     }});
     dtInstances[metric] = dt;
 }}
+function showImageModal(title, uri) {{
+    $('#modal-title').text(title);
+    $('#modal-text').hide();
+    $('#modal-img').attr('src', uri).show();
+    $('#modal-overlay').addClass('active');
+}}
+function showTextModal(title, text) {{
+    $('#modal-title').text(title);
+    $('#modal-img').hide();
+    $('#modal-text').text(text).show();
+    $('#modal-overlay').addClass('active');
+}}
 $(document).ready(function() {{
     var svgTip = document.getElementById('svg-tooltip');
     document.querySelectorAll('[data-tip]').forEach(function(el) {{
@@ -384,12 +434,24 @@ $(document).ready(function() {{
         e.preventDefault();
         var goId   = $(this).data('goid');
         var metric = $(this).data('metric');
-        var plots  = metric ? enrichmentPlotsMap[metric] : enrichmentPlots;
+        var plots  = metric ? enrichmentPlotsMap[metric] : undefined;
         var uri    = plots ? plots[goId] : undefined;
-        if (uri) {{
-            $('#modal-title').text(goId);
-            $('#modal-img').attr('src', uri);
-            $('#modal-overlay').addClass('active');
+        if (uri) showImageModal(goId, uri);
+    }});
+    $(document).on('click', '.geneset-link', function(e) {{
+        e.preventDefault();
+        var goId = $(this).data('goid');
+        var text = fullGeneSets[goId];
+        if (text !== undefined) showTextModal(goId + ' \u2014 full gene set', text);
+    }});
+    $(document).on('click', '.leadedge-link', function(e) {{
+        e.preventDefault();
+        var goId   = $(this).data('goid');
+        var metric = $(this).data('metric');
+        var map    = metric ? leadingEdgeMap[metric] : undefined;
+        var text   = map ? map[goId] : undefined;
+        if (text !== undefined) {{
+            showTextModal(goId + ' \u2014 leading edge genes (' + metric + ')', text);
         }}
     }});
     $('#modal-close, #modal-overlay').on('click', function(e) {{
@@ -417,6 +479,23 @@ def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
             if len(fields) >= 2 and fields[0] and fields[1]:
                 names[fields[0]] = fields[1]
     return names
+
+
+def _gmt_gene_sets(gmt_path: str | None) -> dict[str, list[str]]:
+    """Return term_id -> full list of member gene IDs, read from a GMT file.
+
+    Used to power the "Full gene set" link column: the complete membership
+    of each gene set, independent of ranking metric.
+    """
+    if not gmt_path or not os.path.isfile(gmt_path):
+        return {}
+    sets: dict[str, list[str]] = {}
+    with open(gmt_path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) >= 3 and fields[0]:
+                sets[fields[0]] = [g for g in fields[2:] if g]
+    return sets
 
 
 def _find_gmt_in_dir(directory: str) -> str | None:
@@ -687,6 +766,16 @@ def _augment_with_per_term_scores(
     return df
 
 
+_LEAD_GENES_COL_ALIASES = ("lead_genes", "lead genes", "leading_edge_genes")
+
+
+def _find_lead_genes_col(df: pd.DataFrame) -> str | None:
+    for c in df.columns:
+        if c.strip().lower() in _LEAD_GENES_COL_ALIASES:
+            return c
+    return None
+
+
 def _results_table_html(
     df: pd.DataFrame,
     obo_names: dict[str, str],
@@ -695,11 +784,25 @@ def _results_table_html(
     metric: str | None = None,
     col1_label: str = "List 1",
     col2_label: str = "List 2",
-) -> tuple[str, list[int]]:
+    gene_sets: dict[str, list[str]] | None = None,
+) -> tuple[str, list[int], dict[str, str], dict[str, str]]:
+    """Build the results table HTML.
+
+    In addition to the rendered table, this returns two lookup dicts used
+    to power the "Full gene set" and "Leading edge" link columns:
+      - full_sets_js: GO ID -> newline-joined full gene set membership
+                      (from the GMT; identical regardless of metric).
+      - leadedge_js:  GO ID -> newline-joined leading-edge gene list for
+                      this specific ranking metric (from GSEApy's own
+                      Lead_genes column).
+    Neither gene list is written into the table cell itself — only a
+    "View (N)" link is, and the actual text is injected into the page as a
+    small JS lookup object, shown in a modal on click.
+    """
     df = df.copy()
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
-        return "<p>No results to display.</p>", []
+        return "<p>No results to display.</p>", [], {}, {}
 
     df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
 
@@ -714,6 +817,32 @@ def _results_table_html(
     df["Significant"] = df["FDR q-val"].apply(
         lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
+
+    # --- Full gene set / leading edge link columns --------------------
+    full_sets_js: dict[str, str] = {}
+    leadedge_js:  dict[str, str] = {}
+
+    if gene_sets:
+        def _full_set_cell(term_id):
+            genes = gene_sets.get(term_id)
+            if not genes:
+                return ""
+            full_sets_js[term_id] = "\n".join(genes)
+            return "View (%d)" % len(genes)
+        df["Full gene set"] = df["Term"].apply(_full_set_cell)
+
+    lead_col = _find_lead_genes_col(df)
+    if lead_col:
+        def _leadedge_cell(row):
+            raw = row[lead_col]
+            if pd.isna(raw) or not str(raw).strip():
+                return ""
+            genes = [g.strip() for g in str(raw).split(";") if g.strip()]
+            if not genes:
+                return ""
+            leadedge_js[row["Term"]] = "\n".join(genes)
+            return "View (%d)" % len(genes)
+        df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
 
     diff_label = "%s \u2212 %s" % (col1_label, col2_label)
     col_defs = [
@@ -739,6 +868,11 @@ def _results_table_html(
          "Fraction of gene set genes in the leading edge (0-1)."),
         ("Gene %",       "Gene %",
          "Fraction of all ranked genes in the leading edge (0-1)."),
+        ("Full gene set", "Full gene set",
+         "All genes annotated to this gene set. Click to view as a text list."),
+        ("Leading edge", "Leading edge",
+         "Genes from this set found in the leading edge of the ranked list "
+         "(i.e. driving the enrichment score). Click to view as a text list."),
         ("Significant",  "Sig.",
          "Significant at FDR < %.2f." % fdr_threshold),
     ]
@@ -776,6 +910,16 @@ def _results_table_html(
                     '<td><a href="#" class="go-link" data-goid="%s"%s>%s</a></td>'
                     % (go_id, metric_attr, val)
                 )
+            elif col == "Full gene set" and val:
+                cells += (
+                    '<td><a href="#" class="geneset-link" data-goid="%s">%s</a></td>'
+                    % (go_id, val)
+                )
+            elif col == "Leading edge" and val:
+                cells += (
+                    '<td><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
+                    % (go_id, metric_attr, val)
+                )
             else:
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
@@ -786,7 +930,7 @@ def _results_table_html(
         "<tbody>%s</tbody></table>"
     ) % (table_id, header_cells, filter_cells, rows)
 
-    return html, numeric_col_indices
+    return html, numeric_col_indices, full_sets_js, leadedge_js
 
 
 def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
@@ -833,6 +977,7 @@ def build_report(
     logger.info("Building HTML report...")
     effective_gmt = gmt_path or _find_gmt_in_dir(results_dir)
     term_names    = _resolve_term_names(results_dir, obo_path, effective_gmt)
+    gene_sets     = _gmt_gene_sets(effective_gmt)
     df = _load_gsea_results(results_dir)
     if df is None:
         logger.warning("Cannot build report: no GSEA results found.")
@@ -868,14 +1013,23 @@ def build_report(
         ]
         title = "ENHYDRA Differential Enrichment Report"
     plots_html = _plot_section(plots_dir, plot_names)
-    table_html, numeric_col_indices = _results_table_html(
+    table_html, numeric_col_indices, full_sets_js, leadedge_js = _results_table_html(
         df, term_names, plot_index, fdr_threshold,
         metric=None, col1_label=label1, col2_label=label2,
+        gene_sets=gene_sets,
+    )
+    # Full gene sets are metric-independent (straight from the GMT); leading
+    # edge genes are specific to this metric's ranking. Both are injected as
+    # plain JS lookup objects — never written directly into table cells —
+    # so the table stays small even when gene sets contain hundreds of genes.
+    gene_data_js = "var fullGeneSets = %s;\nvar leadingEdge = %s;" % (
+        json.dumps(full_sets_js), json.dumps(leadedge_js)
     )
     html = _TEMPLATE.format(
         title=title, dt_css=dt_css, plots_html=plots_html,
         table_html=table_html, jquery_js=jquery_js, dt_js=dt_js,
-        plot_data_js=plot_data_js, numeric_col_indices=numeric_col_indices,
+        plot_data_js=plot_data_js, gene_data_js=gene_data_js,
+        numeric_col_indices=numeric_col_indices,
     )
     with open(report_path, "w", encoding="utf-8") as fh:
         fh.write(html)
@@ -902,6 +1056,7 @@ def build_multi_metric_report(
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
     effective_gmt = gmt_path or _find_gmt_in_dir(first_results)
     term_names    = _resolve_term_names(first_results, obo_path, effective_gmt)
+    gene_sets_all = _gmt_gene_sets(effective_gmt)
     cache_dir = os.path.dirname(obo_path) if obo_path else None
     jquery_js = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
     dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
@@ -929,6 +1084,12 @@ def build_multi_metric_report(
     tab_panels_parts     = []
     enrichment_plots_map = {}
     numeric_cols_map     = {}
+    # Full gene set membership is the same across metrics (same GMT), so it
+    # is accumulated into one flat lookup shared by all tabs. Leading edge
+    # genes differ per metric (different ranking -> different leading edge),
+    # so that lookup stays keyed by metric, mirroring enrichment_plots_map.
+    full_gene_sets_accum: dict[str, str] = {}
+    leading_edge_map: dict[str, dict[str, str]] = {}
     first = True
     for metric, paths in metric_data.items():
         label       = METRIC_LABELS.get(metric, metric.capitalize())
@@ -947,14 +1108,18 @@ def build_multi_metric_report(
             df = _augment_with_per_term_scores(
                 df, effective_gmt, tables_dir1, tables_dir2, metric
             )
-            tbl_html, num_cols = _results_table_html(
+            tbl_html, num_cols, full_sets_js, leadedge_js = _results_table_html(
                 df, term_names, plot_idx, fdr_threshold,
                 metric=metric, col1_label=label1, col2_label=label2,
+                gene_sets=gene_sets_all,
             )
             numeric_cols_map[metric] = num_cols
+            full_gene_sets_accum.update(full_sets_js)
+            leading_edge_map[metric] = leadedge_js
         else:
             tbl_html = "<p>No GSEA results found for this metric.</p>"
             numeric_cols_map[metric] = []
+            leading_edge_map[metric] = {}
         plots_html = _plot_section(plots_dir, plot_names)
         desc       = _METRIC_DESCS.get(metric, "")
         tab_panels_parts.append(
@@ -964,7 +1129,9 @@ def build_multi_metric_report(
             '  <div class="plot-grid">{plots}</div>\n'
             '  <h3>Enrichment results</h3>\n'
             '  <p>Significant gene sets (FDR&nbsp;&lt;&nbsp;{fdr}) highlighted '
-            'in blue. Click a GO ID to view its enrichment plot.</p>\n'
+            'in blue. Click a GO ID to view its enrichment plot, or "View" '
+            'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the '
+            'gene lists as text.</p>\n'
             '  {tbl}\n'
             '</div>\n'.format(
                 m=metric, ac=active_cls, desc=desc,
@@ -978,6 +1145,8 @@ def build_multi_metric_report(
         tab_panels="\n".join(tab_panels_parts),
         jquery_js=jquery_js, dt_js=dt_js,
         enrichment_plots_map=json.dumps(enrichment_plots_map),
+        full_gene_sets_js=json.dumps(full_gene_sets_accum),
+        leading_edge_map_js=json.dumps(leading_edge_map),
         numeric_cols_map=json.dumps(numeric_cols_map),
     )
     with open(report_path, "w", encoding="utf-8") as fh:
