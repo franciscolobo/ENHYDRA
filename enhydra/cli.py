@@ -17,8 +17,8 @@ from .orthofinder import preprocess_orthofinder
 from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
-from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 from .stats import aggregate_pipeline_stats, compute_differential_stats
+from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 ALL_METRICS = ("identity", "zscore", "rank")
 
@@ -145,6 +145,7 @@ def _run_single_list(
     label: str = "",
     exclude_from_identity: set[str] | None = None,
     trim_args: list[str] | None = None,
+    require_anchor_in_tables: bool | None = None,
 ) -> tuple[str, dict]:
     logger = logging.getLogger(__name__)
 
@@ -167,6 +168,24 @@ def _run_single_list(
     trimmed_dir       = os.path.join(listdir, "alignment_trimmed")
     ident_dir         = os.path.join(listdir, "ident_alignment")
     tables_dir        = os.path.join(listdir, "tables")
+
+    # These two flags answer genuinely different questions and must not be
+    # conflated: 'require_anchor' controls whether filter_groups() *drops*
+    # groups lacking the anchor sequence entirely (correctly False for both
+    # lists in two-list mode, since most groups won't contain the anchor's
+    # own species). 'require_anchor_in_tables' controls whether make_tables()
+    # *flags* a missing anchor as an anomaly worth recording in
+    # tables/drop_reasons.tsv. For list1 specifically, a group reaching the
+    # tables step without an anchor sequence IS worth flagging even though
+    # it wasn't dropped upstream — that group will later be silently
+    # excluded from anchor2mean.tsv/group2anchor.tsv, and list1's
+    # group2anchor.tsv is exactly what compute_differential() reads to map
+    # groups to anchor gene IDs. For list2, the same absence is fully
+    # expected (list2 never contains the anchor's own species) and should
+    # stay silent. Defaulting to require_anchor when not given preserves
+    # single-list mode's existing behaviour unchanged.
+    if require_anchor_in_tables is None:
+        require_anchor_in_tables = require_anchor
 
     os.makedirs(listdir, exist_ok=True)
     n_steps = (5 + (species is not None) + bool(exclude_from_identity)
@@ -207,10 +226,19 @@ def _run_single_list(
             finally:
                 pool.terminate()
                 pool.join()
-            aggregate_length_filter_stats(
-                length_stats_dir=length_stats_dir,
-                length_filter_stats_dir=os.path.join(listdir, "length_filter_stats"),
-            )
+        # Runs unconditionally, whether or not the filtering above was just
+        # skipped via --resume. This is deliberate: aggregation is a cheap,
+        # idempotent read of whatever per-group '_lengthstats' files already
+        # exist in length_stats_dir — it is not tied to whether filtering
+        # happened in *this* invocation. Nesting it inside the `if not
+        # _skip(...)` block would silently produce empty/stale summary
+        # files on any run that resumes past an already-completed length
+        # filter step, even though the underlying per-group stats files are
+        # present and complete on disk.
+        aggregate_length_filter_stats(
+            length_stats_dir=length_stats_dir,
+            length_filter_stats_dir=os.path.join(listdir, "length_filter_stats"),
+        )
         sbar.update(1)
 
         sbar.set_description(_desc("group filter"))
@@ -297,7 +325,7 @@ def _run_single_list(
                 ident_dir=ident_dir,
                 tables_dir=tables_dir,
                 anchor=anchor,
-                require_anchor=require_anchor,
+                require_anchor=require_anchor_in_tables,
                 show_progress=show_progress,
             )
         sbar.update(1)
@@ -597,9 +625,11 @@ def main():
             anchor=anchor, require_anchor=False,
             species=species1, label=list1_name,
             exclude_from_identity={anchor} if anchor_injected else None,
+            require_anchor_in_tables=True,
             **common_kwargs,
         )
-        aggregate_pipeline_stats(os.path.join(outdir, "list1"), n_input=stats1["n_input"])
+        aggregate_pipeline_stats(os.path.join(outdir, "list1"),
+                                 n_input=stats1["n_input"])
 
         logger.info("--- Processing %s ---", list2_name)
         tables_dir2, stats2 = _run_single_list(
@@ -608,16 +638,13 @@ def main():
             species=species2, label=list2_name,
             **common_kwargs,
         )
-        aggregate_pipeline_stats(os.path.join(outdir, "list2"), n_input=stats2["n_input"])
-
-        logger.info("--- Aggregating filtering stats  ---")
-        
+        aggregate_pipeline_stats(os.path.join(outdir, "list2"),
+                                 n_input=stats2["n_input"])
         compute_differential_stats(
             tables_dir1, tables_dir2,
             list1_name=list1_name, list2_name=list2_name,
             output_path=os.path.join(outdir, "differential_stats.json"),
         )
-
 
         metric_outputs = {}
 
