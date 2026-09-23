@@ -9,6 +9,7 @@ from enhydra.filtering import (
     filter_groups,
     subset_groups,
     strip_species_from_alignments,
+    aggregate_length_filter_stats
 )
 
 
@@ -268,3 +269,104 @@ class TestStripSpeciesFromAlignments:
         _write_fasta(str(aln / "OG0001.aln"), [("anchor|g1", "ACGT")])
         strip_species_from_alignments(str(aln), str(out), exclude={"anchor"})
         assert not (out / "OG0001.aln").exists()
+
+
+# ---------------------------------------------------------------------------
+# test_filter_length_stats
+# ---------------------------------------------------------------------------
+
+class TestFilterLengthStats:
+
+    def _read_tsv(self, path):
+        with open(path) as fh:
+            lines = [l.rstrip("\n").split("\t") for l in fh if l.strip()]
+        return lines[0], lines[1:]
+
+    def test_skipped_group_writes_lengthstats_marker(self, tmp_path):
+        src = tmp_path / "input" / "OG0001"
+        src.parent.mkdir()
+        _write_fasta(str(src), [("sp1|g1", "A" * 100)])   # single sequence
+        stats_dir  = tmp_path / "stats"
+        filter_dir = tmp_path / "filter"
+        stats_dir.mkdir(); filter_dir.mkdir()
+
+        filter_length(str(src), str(stats_dir), str(filter_dir))
+
+        content = (stats_dir / "OG0001_lengthstats").read_text()
+        assert content.startswith("##GroupSkipped")
+        assert "reason\tsingle_sequence" in content
+
+    def test_empty_file_writes_lengthstats_marker(self, tmp_path):
+        src = tmp_path / "input" / "OG0002"
+        src.parent.mkdir()
+        src.touch()
+        stats_dir  = tmp_path / "stats"
+        filter_dir = tmp_path / "filter"
+        stats_dir.mkdir(); filter_dir.mkdir()
+
+        filter_length(str(src), str(stats_dir), str(filter_dir))
+
+        content = (stats_dir / "OG0002_lengthstats").read_text()
+        assert content.startswith("##GroupSkipped")
+        assert "reason\tempty_file" in content
+
+    def test_lengthstats_marks_outlier_status(self, tmp_path):
+        src = tmp_path / "input" / "OG0003"
+        src.parent.mkdir()
+        entries = [("sp%d|g%d" % (i, i), "A" * 100) for i in range(10)]
+        entries.append(("sp99|g99", "A" * 400))
+        _write_fasta(str(src), entries)
+        stats_dir  = tmp_path / "stats"
+        filter_dir = tmp_path / "filter"
+        stats_dir.mkdir(); filter_dir.mkdir()
+
+        filter_length(str(src), str(stats_dir), str(filter_dir))
+
+        content = (stats_dir / "OG0003_lengthstats").read_text()
+        assert "sp99|g99\t400" in content
+        assert "removed_above_max" in content
+        assert content.count("\tkept\n") == 10
+
+    def test_aggregate_collects_skipped_and_outliers(self, tmp_path):
+        input_dir  = tmp_path / "input"
+        stats_dir  = tmp_path / "stats"
+        filter_dir = tmp_path / "filter"
+        agg_dir    = tmp_path / "length_filter_stats"
+        input_dir.mkdir(); stats_dir.mkdir(); filter_dir.mkdir()
+
+        # OG0001: single sequence -> skipped
+        _write_fasta(str(input_dir / "OG0001"), [("sp1|g1", "A" * 100)])
+        # OG0002: empty file -> skipped
+        (input_dir / "OG0002").touch()
+        # OG0003: has one outlier
+        entries = [("sp%d|g%d" % (i, i), "A" * 100) for i in range(10)]
+        entries.append(("sp99|g99", "A" * 400))
+        _write_fasta(str(input_dir / "OG0003"), entries)
+
+        for name in ("OG0001", "OG0002", "OG0003"):
+            filter_length(str(input_dir / name), str(stats_dir), str(filter_dir))
+
+        aggregate_length_filter_stats(str(stats_dir), str(agg_dir))
+
+        _, skipped_rows = self._read_tsv(agg_dir / "skipped_groups.tsv")
+        skipped = {r[0]: r[1] for r in skipped_rows}
+        assert skipped["OG0001"] == "single_sequence"
+        assert skipped["OG0002"] == "empty_file"
+
+        _, drop_rows = self._read_tsv(agg_dir / "drop_reasons.tsv")
+        assert len(drop_rows) == 1
+        assert drop_rows[0][0] == "OG0003"
+        assert drop_rows[0][1] == "sp99|g99"
+        assert drop_rows[0][4] == "removed_above_max"
+
+    def test_aggregate_with_no_stats_files_writes_empty_tables(self, tmp_path):
+        stats_dir = tmp_path / "stats"
+        agg_dir   = tmp_path / "length_filter_stats"
+        stats_dir.mkdir()
+
+        aggregate_length_filter_stats(str(stats_dir), str(agg_dir))
+
+        header1, rows1 = self._read_tsv(agg_dir / "skipped_groups.tsv")
+        header2, rows2 = self._read_tsv(agg_dir / "drop_reasons.tsv")
+        assert rows1 == [] and rows2 == []
+

@@ -64,6 +64,13 @@ def filter_length(
     Both output files are opened in write mode so that re-runs produce clean
     output rather than appending duplicate entries.
 
+    This function is normally called once per group from a multiprocessing
+    pool (see cli.py), so it cannot maintain a running cross-group summary
+    itself. Instead, every call — including groups skipped entirely — writes
+    a per-group '_lengthstats' file recording exactly what happened to that
+    group. Call aggregate_length_filter_stats() once after the pool
+    finishes to consolidate all of these into summary QC tables.
+
     Args:
         input_path:        Path to the input FASTA file.
         length_stats_dir:  Directory where per-group length stats are written.
@@ -71,12 +78,15 @@ def filter_length(
         sd_multiplier:     Number of SDs from the mean beyond which sequences
                            are removed (default: 2.0).
     """
-    if os.stat(input_path).st_size == 0:
-        return
-
     file           = os.path.basename(input_path)
     outfile_s_path = os.path.join(length_stats_dir, file + "_lengthstats")
     outfile_f_path = os.path.join(length_filter_dir, file + "_lengthfilter")
+
+    if os.stat(input_path).st_size == 0:
+        with open(outfile_s_path, "w") as outstats:
+            outstats.write("##GroupSkipped\n")
+            outstats.write("reason\tempty_file\n")
+        return
 
     lengths     = []
     length_data = {}
@@ -89,11 +99,18 @@ def filter_length(
         logger.warning(
             "Group %s has only 1 sequence before length filtering — skipping.", file
         )
+        with open(outfile_s_path, "w") as outstats:
+            outstats.write("##GroupSkipped\n")
+            outstats.write("reason\tsingle_sequence\n")
+            outstats.write("n_sequences\t%d\n" % len(lengths))
         return
 
     mean   = statistics.mean(lengths)
     median = statistics.median(lengths)
     stddev = statistics.stdev(lengths)   # safe: len >= 2
+
+    lower_bound = mean - sd_multiplier * stddev
+    upper_bound = mean + sd_multiplier * stddev
 
     sorted_idx = np.argsort(list(length_data.values()))
     keys, values = list(length_data.keys()), list(length_data.values())
@@ -104,21 +121,124 @@ def filter_length(
         outstats.write("Total seqs: %s\nAverage: %s\nMedian: %s\nSD: %s\n" % (
             len(lengths), mean, median, stddev))
         outstats.write("##Sequence lengths (sorted from smallest to largest)\n")
-        outstats.write("#SequenceID\tLength\tPercentageDifFromAvg\n")
+        outstats.write("#SequenceID\tLength\tPercentageDifFromAvg\tStatus\n")
         for key, value in length_data_sorted.items():
-            outstats.write("%s\t%s\t%s\n" % (key, value, value / mean))
+            if value < lower_bound:
+                status = "removed_below_min"
+            elif value > upper_bound:
+                status = "removed_above_max"
+            else:
+                status = "kept"
+            outstats.write("%s\t%s\t%s\t%s\n" % (key, value, value / mean, status))
 
     with open(outfile_f_path, "w") as outfile:
         for seq_record in SeqIO.parse(input_path, "fasta"):
             seq = seq_record.seq
-            if (len(seq) < mean - sd_multiplier * stddev) or \
-               (len(seq) > mean + sd_multiplier * stddev):
+            if (len(seq) < lower_bound) or (len(seq) > upper_bound):
                 logger.warning(
                     "Sequence %s in group %s removed by length filter",
                     seq_record.id, file
                 )
             else:
                 outfile.write(">%s\n%s\n" % (seq_record.id, seq))
+
+
+def aggregate_length_filter_stats(
+    length_stats_dir: str,
+    length_filter_stats_dir: str,
+) -> None:
+    """Consolidate per-group '_lengthstats' files into summary QC tables.
+
+    filter_length() runs once per group (typically via a multiprocessing
+    pool), so it cannot maintain a running summary across groups the way
+    filter_groups() does in its own single-threaded loop. Instead, each
+    filter_length() call records its own decisions in its per-group
+    '_lengthstats' file, and this function is called once afterward — from
+    the main process, after the pool has finished — to scan every
+    '_lengthstats' file and consolidate them into two summary tables, in
+    the same style as filter_groups()'s drop_reasons.tsv / species_counts.tsv:
+
+    - skipped_groups.tsv: one row per group skipped entirely before any
+      per-sequence filtering could run. reason is one of 'empty_file' or
+      'single_sequence'.
+    - drop_reasons.tsv: one row per individual sequence removed by the
+      length filter within an otherwise-processed group. reason is one of
+      'removed_below_min' or 'removed_above_max', alongside the sequence's
+      length and its percentage difference from the group's mean length.
+
+    Both files are opened in write mode, so re-running this function (e.g.
+    after --resume re-triggers length filtering) produces clean output
+    rather than appending duplicates.
+
+    Args:
+        length_stats_dir:        Directory of per-group '_lengthstats' files
+                                 (as written by filter_length()).
+        length_filter_stats_dir: Directory where the two consolidated
+                                 summary files are written.
+    """
+    os.makedirs(length_filter_stats_dir, exist_ok=True)
+
+    skipped_groups: list[tuple[str, str, str]] = []
+    drop_reasons:   list[tuple[str, str, str, str, str]] = []
+
+    suffix = "_lengthstats"
+    for filename in os.listdir(length_stats_dir):
+        if not filename.endswith(suffix):
+            continue
+        # Match the same group-id convention used elsewhere (e.g.
+        # filter_groups()'s drop_reasons.tsv) so IDs line up across stages.
+        group_name = filename[:-len(suffix)].split(".")[0]
+        path       = os.path.join(length_stats_dir, filename)
+
+        with open(path) as fh:
+            lines = [l.rstrip("\n") for l in fh]
+
+        if lines and lines[0] == "##GroupSkipped":
+            reason = ""
+            detail = ""
+            for line in lines[1:]:
+                if line.startswith("reason\t"):
+                    reason = line.split("\t", 1)[1]
+                elif line.startswith("n_sequences\t"):
+                    detail = "n_sequences=%s" % line.split("\t", 1)[1]
+            skipped_groups.append((group_name, reason, detail))
+            continue
+
+        # Otherwise: a processed group. Scan the per-sequence table for any
+        # rows whose Status is not 'kept'.
+        in_table = False
+        for line in lines:
+            if line.startswith("#SequenceID"):
+                in_table = True
+                continue
+            if not in_table or not line.strip():
+                continue
+            fields = line.split("\t")
+            if len(fields) < 4:
+                continue
+            seq_id, length, pct_diff, status = fields[0], fields[1], fields[2], fields[3]
+            if status != "kept":
+                drop_reasons.append((group_name, seq_id, length, pct_diff, status))
+
+    skipped_path = os.path.join(length_filter_stats_dir, "skipped_groups.tsv")
+    with open(skipped_path, "w") as fh:
+        fh.write("group_id\treason\tdetail\n")
+        for group_id, reason, detail in sorted(skipped_groups, key=lambda r: r[0]):
+            fh.write("%s\t%s\t%s\n" % (group_id, reason, detail))
+    logger.info(
+        "Length filter: %d group(s) skipped entirely. Path: %s",
+        len(skipped_groups), skipped_path,
+    )
+
+    drop_reasons_path = os.path.join(length_filter_stats_dir, "drop_reasons.tsv")
+    with open(drop_reasons_path, "w") as fh:
+        fh.write("group_id\tsequence_id\tlength\tpct_diff_from_avg\treason\n")
+        for row in sorted(drop_reasons, key=lambda r: (r[0], r[1])):
+            fh.write("%s\t%s\t%s\t%s\t%s\n" % row)
+    logger.info(
+        "Length filter: %d sequence(s) removed as outliers. Path: %s",
+        len(drop_reasons), drop_reasons_path,
+    )
 
 
 def _resolve_paralogs_longest(records: list) -> list:

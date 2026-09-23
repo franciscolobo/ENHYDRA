@@ -9,7 +9,7 @@ from tqdm import tqdm
 from .io import read_config_file, read_species_list, parse_obo_names
 from .utils import check_parameters, check_lists, resolve_trim_args
 from .filtering import filter_length, filter_groups, subset_groups, \
-    strip_species_from_alignments
+    strip_species_from_alignments, aggregate_length_filter_stats
 from .alignment import run_aligner, run_trimal, run_trimal_columns
 from .tables import make_tables
 from .gsea import run_gsea
@@ -206,6 +206,10 @@ def _run_single_list(
             finally:
                 pool.terminate()
                 pool.join()
+            aggregate_length_filter_stats(
+                length_stats_dir=length_stats_dir,
+                length_filter_stats_dir=os.path.join(listdir, "length_filter_stats"),
+            )
         sbar.update(1)
 
         sbar.set_description(_desc("group filter"))
