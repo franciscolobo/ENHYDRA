@@ -18,6 +18,7 @@ from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
+from .stats import aggregate_pipeline_stats, compute_differential_stats
 
 ALL_METRICS = ("identity", "zscore", "rank")
 
@@ -296,6 +297,7 @@ def _run_single_list(
                 ident_dir=ident_dir,
                 tables_dir=tables_dir,
                 anchor=anchor,
+                require_anchor=require_anchor,
                 show_progress=show_progress,
             )
         sbar.update(1)
@@ -509,6 +511,7 @@ def main():
             label="",
             **common_kwargs,
         )
+        aggregate_pipeline_stats(outdir, n_input=stats["n_input"])
 
         raw_anchor2mean = os.path.join(tables_dir, "anchor2mean.tsv")
         metric_outputs  = {}
@@ -596,6 +599,7 @@ def main():
             exclude_from_identity={anchor} if anchor_injected else None,
             **common_kwargs,
         )
+        aggregate_pipeline_stats(os.path.join(outdir, "list1"), n_input=stats1["n_input"])
 
         logger.info("--- Processing %s ---", list2_name)
         tables_dir2, stats2 = _run_single_list(
@@ -604,6 +608,16 @@ def main():
             species=species2, label=list2_name,
             **common_kwargs,
         )
+        aggregate_pipeline_stats(os.path.join(outdir, "list2"), n_input=stats2["n_input"])
+
+        logger.info("--- Aggregating filtering stats  ---")
+        
+        compute_differential_stats(
+            tables_dir1, tables_dir2,
+            list1_name=list1_name, list2_name=list2_name,
+            output_path=os.path.join(outdir, "differential_stats.json"),
+        )
+
 
         metric_outputs = {}
 

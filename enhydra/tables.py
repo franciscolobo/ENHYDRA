@@ -22,6 +22,7 @@ def make_tables(
     ident_dir: str,
     tables_dir: str,
     anchor: str,
+    require_anchor: bool = True,
     show_progress: bool = False,
 ):
     """Generate ranked output tables from alignments and identity reports.
@@ -39,17 +40,55 @@ def make_tables(
     group2mean without a matching entry in anchor2mean/group2anchor if the
     two directory listings were not perfectly aligned.
 
+    In addition to the three ranked tables, this also writes
+    'tables_dir/drop_reasons.tsv', recording every group excluded (fully or
+    partially) at this step, with columns group_id, reason, detail. Nothing
+    downstream reads tables_dir wholesale (gsea.py, differential.py, etc. all
+    reference the three named table files directly by name), so this file can
+    sit alongside them safely — unlike group_filter_dir, there's no risk of
+    it being picked up by a later step that lists the directory contents.
+    'reason' is one of:
+      - 'missing_identity'    : alignment exists but no matching .ident file.
+      - 'missing_alignment'   : .ident file exists but no matching alignment.
+      - 'no_average_identity' : .ident file has no parseable AverageIdentity
+                                line (trimAl may have failed silently).
+      - 'no_anchor_sequence'  : group has valid alignment + identity and
+                                contributes to group2mean.tsv, but has no
+                                anchor-species sequence, so it is absent
+                                from anchor2mean.tsv / group2anchor.tsv.
+                                This is the reason group2mean.tsv and
+                                anchor2mean.tsv row counts can diverge.
+                                Only recorded here when require_anchor=True
+                                (see below) — when the anchor is not expected
+                                to be present, this is not an anomaly and
+                                would otherwise flood the file with noise.
+    This file is opened in write mode, so re-running make_tables() (e.g.
+    under --resume) produces clean output rather than appending duplicates.
+
     Args:
-        alignment_dir: Directory of alignment files (.aln).
-        ident_dir:     Directory of trimAl identity report files (.aln.ident).
-        tables_dir:    Directory where output tables are written.
-        anchor:        Anchor species ID used to map group → gene ID.
-        show_progress: False is verbose, True shows progress bar only.
+        alignment_dir:  Directory of alignment files (.aln).
+        ident_dir:      Directory of trimAl identity report files (.aln.ident).
+        tables_dir:     Directory where output tables are written.
+        anchor:         Anchor species ID used to map group → gene ID.
+        require_anchor: Whether the anchor species is expected to be present
+                        in this list's alignments. In two-list differential
+                        mode, list2 is not expected to contain the anchor
+                        (it belongs to list1) — a missing anchor there is
+                        expected behaviour, not a drop, since the group
+                        still contributes to group2mean.tsv either way and
+                        list2's anchor2mean.tsv/group2anchor.tsv are never
+                        read downstream. When False, missing anchors are
+                        logged at debug level only and are not recorded in
+                        drop_reasons.tsv. Defaults to True (matches previous
+                        behaviour for single-list mode and list1).
+        show_progress:  False is verbose, True shows progress bar only.
     """
     os.makedirs(tables_dir, exist_ok=True)
 
     ident_files = os.listdir(ident_dir)
     aln_files   = set(os.listdir(alignment_dir))
+
+    drop_reasons: list[tuple[str, str, str]] = []
 
     # Pre-check: warn about alignment files that have no matching identity file.
     # These indicate groups where trimAl may have failed silently.
@@ -60,6 +99,10 @@ def make_tables(
                 "No identity file found for alignment '%s' — "
                 "trimAl may have failed silently on this group.", aln_file,
             )
+            drop_reasons.append((
+                aln_file.split(".")[0], "missing_identity",
+                "alignment=%s" % aln_file,
+            ))
 
     with open(os.path.join(tables_dir, "group2mean.tsv"),   "w") as group2mean, \
          open(os.path.join(tables_dir, "anchor2mean.tsv"),  "w") as anchor2mean, \
@@ -81,6 +124,10 @@ def make_tables(
                     "Alignment file not found for group '%s' (expected: %s) — "
                     "skipping group.", group_name, aln_path,
                 )
+                drop_reasons.append((
+                    group_name, "missing_alignment",
+                    "identity=%s" % ident_file,
+                ))
                 continue
 
             # Parse identity score from trimAl -sident output.
@@ -97,6 +144,9 @@ def make_tables(
                     "No AverageIdentity line found in '%s' — skipping group.",
                     ident_path,
                 )
+                drop_reasons.append((
+                    group_name, "no_average_identity", "",
+                ))
                 continue
 
             group2mean.write("%s\t%s\n" % (group_name, mean_percent))
@@ -115,8 +165,34 @@ def make_tables(
                     anchor_found = True
 
             if not anchor_found:
-                logger.warning(
-                    "No anchor sequence found in alignment for group '%s' — "
-                    "group contributes to group2mean but not anchor2mean or "
-                    "group2anchor.", group_name,
-                )
+                if require_anchor:
+                    logger.warning(
+                        "No anchor sequence found in alignment for group '%s' — "
+                        "group contributes to group2mean but not anchor2mean or "
+                        "group2anchor.", group_name,
+                    )
+                    drop_reasons.append((
+                        group_name, "no_anchor_sequence", "anchor=%s" % anchor,
+                    ))
+                else:
+                    # Expected: this list is not required to contain the
+                    # anchor species (e.g. list2 in two-list differential
+                    # mode). The group still contributes to group2mean.tsv
+                    # above; only anchor2mean/group2anchor are unaffected,
+                    # and neither of those is read from this list downstream.
+                    logger.debug(
+                        "No anchor sequence found in alignment for group '%s' "
+                        "(expected — anchor not required for this list).",
+                        group_name,
+                    )
+
+    drop_reasons_path = os.path.join(tables_dir, "drop_reasons.tsv")
+    with open(drop_reasons_path, "w") as fh:
+        fh.write("group_id\treason\tdetail\n")
+        for group_id, reason, detail in sorted(drop_reasons):
+            fh.write("%s\t%s\t%s\n" % (group_id, reason, detail))
+    logger.info(
+        "Tables step drop reasons written: %d entr%s. Path: %s",
+        len(drop_reasons), "y" if len(drop_reasons) == 1 else "ies",
+        drop_reasons_path,
+    )

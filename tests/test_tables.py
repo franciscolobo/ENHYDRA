@@ -231,3 +231,122 @@ class TestMakeTablesMismatch:
         assert g2m[0][0] == "OG0001"
         assert len(a2m) == 1
         assert a2m[0][0] == "gA"
+
+
+# ---------------------------------------------------------------------------
+# Reasons for dropping groups
+# ---------------------------------------------------------------------------
+
+class TestMakeTablesDropReasons:
+
+    def _read_tsv(self, path):
+        with open(path) as fh:
+            lines = [l.rstrip("\n").split("\t") for l in fh if l.strip()]
+        return lines[0], lines[1:]
+
+    def test_no_drops_writes_empty_table(self, tmp_path):
+        aln, ident, tbl = _setup(tmp_path, {
+            "OG0001": {"identity": 0.85,
+                       "sequences": [("sp1|g1", "ACGT"), ("anchor|gX", "ACGT")]},
+        })
+        make_tables(aln, ident, tbl, anchor="anchor")
+        header, rows = self._read_tsv(os.path.join(tbl, "drop_reasons.tsv"))
+        assert header == ["group_id", "reason", "detail"]
+        assert rows == []
+
+    def test_missing_alignment_recorded(self, tmp_path):
+        aln_dir   = str(tmp_path / "alignment")
+        ident_dir = str(tmp_path / "ident")
+        tbl_dir   = str(tmp_path / "tables")
+        os.makedirs(aln_dir)
+        os.makedirs(ident_dir)
+        _write_ident(os.path.join(ident_dir, "OG0001.aln.ident"), 0.85)
+
+        make_tables(aln_dir, ident_dir, tbl_dir, anchor="anchor")
+
+        _, rows = self._read_tsv(os.path.join(tbl_dir, "drop_reasons.tsv"))
+        assert len(rows) == 1
+        assert rows[0][0] == "OG0001"
+        assert rows[0][1] == "missing_alignment"
+        assert "identity=OG0001.aln.ident" in rows[0][2]
+
+    def test_missing_identity_recorded(self, tmp_path):
+        aln_dir   = str(tmp_path / "alignment")
+        ident_dir = str(tmp_path / "ident")
+        tbl_dir   = str(tmp_path / "tables")
+        os.makedirs(aln_dir)
+        os.makedirs(ident_dir)
+        _write_fasta(
+            os.path.join(aln_dir, "OG0001.aln"),
+            [("sp1|g1", "ACGT"), ("anchor|gX", "ACGT")],
+        )
+
+        make_tables(aln_dir, ident_dir, tbl_dir, anchor="anchor")
+
+        _, rows = self._read_tsv(os.path.join(tbl_dir, "drop_reasons.tsv"))
+        assert len(rows) == 1
+        assert rows[0][0] == "OG0001"
+        assert rows[0][1] == "missing_identity"
+        assert "alignment=OG0001.aln" in rows[0][2]
+
+    def test_no_anchor_sequence_recorded(self, tmp_path):
+        aln, ident, tbl = _setup(tmp_path, {
+            "OG0001": {"identity": 0.7,
+                       "sequences": [("sp1|g1", "ACGT"), ("sp2|g2", "ACGT")]},
+        })
+        make_tables(aln, ident, tbl, anchor="anchor")
+
+        _, rows = self._read_tsv(os.path.join(tbl, "drop_reasons.tsv"))
+        assert len(rows) == 1
+        assert rows[0][0] == "OG0001"
+        assert rows[0][1] == "no_anchor_sequence"
+        assert "anchor=anchor" in rows[0][2]
+        # Group still contributes to group2mean despite the missing anchor.
+        g2m_rows = _read_tsv(os.path.join(tbl, "group2mean.tsv"))
+        assert len(g2m_rows) == 1
+
+    def test_mixed_valid_and_dropped_groups(self, tmp_path):
+        aln_dir   = str(tmp_path / "alignment")
+        ident_dir = str(tmp_path / "ident")
+        tbl_dir   = str(tmp_path / "tables")
+        os.makedirs(aln_dir)
+        os.makedirs(ident_dir)
+
+        # OG0001: valid.
+        _write_fasta(os.path.join(aln_dir, "OG0001.aln"),
+                     [("sp1|g1", "ACGT"), ("anchor|gA", "ACGT")])
+        _write_ident(os.path.join(ident_dir, "OG0001.aln.ident"), 0.9)
+
+        # OG0002: missing alignment.
+        _write_ident(os.path.join(ident_dir, "OG0002.aln.ident"), 0.7)
+
+        # OG0003: no anchor sequence.
+        _write_fasta(os.path.join(aln_dir, "OG0003.aln"),
+                     [("sp1|g3", "ACGT"), ("sp2|g4", "ACGT")])
+        _write_ident(os.path.join(ident_dir, "OG0003.aln.ident"), 0.6)
+
+        make_tables(aln_dir, ident_dir, tbl_dir, anchor="anchor")
+
+        _, rows = self._read_tsv(os.path.join(tbl_dir, "drop_reasons.tsv"))
+        reasons = {r[0]: r[1] for r in rows}
+        assert reasons["OG0002"] == "missing_alignment"
+        assert reasons["OG0003"] == "no_anchor_sequence"
+        assert "OG0001" not in reasons
+
+
+def test_no_anchor_sequence_not_recorded_when_not_required(self, tmp_path):
+        """When require_anchor=False (e.g. list2 in two-list mode), a missing
+        anchor sequence is expected and must not appear in drop_reasons.tsv,
+        even though the group still correctly contributes to group2mean.tsv."""
+        aln, ident, tbl = _setup(tmp_path, {
+            "OG0001": {"identity": 0.7,
+                       "sequences": [("sp1|g1", "ACGT"), ("sp2|g2", "ACGT")]},
+        })
+        make_tables(aln, ident, tbl, anchor="anchor", require_anchor=False)
+
+        _, rows = self._read_tsv(os.path.join(tbl, "drop_reasons.tsv"))
+        assert rows == []
+        g2m_rows = _read_tsv(os.path.join(tbl, "group2mean.tsv"))
+        assert len(g2m_rows) == 1
+        a2m_rows = _read_tsv(os.path.join(tbl, "anchor2mean.tsv"))
+        assert a2m_rows == []

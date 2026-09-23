@@ -13,3 +13,4 @@ from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
+from .stats import aggregate_pipeline_stats, compute_differential_stats
