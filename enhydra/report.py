@@ -103,8 +103,15 @@ thead tr.filter-row th {{ padding: 4px 8px; }}
                 cursor: pointer; color: #555; background: none; border: none; }}
 .export-btn {{ padding: 8px 18px; border: none; border-radius: 4px;
                background: #1a3a5c; color: white; font-size: 13px;
-               font-weight: 600; cursor: pointer; margin-bottom: 14px; }}
+               font-weight: 600; cursor: pointer; margin-bottom: 14px;
+               margin-right: 8px; }}
 .export-btn:hover {{ background: #12293f; }}
+.sig-toggle-btn {{ padding: 8px 18px; border: 2px solid #1a3a5c; border-radius: 4px;
+                    background: white; color: #1a3a5c; font-size: 13px;
+                    font-weight: 600; cursor: pointer; margin-bottom: 14px;
+                    margin-right: 8px; }}
+.sig-toggle-btn:hover {{ background: #f0f5fa; }}
+.sig-toggle-btn.active {{ background: #1a3a5c; color: white; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </style>
 </head>
@@ -136,6 +143,7 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
      Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the gene lists as text.
      Use the filter boxes below each column header to filter by that column.</p>
   <p>
+    <button id="sig-toggle-btn" class="sig-toggle-btn">Show only significant</button>
     <button id="export-xlsx-btn" class="export-btn">&#8681; Export table to Excel (.xlsx)</button>
     <button id="export-xlsx-all-btn" class="export-btn">&#8681; Export all rows (ignore filters)</button>
   </p>
@@ -149,6 +157,16 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 <script>
 {plot_data_js}
 {gene_data_js}
+
+function getHeaderIndex(tableSelector, name) {{
+    var headers = [];
+    $(tableSelector).find('thead tr').first().find('th').each(function() {{
+        var $clone = $(this).clone();
+        $clone.find('.col-tip').remove();
+        headers.push($clone.text().trim());
+    }});
+    return headers.indexOf(name);
+}}
 
 function tableToXLSX(tableSelector, numericCols, fullGeneSetsMap, leadEdgeMap, filename, onlyFiltered) {{
     var $table = $(tableSelector);
@@ -210,7 +228,12 @@ $(document).ready(function() {{
     }});
     var numericCols = {numeric_col_indices};
     var colFilters  = {{}};
+    var sigOnly     = false;
+    var sigColIndex = null;
     $.fn.dataTable.ext.search.push(function(settings, data) {{
+        if (sigOnly && sigColIndex !== null && data[sigColIndex] !== '\u2713') {{
+            return false;
+        }}
         for (var i in colFilters) {{
             var f = colFilters[i];
             if (f.text !== undefined) {{
@@ -232,6 +255,7 @@ $(document).ready(function() {{
         pageLength: 25, orderCellsTop: true, order: [[4, 'asc']],
         columnDefs: [{{ targets: numericCols, type: 'num' }}]
     }});
+    sigColIndex = getHeaderIndex('#results-table', 'Sig.');
     $('#results-table thead tr.filter-row th').each(function(i) {{
         var isNumeric   = numericCols.indexOf(i) !== -1;
         var placeholder = isNumeric ? "e.g. < 0.05" : "Filter...";
@@ -250,6 +274,12 @@ $(document).ready(function() {{
             }}
             table.draw();
         }});
+    }});
+    $('#sig-toggle-btn').on('click', function() {{
+        sigOnly = !sigOnly;
+        $(this).toggleClass('active', sigOnly);
+        $(this).text(sigOnly ? 'Showing significant only \u2713' : 'Show only significant');
+        table.draw();
     }});
     function showImageModal(title, uri) {{
         $('#modal-title').text(title);
@@ -374,8 +404,15 @@ thead tr.filter-row th {{ padding: 4px 8px; }}
                 cursor: pointer; color: #555; background: none; border: none; }}
 .export-btn {{ padding: 8px 18px; border: none; border-radius: 4px;
                background: #1a3a5c; color: white; font-size: 13px;
-               font-weight: 600; cursor: pointer; margin-bottom: 14px; }}
+               font-weight: 600; cursor: pointer; margin-bottom: 14px;
+               margin-right: 8px; }}
 .export-btn:hover {{ background: #12293f; }}
+.sig-toggle-btn {{ padding: 8px 18px; border: 2px solid #1a3a5c; border-radius: 4px;
+                    background: white; color: #1a3a5c; font-size: 13px;
+                    font-weight: 600; cursor: pointer; margin-bottom: 14px;
+                    margin-right: 8px; }}
+.sig-toggle-btn:hover {{ background: #f0f5fa; }}
+.sig-toggle-btn.active {{ background: #1a3a5c; color: white; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </style>
 </head>
@@ -413,9 +450,29 @@ var leadingEdgeMap     = {leading_edge_map_js};
 var numericColsMap     = {numeric_cols_map};
 var dtInstances        = {{}};
 var colFiltersMap      = {{}};
+var sigOnlyMap         = {{}};
+var sigColIndexMap     = {{}};
+
+function getHeaderIndex(tableSelector, name) {{
+    var headers = [];
+    $(tableSelector).find('thead tr').first().find('th').each(function() {{
+        var $clone = $(this).clone();
+        $clone.find('.col-tip').remove();
+        headers.push($clone.text().trim());
+    }});
+    return headers.indexOf(name);
+}}
+
 $.fn.dataTable.ext.search.push(function(settings, data) {{
     var metric = settings.nTable.id.replace('results-table-', '');
-    var cf     = colFiltersMap[metric] || {{}};
+    if (sigOnlyMap[metric]) {{
+        var sigCol = sigColIndexMap[metric];
+        if (sigCol !== undefined && sigCol !== null &&
+            data[sigCol] !== '\u2713') {{
+            return false;
+        }}
+    }}
+    var cf = colFiltersMap[metric] || {{}};
     for (var i in cf) {{
         var f = cf[i];
         if (f.text !== undefined) {{
@@ -436,11 +493,13 @@ $.fn.dataTable.ext.search.push(function(settings, data) {{
 function initTable(metric) {{
     if (dtInstances[metric]) return;
     colFiltersMap[metric] = {{}};
+    sigOnlyMap[metric]    = false;
     var numericCols = numericColsMap[metric] || [];
     var dt = $('#results-table-' + metric).DataTable({{
         pageLength: 25, orderCellsTop: true, order: [[4, 'asc']],
         columnDefs: [{{ targets: numericCols, type: 'num' }}],
     }});
+    sigColIndexMap[metric] = getHeaderIndex('#results-table-' + metric, 'Sig.');
     $('#results-table-' + metric + ' thead tr.filter-row th').each(function(i) {{
         var isNum = numericCols.indexOf(i) !== -1;
         var inp   = $('<input type="text" placeholder="' +
@@ -570,6 +629,13 @@ $(document).ready(function() {{
         if (text !== undefined) {{
             showTextModal(goId + ' \u2014 leading edge genes (' + metric + ')', text);
         }}
+    }});
+    $(document).on('click', '.sig-toggle-btn', function() {{
+        var metric = $(this).data('metric');
+        sigOnlyMap[metric] = !sigOnlyMap[metric];
+        $(this).toggleClass('active', sigOnlyMap[metric]);
+        $(this).text(sigOnlyMap[metric] ? 'Showing significant only \u2713' : 'Show only significant');
+        if (dtInstances[metric]) dtInstances[metric].draw();
     }});
     $(document).on('click', '.export-xlsx-btn', function() {{
         var metric      = $(this).data('metric');
@@ -931,7 +997,8 @@ def _results_table_html(
     Neither gene list is written into the table cell itself — only a
     "View (N)" link is, and the actual text is injected into the page as a
     small JS lookup object, shown in a modal on click (or exported to xlsx
-    on export).
+    on export). The "Sig." column (rendered as a checkmark, '\u2713') is
+    also what the "Show only significant" toggle filters on client-side.
     """
     df = df.copy()
     if "Term" not in df.columns:
@@ -1271,6 +1338,7 @@ def build_multi_metric_report(
             'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the '
             'gene lists as text.</p>\n'
             '  <p>'
+            '<button class="sig-toggle-btn" data-metric="{m}">Show only significant</button> '
             '<button class="export-btn export-xlsx-btn" data-metric="{m}">'
             '&#8681; Export table to Excel (.xlsx)</button> '
             '<button class="export-btn export-xlsx-all-btn" data-metric="{m}">'
