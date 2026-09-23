@@ -580,6 +580,7 @@ def main():
                 mode="single",
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir,
+                pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
             )
         else:
             build_report(
@@ -591,6 +592,7 @@ def main():
                 fdr_threshold=fdr_threshold,
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir,
+                pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
             )
 
         for m in metrics_to_run:
@@ -707,6 +709,9 @@ def main():
                 tables_dir2=tables_dir2,
                 label1=list1_name,
                 label2=list2_name,
+                pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
+                pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
+                differential_stats_path=os.path.join(outdir, "differential_stats.json"),
             )
         else:
             build_report(
@@ -722,6 +727,9 @@ def main():
                 tables_dir2=tables_dir2,
                 label1=list1_name,
                 label2=list2_name,
+                pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
+                pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
+                differential_stats_path=os.path.join(outdir, "differential_stats.json"),
             )
 
         for m in metrics_to_run:

@@ -7,6 +7,7 @@ import base64
 import logging
 import urllib.request
 import ssl
+from urllib.parse import quote as _urlquote
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,17 @@ _METRIC_DESCS = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# Unified report template — one tab shell used for every report, regardless
+# of how many ranking metrics were run. A single-metric report simply has
+# one metric tab plus the Filtering summary tab; a multi-metric report has
+# three metric tabs plus Filtering summary. This replaces what used to be
+# two separate templates (a flat non-tabbed layout for single-metric
+# reports, and a tabbed layout for multi-metric reports) — they had been
+# drifting into near-duplicates anyway, and the Filtering summary tab needs
+# to appear in both cases.
+# ---------------------------------------------------------------------------
+
 _TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -60,294 +72,9 @@ section {{ background: white; border-radius: 8px;
            padding: 28px 32px; margin-bottom: 28px; }}
 h2 {{ margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
       padding-bottom: 8px; }}
-.plot-block {{ margin: 20px 0; text-align: center; }}
-.plot-block img {{ max-width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
-.plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
-.plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
-tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
-a.go-link, a.geneset-link, a.leadedge-link {{
-    color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
-.col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
-            font-size: 10px; text-align: center; border-radius: 50%;
-            background: #aaa; color: white; cursor: help; margin-left: 3px;
-            position: relative; }}
-.col-tip .tip-text {{ display: none; position: absolute; bottom: 120%; left: 50%;
-                      transform: translateX(-50%); background: #333; color: #fff;
-                      padding: 6px 10px; border-radius: 4px; font-size: 11px;
-                      white-space: normal; width: 220px; z-index: 999;
-                      font-weight: normal; line-height: 1.4; }}
-.col-tip:hover .tip-text {{ display: block; }}
-thead tr.filter-row th input {{
-    width: 100%; box-sizing: border-box; font-size: 11px;
-    padding: 3px; border: 1px solid #ccc; border-radius: 3px; }}
-thead tr.filter-row th {{ padding: 4px 8px; }}
-.svg-tooltip {{ position: fixed; background: #333; color: #fff;
-                padding: 8px 12px; border-radius: 4px; font-size: 12px;
-                max-width: 360px; line-height: 1.5; pointer-events: none;
-                z-index: 2000; display: none; white-space: normal; }}
-#modal-overlay {{ display: none; position: fixed; top: 0; left: 0;
-                  width: 100%; height: 100%; background: rgba(0,0,0,0.6);
-                  z-index: 1000; justify-content: center; align-items: center; }}
-#modal-overlay.active {{ display: flex; }}
-#modal-box {{ background: white; border-radius: 8px; padding: 24px;
-              max-width: 700px; width: 90%; position: relative; }}
-#modal-title {{ font-size: 1.1em; font-weight: bold; color: #1a3a5c;
-                margin-bottom: 12px; }}
-#modal-img {{ width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
-#modal-text {{ display: none; max-height: 420px; overflow-y: auto;
-               text-align: left; white-space: pre-wrap; word-break: break-word;
-               font-family: 'Courier New', monospace; font-size: 12px;
-               background: #f7f7f7; border: 1px solid #e0e0e0;
-               border-radius: 4px; padding: 10px 14px; margin: 0; }}
-#modal-close {{ position: absolute; top: 12px; right: 16px; font-size: 1.4em;
-                cursor: pointer; color: #555; background: none; border: none; }}
-.export-btn {{ padding: 8px 18px; border: none; border-radius: 4px;
-               background: #1a3a5c; color: white; font-size: 13px;
-               font-weight: 600; cursor: pointer; margin-bottom: 14px;
-               margin-right: 8px; }}
-.export-btn:hover {{ background: #12293f; }}
-.sig-toggle-btn {{ padding: 8px 18px; border: 2px solid #1a3a5c; border-radius: 4px;
-                    background: white; color: #1a3a5c; font-size: 13px;
-                    font-weight: 600; cursor: pointer; margin-bottom: 14px;
-                    margin-right: 8px; }}
-.sig-toggle-btn:hover {{ background: #f0f5fa; }}
-.sig-toggle-btn.active {{ background: #1a3a5c; color: white; }}
-footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
-</style>
-</head>
-<body>
-<header>
-  <h1>{title}</h1>
-  <p>ENHYDRA &mdash; Gene Set Enrichment Analysis for evolutionary genomics</p>
-</header>
-<div id="svg-tooltip" class="svg-tooltip"></div>
-<div id="modal-overlay">
-  <div id="modal-box">
-    <button id="modal-close" title="Close">&times;</button>
-    <div id="modal-title"></div>
-    <img id="modal-img" src="" alt="Enrichment plot"/>
-    <pre id="modal-text"></pre>
-  </div>
-</div>
-<main>
-<section>
-  <h2>Plots</h2>
-  <div class="plot-grid">
-{plots_html}
-  </div>
-</section>
-<section>
-  <h2>Enrichment results</h2>
-  <p>Significant gene sets are highlighted in blue.
-     Click a GO ID to view its enrichment plot, or "View" under
-     Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the gene lists as text.
-     Use the filter boxes below each column header to filter by that column.</p>
-  <p>
-    <button id="sig-toggle-btn" class="sig-toggle-btn">Show only significant</button>
-    <button id="export-xlsx-btn" class="export-btn">&#8681; Export table to Excel (.xlsx)</button>
-    <button id="export-xlsx-all-btn" class="export-btn">&#8681; Export all rows (ignore filters)</button>
-  </p>
-{table_html}
-</section>
-</main>
-<footer>Generated by ENHYDRA</footer>
-<script>{jquery_js}</script>
-<script>{dt_js}</script>
-<script>{xlsx_js}</script>
-<script>
-{plot_data_js}
-{gene_data_js}
-
-function getHeaderIndex(tableSelector, name) {{
-    var headers = [];
-    $(tableSelector).find('thead tr').first().find('th').each(function() {{
-        var $clone = $(this).clone();
-        $clone.find('.col-tip').remove();
-        headers.push($clone.text().trim());
-    }});
-    return headers.indexOf(name);
-}}
-
-function tableToXLSX(tableSelector, numericCols, fullGeneSetsMap, leadEdgeMap, filename, onlyFiltered) {{
-    var $table = $(tableSelector);
-    if ($table.length === 0) return;
-
-    var headers = [];
-    $table.find('thead tr').first().find('th').each(function() {{
-        var $clone = $(this).clone();
-        $clone.find('.col-tip').remove();
-        headers.push($clone.text().trim());
-    }});
-    var goIdCol     = headers.indexOf('GO ID');
-    var fullSetCol  = headers.indexOf('Full gene set');
-    var leadEdgeCol = headers.indexOf('Leading edge');
-
-    var dt       = $table.DataTable();
-    var selector = onlyFiltered ? {{ search: 'applied' }} : {{}};
-    var rows     = dt.rows(selector).nodes();
-    var aoa      = [headers];
-
-    $(rows).each(function() {{
-        var cells   = $(this).find('td');
-        var goId    = goIdCol >= 0 ? $(cells[goIdCol]).text().trim() : null;
-        var rowData = [];
-        cells.each(function(i) {{
-            var text = $(this).text().trim();
-            if (i === fullSetCol && goId && fullGeneSetsMap &&
-                fullGeneSetsMap[goId] !== undefined) {{
-                rowData.push(fullGeneSetsMap[goId].split('\\n').join('; '));
-            }} else if (i === leadEdgeCol && goId && leadEdgeMap &&
-                       leadEdgeMap[goId] !== undefined) {{
-                rowData.push(leadEdgeMap[goId].split('\\n').join('; '));
-            }} else if (numericCols.indexOf(i) !== -1) {{
-                var v = parseFloat(text);
-                rowData.push(isNaN(v) ? text : v);
-            }} else {{
-                rowData.push(text);
-            }}
-        }});
-        aoa.push(rowData);
-    }});
-
-    var ws = XLSX.utils.aoa_to_sheet(aoa);
-    var wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Enrichment results');
-    XLSX.writeFile(wb, filename);
-}}
-
-$(document).ready(function() {{
-    var tip = document.getElementById('svg-tooltip');
-    document.querySelectorAll('[data-tip]').forEach(function(el) {{
-        el.addEventListener('mousemove', function(e) {{
-            tip.innerHTML = this.getAttribute('data-tip');
-            tip.style.display = 'block';
-            tip.style.left = (e.clientX + 15) + 'px';
-            tip.style.top  = (e.clientY + 15) + 'px';
-        }});
-        el.addEventListener('mouseleave', function() {{ tip.style.display = 'none'; }});
-    }});
-    var numericCols = {numeric_col_indices};
-    var colFilters  = {{}};
-    var sigOnly     = false;
-    var sigColIndex = null;
-    $.fn.dataTable.ext.search.push(function(settings, data) {{
-        if (sigOnly && sigColIndex !== null && data[sigColIndex] !== '\u2713') {{
-            return false;
-        }}
-        for (var i in colFilters) {{
-            var f = colFilters[i];
-            if (f.text !== undefined) {{
-                if (data[i].toLowerCase().indexOf(f.text) === -1) return false;
-            }} else {{
-                var cell = parseFloat(data[i]);
-                if (isNaN(cell)) return false;
-                if (f.op === '<'  && !(cell <  f.num)) return false;
-                if (f.op === '<=' && !(cell <= f.num)) return false;
-                if (f.op === '>'  && !(cell >  f.num)) return false;
-                if (f.op === '>=' && !(cell >= f.num)) return false;
-                if ((f.op === '=' || f.op === '==') && !(cell === f.num)) return false;
-                if (f.op === '!=' && !(cell !== f.num)) return false;
-            }}
-        }}
-        return true;
-    }});
-    var table = $('#results-table').DataTable({{
-        pageLength: 25, orderCellsTop: true, order: [[4, 'asc']],
-        columnDefs: [{{ targets: numericCols, type: 'num' }}]
-    }});
-    sigColIndex = getHeaderIndex('#results-table', 'Sig.');
-    $('#results-table thead tr.filter-row th').each(function(i) {{
-        var isNumeric   = numericCols.indexOf(i) !== -1;
-        var placeholder = isNumeric ? "e.g. < 0.05" : "Filter...";
-        var input       = $('<input type="text" placeholder="' + placeholder + '"/>');
-        $(this).html(input);
-        input.on('keyup change', function() {{
-            var val = this.value.trim();
-            if (val === '') {{
-                delete colFilters[i];
-            }} else if (isNumeric) {{
-                var m = val.match(/^([<>=!]=?)\\s*([\\d.eE+\\-]+)$/);
-                if (m) colFilters[i] = {{ op: m[1], num: parseFloat(m[2]) }};
-                else   delete colFilters[i];
-            }} else {{
-                colFilters[i] = {{ text: val.toLowerCase() }};
-            }}
-            table.draw();
-        }});
-    }});
-    $('#sig-toggle-btn').on('click', function() {{
-        sigOnly = !sigOnly;
-        $(this).toggleClass('active', sigOnly);
-        $(this).text(sigOnly ? 'Showing significant only \u2713' : 'Show only significant');
-        table.draw();
-    }});
-    function showImageModal(title, uri) {{
-        $('#modal-title').text(title);
-        $('#modal-text').hide();
-        $('#modal-img').attr('src', uri).show();
-        $('#modal-overlay').addClass('active');
-    }}
-    function showTextModal(title, text) {{
-        $('#modal-title').text(title);
-        $('#modal-img').hide();
-        $('#modal-text').text(text).show();
-        $('#modal-overlay').addClass('active');
-    }}
-    $(document).on('click', '.go-link', function(e) {{
-        e.preventDefault();
-        var goId = $(this).data('goid');
-        var uri  = enrichmentPlots[goId];
-        if (uri) showImageModal(goId, uri);
-    }});
-    $(document).on('click', '.geneset-link', function(e) {{
-        e.preventDefault();
-        var goId = $(this).data('goid');
-        var text = fullGeneSets[goId];
-        if (text !== undefined) showTextModal(goId + ' \u2014 full gene set', text);
-    }});
-    $(document).on('click', '.leadedge-link', function(e) {{
-        e.preventDefault();
-        var goId = $(this).data('goid');
-        var text = leadingEdge[goId];
-        if (text !== undefined) showTextModal(goId + ' \u2014 leading edge genes', text);
-    }});
-    $('#modal-close, #modal-overlay').on('click', function(e) {{
-        if (e.target === this) $('#modal-overlay').removeClass('active');
-    }});
-    $(document).on('click', '#export-xlsx-btn', function() {{
-        tableToXLSX('#results-table', numericCols, fullGeneSets, leadingEdge,
-                   'enrichment_results.xlsx', true);
-    }});
-    $(document).on('click', '#export-xlsx-all-btn', function() {{
-        tableToXLSX('#results-table', numericCols, fullGeneSets, leadingEdge,
-                   'enrichment_results_all.xlsx', false);
-    }});
-}});
-</script>
-</body>
-</html>"""
-
-_MULTI_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>{title}</title>
-<style>
-{dt_css}
-body {{ font-family: Arial, sans-serif; margin: 0; padding: 0;
-        background: #f5f5f5; color: #222; }}
-header {{ background: #1a3a5c; color: white; padding: 24px 40px; }}
-header h1 {{ margin: 0; font-size: 1.8em; }}
-header p  {{ margin: 4px 0 0; font-size: 0.95em; opacity: 0.85; }}
-main {{ max-width: 1300px; margin: 32px auto; padding: 0 24px; }}
-section {{ background: white; border-radius: 8px;
-           box-shadow: 0 1px 4px rgba(0,0,0,0.1);
-           padding: 28px 32px; margin-bottom: 28px; }}
-h2 {{ margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
-      padding-bottom: 8px; }}
 h3 {{ color: #2c5282; margin: 24px 0 12px; }}
+h4 {{ color: #1a3a5c; margin: 20px 0 6px; }}
+h5 {{ color: #2c5282; margin: 14px 0 4px; font-size: 0.95em; }}
 .tab-nav {{ display: flex; gap: 0; border-bottom: 3px solid #1a3a5c;
             margin-bottom: 28px; flex-wrap: wrap; }}
 .tab-btn {{ padding: 11px 32px; border: none; border-radius: 6px 6px 0 0;
@@ -366,7 +93,7 @@ h3 {{ color: #2c5282; margin: 24px 0 12px; }}
 .plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
 .plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
 tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
-a.go-link, a.geneset-link, a.leadedge-link {{
+a.go-link, a.geneset-link, a.leadedge-link, a.detail-link {{
     color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
 .col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
             font-size: 10px; text-align: center; border-radius: 50%;
@@ -413,6 +140,24 @@ thead tr.filter-row th {{ padding: 4px 8px; }}
                     margin-right: 8px; }}
 .sig-toggle-btn:hover {{ background: #f0f5fa; }}
 .sig-toggle-btn.active {{ background: #1a3a5c; color: white; }}
+.funnel-block {{ margin-bottom: 18px; }}
+.funnel-row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+               margin-top: 8px; }}
+.funnel-step {{ background: #1a3a5c; color: white; border-radius: 6px;
+                padding: 10px 14px; text-align: center; min-width: 92px; }}
+.funnel-num {{ font-size: 1.3em; font-weight: 700; }}
+.funnel-label {{ font-size: 0.72em; opacity: 0.9; margin-top: 2px; }}
+.funnel-arrow {{ font-size: 1.2em; color: #888; padding: 0 4px; }}
+.filtering-overlap {{ margin-bottom: 22px; padding: 14px 20px; background: #f0f5fa;
+                      border-left: 3px solid #1a3a5c; border-radius: 0 6px 6px 0; }}
+.filtering-cols {{ display: flex; gap: 24px; flex-wrap: wrap; }}
+.filtering-col {{ flex: 1 1 380px; background: #fafbfc; border: 1px solid #e0e0e0;
+                  border-radius: 6px; padding: 16px 20px; min-width: 320px; }}
+table.reason-table {{ width: 100%; border-collapse: collapse; margin: 6px 0 16px; }}
+table.reason-table th, table.reason-table td {{ border: 1px solid #e0e0e0;
+    padding: 5px 10px; font-size: 12.5px; text-align: left; }}
+table.reason-table th {{ background: #eef2f6; }}
+p.no-drops {{ color: #2f7d3c; font-size: 0.88em; margin: 4px 0 16px; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </style>
 </head>
@@ -432,7 +177,7 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </div>
 <main>
 <section>
-  <h2>Results by ranking metric</h2>
+  <h2>Results</h2>
   <nav class="tab-nav" role="tablist">
 {tab_buttons}
   </nav>
@@ -523,6 +268,13 @@ function initTable(metric) {{
     }});
     dtInstances[metric] = dt;
 }}
+function initFilteringSummaryTables() {{
+    if (dtInstances['filtering-summary']) return;
+    $('#tab-filtering-summary table.species-count-table').each(function() {{
+        $(this).DataTable({{ pageLength: 25, order: [] }});
+    }});
+    dtInstances['filtering-summary'] = true;
+}}
 function showImageModal(title, uri) {{
     $('#modal-title').text(title);
     $('#modal-text').hide();
@@ -603,7 +355,11 @@ $(document).ready(function() {{
             }});
             this.classList.add('active');
             document.getElementById('tab-' + metric).classList.add('active');
-            initTable(metric);
+            if (metric === 'filtering-summary') {{
+                initFilteringSummaryTables();
+            }} else if (numericColsMap.hasOwnProperty(metric)) {{
+                initTable(metric);
+            }}
         }});
     }});
     $(document).on('click', '.go-link', function(e) {{
@@ -663,7 +419,387 @@ $(document).ready(function() {{
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Standalone drop-details pages (one per drop-reasons/skipped-groups TSV)
+# ---------------------------------------------------------------------------
+# These intentionally do NOT depend on jQuery/DataTables — they are meant to
+# stay tiny even when a stage has thousands of dropped rows, and the main
+# report should not need to embed or fetch this data at all. Filtering is
+# done with plain JS string matching, which is more than sufficient for a
+# single-column reason filter plus a free-text search box.
+
+_DETAILS_PAGE_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>{title}</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; background: #f5f5f5; }}
+h1 {{ color: #1a3a5c; font-size: 1.3em; }}
+.controls {{ margin-bottom: 14px; }}
+.controls input {{ padding: 6px 10px; font-size: 13px;
+    border: 1px solid #ccc; border-radius: 4px; margin-right: 8px; width: 260px; }}
+table {{ border-collapse: collapse; width: 100%; background: white; }}
+th, td {{ border: 1px solid #e0e0e0; padding: 6px 10px; font-size: 13px; text-align: left; }}
+th {{ background: #1a3a5c; color: white; position: sticky; top: 0; }}
+tr:nth-child(even) {{ background: #f9f9f9; }}
+.count {{ color: #555; font-size: 0.9em; margin-bottom: 10px; }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<p class="count"><span id="visible-count">{n_rows}</span> of {n_rows} rows shown</p>
+<div class="controls">
+  <input type="text" id="reason-filter" placeholder="Filter by reason (exact match)..."/>
+  <input type="text" id="text-filter" placeholder="Search all columns..."/>
+</div>
+<table id="details-table">
+<thead><tr>{header_html}</tr></thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+<script>
+function getQueryParam(name) {{
+    var params = new URLSearchParams(window.location.search);
+    return params.get(name);
+}}
+function applyFilters() {{
+    var reasonVal = document.getElementById('reason-filter').value.trim().toLowerCase();
+    var textVal   = document.getElementById('text-filter').value.trim().toLowerCase();
+    var rows      = document.querySelectorAll('#details-table tbody tr');
+    var visible   = 0;
+    rows.forEach(function(row) {{
+        var reasonMatch = !reasonVal || (row.getAttribute('data-reason') || '').toLowerCase() === reasonVal;
+        var textMatch   = !textVal || row.textContent.toLowerCase().indexOf(textVal) !== -1;
+        var show = reasonMatch && textMatch;
+        row.style.display = show ? '' : 'none';
+        if (show) visible++;
+    }});
+    document.getElementById('visible-count').textContent = visible;
+}}
+document.getElementById('reason-filter').addEventListener('input', applyFilters);
+document.getElementById('text-filter').addEventListener('input', applyFilters);
+var initialReason = getQueryParam('reason');
+if (initialReason) {{
+    document.getElementById('reason-filter').value = initialReason;
+    applyFilters();
+}}
+</script>
+</body>
+</html>"""
+
+
+def _tsv_to_details_html(tsv_path: str, html_path: str, title: str) -> bool:
+    """Render a drop-reasons-style TSV as a standalone, filterable HTML page.
+
+    Returns False (writing nothing) if the source TSV doesn't exist or is
+    empty (header-only), so callers can treat 'no page generated' as the
+    signal to omit the corresponding 'View list' link entirely.
+    """
+    if not os.path.isfile(tsv_path):
+        return False
+    with open(tsv_path) as fh:
+        lines = [l.rstrip("\n").split("\t") for l in fh if l.strip()]
+    if len(lines) < 2:   # header only, or empty
+        return False
+    header, rows = lines[0], lines[1:]
+    reason_idx = header.index("reason") if "reason" in header else None
+
+    header_html = "".join("<th>%s</th>" % h for h in header)
+    row_lines = []
+    for row in rows:
+        reason_val = row[reason_idx] if reason_idx is not None and reason_idx < len(row) else ""
+        cells = "".join("<td>%s</td>" % c for c in row)
+        row_lines.append('<tr data-reason="%s">%s</tr>' % (reason_val, cells))
+
+    html = _DETAILS_PAGE_TEMPLATE.format(
+        title=title, header_html=header_html,
+        rows_html="\n".join(row_lines), n_rows=len(rows),
+    )
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    return True
+
+
+def _generate_drop_details_pages(
+    listdir: str,
+    detail_files: dict,
+    report_dir: str,
+) -> dict[str, str | None]:
+    """Write a standalone details page next to each drop-reasons TSV.
+
+    Args:
+        listdir:      The list's root directory (dirname of its
+                      pipeline_stats.json), used to resolve the relative
+                      paths stored in detail_files.
+        detail_files: The 'detail_files' dict from pipeline_stats.json,
+                      mapping a stage key to a path relative to listdir
+                      (or null if that stage's file wasn't produced).
+        report_dir:   Directory the report.html itself will be written
+                      into, used as the base for the returned link paths
+                      (same convention as the enrichment-plot links).
+
+    Returns:
+        Dict with the same keys as detail_files, mapped to a path relative
+        to report_dir for the generated HTML page — or None if no page was
+        generated (source TSV missing/empty, or not applicable — e.g.
+        species_counts, which isn't a drop-reasons file and is rendered
+        inline instead, is passed through untouched as None here since
+        callers handle it separately).
+    """
+    out: dict[str, str | None] = {}
+    for key, rel_tsv in (detail_files or {}).items():
+        if key == "group_filter_species_counts":
+            continue
+        if not rel_tsv:
+            out[key] = None
+            continue
+        tsv_path  = os.path.join(listdir, rel_tsv)
+        html_path = os.path.splitext(tsv_path)[0] + ".html"
+        title     = key.replace("_", " ").title()
+        if _tsv_to_details_html(tsv_path, html_path, title):
+            out[key] = os.path.relpath(html_path, report_dir).replace(os.sep, "/")
+        else:
+            out[key] = None
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Filtering summary tab content
+# ---------------------------------------------------------------------------
+
+def _load_json(path: str | None) -> dict | None:
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def _funnel_html(name: str, stats: dict) -> str:
+    steps = [
+        ("Input groups",         stats.get("n_input")),
+        ("After length filter",  stats.get("n_after_length_filter")),
+        ("After group filter",   stats.get("n_after_group_filter")),
+        ("Final groups",         stats.get("n_final_groups")),
+        ("Anchor-mapped",        stats.get("n_anchor_mapped")),
+    ]
+    parts = []
+    for i, (label, val) in enumerate(steps):
+        if i > 0:
+            parts.append('<div class="funnel-arrow">&rarr;</div>')
+        parts.append(
+            '<div class="funnel-step"><div class="funnel-num">%s</div>'
+            '<div class="funnel-label">%s</div></div>'
+            % (val if val is not None else "\u2013", label)
+        )
+    return (
+        '<div class="funnel-block"><h4>%s</h4><div class="funnel-row">%s</div></div>'
+        % (name, "".join(parts))
+    )
+
+
+def _reason_table_html(
+    reason_counts: dict[str, int],
+    detail_html_rel: str | None,
+    empty_message: str,
+) -> str:
+    if not reason_counts:
+        return '<p class="no-drops">%s</p>' % empty_message
+    rows = ""
+    for reason, count in sorted(reason_counts.items(), key=lambda kv: -kv[1]):
+        if detail_html_rel:
+            link = (
+                '<a href="%s?reason=%s" target="_blank" class="detail-link">View list</a>'
+                % (detail_html_rel, _urlquote(reason))
+            )
+        else:
+            link = ""
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (reason, count, link)
+    return (
+        '<table class="reason-table"><thead><tr><th>Reason</th><th>Count</th>'
+        '<th></th></tr></thead><tbody>%s</tbody></table>' % rows
+    )
+
+
+def _species_counts_table_html(tsv_path: str | None, table_id: str) -> str:
+    if not tsv_path or not os.path.isfile(tsv_path):
+        return "<p>No species count data available.</p>"
+    with open(tsv_path) as fh:
+        lines = [l.rstrip("\n").split("\t") for l in fh if l.strip()]
+    if len(lines) < 2:
+        return "<p>No species count data available.</p>"
+    header, rows = lines[0], lines[1:]
+    header_html = "".join("<th>%s</th>" % h for h in header)
+    rows_html   = "".join(
+        "<tr>%s</tr>" % "".join("<td>%s</td>" % c for c in row)
+        for row in rows
+    )
+    return (
+        '<table id="%s" class="species-count-table display compact" style="width:100%%">'
+        '<thead><tr>%s</tr></thead><tbody>%s</tbody></table>'
+        % (table_id, header_html, rows_html)
+    )
+
+
+def _one_list_filtering_block(
+    name: str,
+    pipeline_stats_path: str | None,
+    report_dir: str,
+    table_id_prefix: str,
+) -> str:
+    stats = _load_json(pipeline_stats_path)
+    if stats is None:
+        return (
+            '<div class="filtering-col"><h4>%s</h4>'
+            '<p>No pipeline statistics available.</p></div>' % name
+        )
+    listdir       = os.path.dirname(os.path.abspath(pipeline_stats_path))
+    detail_files  = stats.get("detail_files", {})
+    detail_links  = _generate_drop_details_pages(listdir, detail_files, report_dir)
+    species_rel   = detail_files.get("group_filter_species_counts")
+    species_tsv   = os.path.join(listdir, species_rel) if species_rel else None
+    ds            = stats.get("drop_summary", {})
+
+    funnel = _funnel_html(name, stats)
+    reasons_html = (
+        "<h5>Length filter \u2014 groups skipped entirely</h5>"
+        + _reason_table_html(
+            ds.get("length_filter", {}).get("groups_skipped", {}),
+            detail_links.get("length_filter_skipped_groups"),
+            "No groups were skipped entirely at this step.",
+        )
+        + "<h5>Length filter \u2014 sequences removed as outliers</h5>"
+        + _reason_table_html(
+            ds.get("length_filter", {}).get("sequences_removed", {}),
+            detail_links.get("length_filter_drop_reasons"),
+            "No individual sequences were removed as length outliers.",
+        )
+        + "<h5>Group filter \u2014 groups removed</h5>"
+        + _reason_table_html(
+            ds.get("group_filter", {}),
+            detail_links.get("group_filter_drop_reasons"),
+            "No groups were removed at the group filter step.",
+        )
+        + "<h5>Tables step \u2014 anomalies</h5>"
+        + _reason_table_html(
+            ds.get("tables", {}),
+            detail_links.get("tables_drop_reasons"),
+            "No anomalies at the table generation step.",
+        )
+    )
+    species_html = (
+        "<h5>Groups per species (surviving groups)</h5>"
+        + _species_counts_table_html(species_tsv, table_id_prefix + "-species-counts")
+    )
+    return '<div class="filtering-col"><h4>%s</h4>%s%s%s</div>' % (
+        name, funnel, reasons_html, species_html,
+    )
+
+
+def _build_filtering_summary_tab_content(
+    mode: str,
+    label1: str,
+    label2: str,
+    pipeline_stats_path: str | None,
+    pipeline_stats_path1: str | None,
+    pipeline_stats_path2: str | None,
+    differential_stats_path: str | None,
+    report_dir: str,
+) -> str:
+    """Build the Filtering summary tab body.
+
+    mode == 'differential' corresponds exactly to two-list mode throughout
+    this module (see build_report()/build_multi_metric_report() call sites
+    in cli.py), so it doubles as the single-list vs two-list switch here —
+    no separate flag is needed.
+    """
+    if mode != "differential":
+        stats = _load_json(pipeline_stats_path)
+        if stats is None:
+            return "<p>No pipeline statistics available for this run.</p>"
+        listdir      = os.path.dirname(os.path.abspath(pipeline_stats_path))
+        detail_files = stats.get("detail_files", {})
+        detail_links = _generate_drop_details_pages(listdir, detail_files, report_dir)
+        species_rel  = detail_files.get("group_filter_species_counts")
+        species_tsv  = os.path.join(listdir, species_rel) if species_rel else None
+        ds           = stats.get("drop_summary", {})
+
+        funnel = _funnel_html("Groups", stats)
+        reasons_html = (
+            "<h4>Length filter \u2014 groups skipped entirely</h4>"
+            + _reason_table_html(
+                ds.get("length_filter", {}).get("groups_skipped", {}),
+                detail_links.get("length_filter_skipped_groups"),
+                "No groups were skipped entirely at this step.",
+            )
+            + "<h4>Length filter \u2014 sequences removed as outliers</h4>"
+            + _reason_table_html(
+                ds.get("length_filter", {}).get("sequences_removed", {}),
+                detail_links.get("length_filter_drop_reasons"),
+                "No individual sequences were removed as length outliers.",
+            )
+            + "<h4>Group filter \u2014 groups removed</h4>"
+            + _reason_table_html(
+                ds.get("group_filter", {}),
+                detail_links.get("group_filter_drop_reasons"),
+                "No groups were removed at the group filter step.",
+            )
+            + "<h4>Tables step \u2014 anomalies</h4>"
+            + _reason_table_html(
+                ds.get("tables", {}),
+                detail_links.get("tables_drop_reasons"),
+                "No anomalies at the table generation step.",
+            )
+        )
+        species_html = (
+            "<h4>Groups per species (surviving groups)</h4>"
+            + _species_counts_table_html(species_tsv, "species-counts")
+        )
+        return '<div class="filtering-summary">%s%s%s</div>' % (
+            funnel, reasons_html, species_html,
+        )
+
+    # Two-list mode: one column per list, plus an overlap summary on top.
+    diff_stats = _load_json(differential_stats_path)
+    if diff_stats:
+        overlap_html = (
+            '<div class="filtering-overlap"><h4>Overlap between lists '
+            '(used for differential scoring)</h4>'
+            '<div class="funnel-row">'
+            '<div class="funnel-step"><div class="funnel-num">%d</div>'
+            '<div class="funnel-label">%s groups</div></div>'
+            '<div class="funnel-arrow">&cap;</div>'
+            '<div class="funnel-step"><div class="funnel-num">%d</div>'
+            '<div class="funnel-label">%s groups</div></div>'
+            '<div class="funnel-arrow">=</div>'
+            '<div class="funnel-step"><div class="funnel-num">%d</div>'
+            '<div class="funnel-label">Common groups</div></div>'
+            '<div class="funnel-step"><div class="funnel-num">%d</div>'
+            '<div class="funnel-label">%s only</div></div>'
+            '<div class="funnel-step"><div class="funnel-num">%d</div>'
+            '<div class="funnel-label">%s only</div></div>'
+            '</div></div>'
+            % (diff_stats["n_groups_list1"], diff_stats["list1_name"],
+               diff_stats["n_groups_list2"], diff_stats["list2_name"],
+               diff_stats["n_common_groups"],
+               diff_stats["n_list1_only"], diff_stats["list1_name"],
+               diff_stats["n_list2_only"], diff_stats["list2_name"])
+        )
+    else:
+        overlap_html = "<p>No overlap statistics available.</p>"
+
+    col1 = _one_list_filtering_block(label1, pipeline_stats_path1, report_dir, "list1")
+    col2 = _one_list_filtering_block(label2, pipeline_stats_path2, report_dir, "list2")
+    return (
+        '<div class="filtering-summary-two-list">%s'
+        '<div class="filtering-cols">%s%s</div></div>'
+        % (overlap_html, col1, col2)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers (GMT / GSEA results / enrichment table — unchanged)
 # ---------------------------------------------------------------------------
 
 def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
@@ -679,11 +815,7 @@ def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
 
 
 def _gmt_gene_sets(gmt_path: str | None) -> dict[str, list[str]]:
-    """Return term_id -> full list of member gene IDs, read from a GMT file.
-
-    Used to power the "Full gene set" link column: the complete membership
-    of each gene set, independent of ranking metric.
-    """
+    """Return term_id -> full list of member gene IDs, read from a GMT file."""
     if not gmt_path or not os.path.isfile(gmt_path):
         return {}
     sets: dict[str, list[str]] = {}
@@ -745,9 +877,6 @@ def _per_term_scores(
 
     Single-list mode (tables_dir2=None) → "Mean score" column.
     Two-list mode → "List 1 score", "List 2 score", "Score diff".
-
-    Gene IDs are always read as str to prevent pandas inferring numeric
-    columns as int/float, which would break matching against GMT identifiers.
     """
     def _load_anchor2mean(tables_dir: str) -> dict[str, float]:
         path = os.path.join(tables_dir, "anchor2mean.tsv")
@@ -755,14 +884,13 @@ def _per_term_scores(
             return {}
         df = pd.read_csv(path, sep="\t", header=None,
                          names=["gene_id", "score"],
-                         dtype={"gene_id": str})          # always str
+                         dtype={"gene_id": str})
         df["score"] = pd.to_numeric(df["score"], errors="coerce")
         df = df.dropna(subset=["score"]).drop_duplicates("gene_id")
         return dict(_normalise_series(df.set_index("gene_id")["score"], metric))
 
     def _load_via_group_mapping(tables_dir_scores: str,
                                 tables_dir_mapping: str) -> dict[str, float]:
-        """Fallback for lists without anchor sequences."""
         g2m_path = os.path.join(tables_dir_scores,  "group2mean.tsv")
         g2a_path = os.path.join(tables_dir_mapping, "group2anchor.tsv")
         if not os.path.isfile(g2m_path) or not os.path.isfile(g2a_path):
@@ -778,7 +906,7 @@ def _per_term_scores(
 
         g2a = pd.read_csv(g2a_path, sep="\t", header=None,
                           names=["group_id", "gene_id"],
-                          dtype={"group_id": str, "gene_id": str})  # always str
+                          dtype={"group_id": str, "gene_id": str})
         g2a = (g2a.dropna()
                   .drop_duplicates("group_id")
                   .set_index("group_id")["gene_id"])
@@ -891,28 +1019,9 @@ def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
 def _build_enrichment_plot_index(results_dir: str, report_dir: str) -> dict[str, str]:
     """Build a mapping of GO ID -> image path for per-gene-set enrichment plots.
 
-    Rather than reading and base64-encoding every PNG (which used to embed
-    the full binary content of every plot directly into the HTML — the
-    dominant cause of multi-hundred-MB reports on large analyses such as
-    vertebrate genomes), this now records a path *relative to the report's
-    own directory* on disk. The browser then loads each plot on demand,
-    directly from the enrichment/prerank/ folder, only when the user clicks
-    a GO ID. The images are never copied or embedded — the report simply
-    keeps a pointer to where they already live.
-
-    Note: this means the resulting report.html is no longer a single
-    self-contained file. It must stay alongside the output directory
-    structure (specifically the relevant enrichment/prerank/ subfolder) for
-    the modal images to resolve.
-
-    Args:
-        results_dir: Directory passed to run_gsea() for this metric/list
-                     (i.e. the parent of the 'prerank' subfolder).
-        report_dir:  Directory where the report.html file itself will be
-                     written, used as the base for the relative paths.
-
-    Returns:
-        Dict mapping GO ID -> path (relative to report_dir) of its PNG.
+    Records a path relative to the report's own directory rather than
+    base64-embedding every PNG, so the browser loads each plot from disk on
+    demand and the HTML stays small even with hundreds of significant sets.
     """
     prerank_dir = os.path.join(results_dir, "prerank")
     if not os.path.isdir(prerank_dir):
@@ -924,8 +1033,6 @@ def _build_enrichment_plot_index(results_dir: str, report_dir: str) -> dict[str,
         go_id    = filename.replace(".png", "").replace("_", ":", 1)
         abs_path = os.path.abspath(os.path.join(prerank_dir, filename))
         rel_path = os.path.relpath(abs_path, start=report_dir)
-        # Use forward slashes regardless of platform, since this path is
-        # used as a URL/src attribute inside the HTML, not a filesystem call.
         index[go_id] = rel_path.replace(os.sep, "/")
     logger.info(
         "Indexed %d enrichment plot(s) as on-disk links (not embedded).",
@@ -983,23 +1090,6 @@ def _results_table_html(
     col2_label: str = "List 2",
     gene_sets: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[int], dict[str, str], dict[str, str]]:
-    """Build the results table HTML.
-
-    In addition to the rendered table, this returns two lookup dicts used
-    to power the "Full gene set" and "Leading edge" link columns (and, in
-    turn, the "Export to Excel" button, which reads gene lists from these
-    same dicts rather than from the truncated "View (N)" cell text):
-      - full_sets_js: GO ID -> newline-joined full gene set membership
-                      (from the GMT; identical regardless of metric).
-      - leadedge_js:  GO ID -> newline-joined leading-edge gene list for
-                      this specific ranking metric (from GSEApy's own
-                      Lead_genes column).
-    Neither gene list is written into the table cell itself — only a
-    "View (N)" link is, and the actual text is injected into the page as a
-    small JS lookup object, shown in a modal on click (or exported to xlsx
-    on export). The "Sig." column (rendered as a checkmark, '\u2713') is
-    also what the "Show only significant" toggle filters on client-side.
-    """
     df = df.copy()
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
@@ -1019,7 +1109,6 @@ def _results_table_html(
         lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
 
-    # --- Full gene set / leading edge link columns --------------------
     full_sets_js: dict[str, str] = {}
     leadedge_js:  dict[str, str] = {}
 
@@ -1158,105 +1247,26 @@ def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Single-metric report
+# Shared report builder
 # ---------------------------------------------------------------------------
 
-def build_report(
-    results_dir: str,
-    plots_dir: str,
-    report_path: str,
-    obo_path: str | None = None,
-    mode: str = "single",
-    metric: str = "zscore",
-    fdr_threshold: float = 0.25,
-    gmt_path: str | None = None,
-    tables_dir1: str | None = None,
-    tables_dir2: str | None = None,
-    label1: str = "List 1",
-    label2: str = "List 2",
-):
-    logger.info("Building HTML report...")
-    effective_gmt = gmt_path or _find_gmt_in_dir(results_dir)
-    term_names    = _resolve_term_names(results_dir, obo_path, effective_gmt)
-    gene_sets     = _gmt_gene_sets(effective_gmt)
-    df = _load_gsea_results(results_dir)
-    if df is None:
-        logger.warning("Cannot build report: no GSEA results found.")
-        return
-    df = _augment_with_per_term_scores(
-        df, effective_gmt, tables_dir1, tables_dir2, metric
-    )
-    cache_dir    = os.path.dirname(obo_path) if obo_path else None
-    jquery_js    = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
-    dt_js        = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
-    dt_css       = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
-    xlsx_js      = _fetch_cached(_XLSX_JS_URL,        cache_dir, "xlsx.full.min.js")
-
-    # Plot links are resolved relative to the directory the report itself
-    # will be written into, so images are read from disk on click rather
-    # than being embedded as base64 blobs in the HTML.
-    report_dir   = os.path.dirname(os.path.abspath(report_path))
-    plot_index   = _build_enrichment_plot_index(results_dir, report_dir)
-    plot_data_js = "var enrichmentPlots = {%s};" % ",".join(
-        '"%s": "%s"' % (go_id, path) for go_id, path in plot_index.items()
-    )
-    if mode == "single":
-        plot_names = [
-            ("identity_distribution", "Distribution of mean alignment identity"),
-            ("gsea_barplot",          "Top enriched gene sets (NES)"),
-        ]
-        title = "ENHYDRA Single-List Enrichment Report"
-    else:
-        plot_names = [
-            ("identity_scatter",          "Identity comparison between lists"),
-            ("differential_distribution", "Differential conservation score distribution"),
-            ("identity_distribution",     "Distribution of differential scores"),
-            ("gsea_barplot",              "Top differentially enriched gene sets (NES)"),
-        ]
-        title = "ENHYDRA Differential Enrichment Report"
-    plots_html = _plot_section(plots_dir, plot_names)
-    table_html, numeric_col_indices, full_sets_js, leadedge_js = _results_table_html(
-        df, term_names, plot_index, fdr_threshold,
-        metric=None, col1_label=label1, col2_label=label2,
-        gene_sets=gene_sets,
-    )
-    # Full gene sets are metric-independent (straight from the GMT); leading
-    # edge genes are specific to this metric's ranking. Both are injected as
-    # plain JS lookup objects — never written directly into table cells —
-    # so the table (and the resulting Excel export) stays fast to build even
-    # when gene sets contain hundreds of genes.
-    gene_data_js = "var fullGeneSets = %s;\nvar leadingEdge = %s;" % (
-        json.dumps(full_sets_js), json.dumps(leadedge_js)
-    )
-    html = _TEMPLATE.format(
-        title=title, dt_css=dt_css, plots_html=plots_html,
-        table_html=table_html, jquery_js=jquery_js, dt_js=dt_js,
-        xlsx_js=xlsx_js,
-        plot_data_js=plot_data_js, gene_data_js=gene_data_js,
-        numeric_col_indices=numeric_col_indices,
-    )
-    with open(report_path, "w", encoding="utf-8") as fh:
-        fh.write(html)
-    logger.info("HTML report written to: %s", report_path)
-
-
-# ---------------------------------------------------------------------------
-# Multi-metric tabbed report
-# ---------------------------------------------------------------------------
-
-def build_multi_metric_report(
+def _build_report_impl(
     metric_data: dict,
     report_path: str,
-    obo_path: str | None = None,
-    fdr_threshold: float = 0.25,
-    mode: str = "single",
-    gmt_path: str | None = None,
-    tables_dir1: str | None = None,
-    tables_dir2: str | None = None,
-    label1: str = "List 1",
-    label2: str = "List 2",
+    obo_path: str | None,
+    fdr_threshold: float,
+    mode: str,
+    gmt_path: str | None,
+    tables_dir1: str | None,
+    tables_dir2: str | None,
+    label1: str,
+    label2: str,
+    pipeline_stats_path: str | None,
+    pipeline_stats_path1: str | None,
+    pipeline_stats_path2: str | None,
+    differential_stats_path: str | None,
 ):
-    logger.info("Building multi-metric HTML report (%d metrics)...", len(metric_data))
+    logger.info("Building HTML report (%d metric tab(s))...", len(metric_data))
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
     effective_gmt = gmt_path or _find_gmt_in_dir(first_results)
     term_names    = _resolve_term_names(first_results, obo_path, effective_gmt)
@@ -1266,35 +1276,32 @@ def build_multi_metric_report(
     dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
     dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
     xlsx_js   = _fetch_cached(_XLSX_JS_URL,        cache_dir, "xlsx.full.min.js")
-    title = ("ENHYDRA Multi-Metric Differential Enrichment Report"
-             if mode == "differential"
-             else "ENHYDRA Multi-Metric Enrichment Report")
-    if mode == "single":
-        plot_names = [
-            ("identity_distribution", "Distribution of mean alignment identity"),
-            ("gsea_barplot",          "Top enriched gene sets (NES)"),
-        ]
-    else:
+
+    single_metric = len(metric_data) == 1
+    if mode == "differential":
+        title = ("ENHYDRA Differential Enrichment Report" if single_metric
+                  else "ENHYDRA Multi-Metric Differential Enrichment Report")
         plot_names = [
             ("identity_scatter",          "Identity comparison between lists"),
             ("differential_distribution", "Differential conservation score distribution"),
             ("gsea_barplot",              "Top differentially enriched gene sets (NES)"),
         ]
+    else:
+        title = ("ENHYDRA Single-List Enrichment Report" if single_metric
+                  else "ENHYDRA Multi-Metric Enrichment Report")
+        plot_names = [
+            ("identity_distribution", "Distribution of mean alignment identity"),
+            ("gsea_barplot",          "Top enriched gene sets (NES)"),
+        ]
 
-    # Plot links are resolved relative to the directory the report itself
-    # will be written into (see build_report for the rationale).
     report_dir = os.path.dirname(os.path.abspath(report_path))
 
     tab_buttons_parts    = []
     tab_panels_parts     = []
     enrichment_plots_map = {}
-    numeric_cols_map     = {}
-    # Full gene set membership is the same across metrics (same GMT), so it
-    # is accumulated into one flat lookup shared by all tabs. Leading edge
-    # genes differ per metric (different ranking -> different leading edge),
-    # so that lookup stays keyed by metric, mirroring enrichment_plots_map.
-    full_gene_sets_accum: dict[str, str] = {}
-    leading_edge_map: dict[str, dict[str, str]] = {}
+    numeric_cols_map      = {}
+    full_gene_sets_accum  = {}
+    leading_edge_map      = {}
     first = True
     for metric, paths in metric_data.items():
         label       = METRIC_LABELS.get(metric, metric.capitalize())
@@ -1326,10 +1333,11 @@ def build_multi_metric_report(
             numeric_cols_map[metric] = []
             leading_edge_map[metric] = {}
         plots_html = _plot_section(plots_dir, plot_names)
-        desc       = _METRIC_DESCS.get(metric, "")
+        desc       = "" if single_metric else _METRIC_DESCS.get(metric, "")
+        desc_html  = ('<p class="metric-desc">%s</p>' % desc) if desc else ""
         tab_panels_parts.append(
             '<div id="tab-{m}" class="tab-panel{ac}" role="tabpanel">\n'
-            '  <p class="metric-desc">{desc}</p>\n'
+            '  {desc_html}\n'
             '  <h3>Plots</h3>\n'
             '  <div class="plot-grid">{plots}</div>\n'
             '  <h3>Enrichment results</h3>\n'
@@ -1346,12 +1354,38 @@ def build_multi_metric_report(
             '</p>\n'
             '  {tbl}\n'
             '</div>\n'.format(
-                m=metric, ac=active_cls, desc=desc,
+                m=metric, ac=active_cls, desc_html=desc_html,
                 plots=plots_html, fdr=fdr_threshold, tbl=tbl_html,
             )
         )
         first = False
-    html = _MULTI_TEMPLATE.format(
+
+    # Filtering summary tab — always appended last; never the default-active
+    # tab (the JS default-click targets the first .tab-btn in DOM order,
+    # which is always one of the metric tabs above).
+    tab_buttons_parts.append(
+        '    <button class="tab-btn" data-metric="filtering-summary" '
+        'role="tab" aria-controls="tab-filtering-summary">Filtering summary</button>'
+    )
+    filtering_html = _build_filtering_summary_tab_content(
+        mode=mode, label1=label1, label2=label2,
+        pipeline_stats_path=pipeline_stats_path,
+        pipeline_stats_path1=pipeline_stats_path1,
+        pipeline_stats_path2=pipeline_stats_path2,
+        differential_stats_path=differential_stats_path,
+        report_dir=report_dir,
+    )
+    tab_panels_parts.append(
+        '<div id="tab-filtering-summary" class="tab-panel" role="tabpanel">\n'
+        '  <p class="metric-desc">Counts of input groups and sequences '
+        'retained or excluded at each pipeline stage, and why. "View list" '
+        'links open a separate page listing the affected group or sequence '
+        'IDs.</p>\n'
+        '  %s\n'
+        '</div>\n' % filtering_html
+    )
+
+    html = _TEMPLATE.format(
         title=title, dt_css=dt_css,
         tab_buttons="\n".join(tab_buttons_parts),
         tab_panels="\n".join(tab_panels_parts),
@@ -1363,4 +1397,76 @@ def build_multi_metric_report(
     )
     with open(report_path, "w", encoding="utf-8") as fh:
         fh.write(html)
-    logger.info("Multi-metric HTML report written to: %s", report_path)
+    logger.info("HTML report written to: %s", report_path)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def build_report(
+    results_dir: str,
+    plots_dir: str,
+    report_path: str,
+    obo_path: str | None = None,
+    mode: str = "single",
+    metric: str = "zscore",
+    fdr_threshold: float = 0.25,
+    gmt_path: str | None = None,
+    tables_dir1: str | None = None,
+    tables_dir2: str | None = None,
+    label1: str = "List 1",
+    label2: str = "List 2",
+    pipeline_stats_path: str | None = None,
+    pipeline_stats_path1: str | None = None,
+    pipeline_stats_path2: str | None = None,
+    differential_stats_path: str | None = None,
+):
+    """Build a single-metric HTML report (one enrichment tab + Filtering summary).
+
+    Thin wrapper around _build_report_impl() with a one-entry metric_data
+    dict, so single-metric and multi-metric reports share one implementation
+    and one visual shell.
+    """
+    metric_data = {metric: {"results_dir": results_dir, "plots_dir": plots_dir}}
+    _build_report_impl(
+        metric_data=metric_data, report_path=report_path, obo_path=obo_path,
+        fdr_threshold=fdr_threshold, mode=mode, gmt_path=gmt_path,
+        tables_dir1=tables_dir1, tables_dir2=tables_dir2,
+        label1=label1, label2=label2,
+        pipeline_stats_path=pipeline_stats_path,
+        pipeline_stats_path1=pipeline_stats_path1,
+        pipeline_stats_path2=pipeline_stats_path2,
+        differential_stats_path=differential_stats_path,
+    )
+
+
+def build_multi_metric_report(
+    metric_data: dict,
+    report_path: str,
+    obo_path: str | None = None,
+    fdr_threshold: float = 0.25,
+    mode: str = "single",
+    gmt_path: str | None = None,
+    tables_dir1: str | None = None,
+    tables_dir2: str | None = None,
+    label1: str = "List 1",
+    label2: str = "List 2",
+    pipeline_stats_path: str | None = None,
+    pipeline_stats_path1: str | None = None,
+    pipeline_stats_path2: str | None = None,
+    differential_stats_path: str | None = None,
+):
+    """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
+    including the Filtering summary tab appended after the metric tabs.
+    """
+    _build_report_impl(
+        metric_data=metric_data, report_path=report_path, obo_path=obo_path,
+        fdr_threshold=fdr_threshold, mode=mode, gmt_path=gmt_path,
+        tables_dir1=tables_dir1, tables_dir2=tables_dir2,
+        label1=label1, label2=label2,
+        pipeline_stats_path=pipeline_stats_path,
+        pipeline_stats_path1=pipeline_stats_path1,
+        pipeline_stats_path2=pipeline_stats_path2,
+        differential_stats_path=differential_stats_path,
+    )
