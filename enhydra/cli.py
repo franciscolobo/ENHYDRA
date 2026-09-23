@@ -160,6 +160,7 @@ def _run_single_list(
     length_stats_dir  = os.path.join(listdir, "length_stats")
     length_filter_dir = os.path.join(listdir, "length_filter")
     group_filter_dir  = os.path.join(listdir, "group_filter")
+    group_stats_dir   = os.path.join(listdir, "group_filter_stats")
     alignment_dir     = os.path.join(listdir, "alignment")
     stripped_dir      = os.path.join(listdir, "alignment_stripped")
     trimmed_dir       = os.path.join(listdir, "alignment_trimmed")
@@ -213,6 +214,7 @@ def _run_single_list(
             filter_groups(
                 length_filter_dir=length_filter_dir,
                 group_filter_dir=group_filter_dir,
+                group_stats_dir=group_stats_dir,
                 anchor=anchor,
                 min_species=min_species,
                 min_sequences=min_sequences,

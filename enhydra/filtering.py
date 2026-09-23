@@ -4,6 +4,7 @@ import os
 import random
 import logging
 import statistics
+from collections import Counter
 import numpy as np
 from Bio import SeqIO
 from tqdm import tqdm
@@ -146,9 +147,33 @@ def filter_groups(
     min_sequences: int = 2,
     paralog_mode: str = "all",
     require_anchor: bool = True,
+    group_stats_dir: str | None = None,
     show_progress: bool = False,
 ):
     """Filter groups lacking the anchor species or below the minimum species count.
+
+    In addition to writing the passing group FASTAs to group_filter_dir, this
+    also writes two small QC/reporting files into a *separate* group_stats_dir
+    (mirroring how filter_length keeps its length_stats_dir separate from its
+    length_filter_dir output). This separation matters: group_filter_dir is
+    later read wholesale by the aligner (run_aligner/run_mafft etc.), which
+    assumes every file it lists is a sequence-group FASTA to align. Writing
+    stats files into group_filter_dir itself would get them picked up and
+    fed into MAFFT/trimAl as if they were real groups.
+
+    Both stats files are opened in write mode so re-runs produce clean
+    output rather than appending duplicates:
+
+    - drop_reasons.tsv: one row per group removed at this step, with
+      columns group_id, reason, detail. 'reason' is one of:
+      'below_min_sequences', 'missing_anchor', 'below_min_species',
+      'paralogs_removed'. Groups dropped earlier (e.g. by filter_length)
+      are not included here — this file only covers this step's decisions.
+    - species_counts.tsv: one row per species, with the number of
+      surviving (written) groups that species appears in, sorted ascending
+      by count so an underrepresented genome sorts to the top. Useful for
+      spotting a genome that is systematically thin (e.g. due to
+      consistently failing the anchor or length checks upstream).
 
     Args:
         length_filter_dir: Directory of length-filtered FASTA files.
@@ -158,6 +183,9 @@ def filter_groups(
         min_sequences:     Minimum number of sequences required (default: 2).
         paralog_mode:      How to handle paralogs: 'all', 'remove', 'longest'.
         require_anchor:    Discard groups lacking the anchor species.
+        group_stats_dir:   Directory for this step's QC/reporting files
+                           (drop_reasons.tsv, species_counts.tsv). Defaults
+                           to '<group_filter_dir>_stats' if not given.
         show_progress:     Show a tqdm progress bar.
     """
     if paralog_mode not in PARALOG_MODES:
@@ -165,8 +193,16 @@ def filter_groups(
             "Invalid paralog_mode '%s'. Choose from: %s" % (paralog_mode, PARALOG_MODES)
         )
 
+    if group_stats_dir is None:
+        group_stats_dir = group_filter_dir.rstrip("/\\") + "_stats"
+
     os.makedirs(group_filter_dir, exist_ok=True)
+    os.makedirs(group_stats_dir, exist_ok=True)
     files = os.listdir(length_filter_dir)
+
+    drop_reasons:  list[tuple[str, str, str]] = []
+    species_counts: Counter = Counter()
+
     for file in tqdm(files, desc="  groups", unit="group",
                      leave=False, disable=not show_progress):
         group_name    = file.split(".")[0]
@@ -179,6 +215,10 @@ def filter_groups(
                 "Group %s has fewer than %d sequences. Group removed.",
                 group_name, min_sequences,
             )
+            drop_reasons.append((
+                group_name, "below_min_sequences",
+                "n_sequences=%d;min_required=%d" % (len(records), min_sequences),
+            ))
             continue
 
         species_ids = [r.id.split("|")[0] for r in records]
@@ -189,6 +229,9 @@ def filter_groups(
                 "Group %s does not contain anchor species %s. Group removed.",
                 group_name, anchor,
             )
+            drop_reasons.append((
+                group_name, "missing_anchor", "anchor=%s" % anchor,
+            ))
             continue
 
         if len(uniq_ids) < min_species:
@@ -196,6 +239,10 @@ def filter_groups(
                 "Group %s has fewer species than minimum required (%s). Group removed.",
                 group_name, min_species,
             )
+            drop_reasons.append((
+                group_name, "below_min_species",
+                "n_species=%d;min_required=%d" % (len(uniq_ids), min_species),
+            ))
             continue
 
         has_paralogs = len(species_ids) > len(uniq_ids)
@@ -205,6 +252,10 @@ def filter_groups(
                     "Group %s contains paralogs and will be removed (--paralogs remove).",
                     group_name,
                 )
+                drop_reasons.append((
+                    group_name, "paralogs_removed",
+                    "n_species=%d;n_sequences=%d" % (len(uniq_ids), len(species_ids)),
+                ))
                 continue
             elif paralog_mode == "longest":
                 records = _resolve_paralogs_longest(records)
@@ -216,6 +267,33 @@ def filter_groups(
         with open(outfile_path, "w") as out_fh:
             for record in records:
                 out_fh.write(">%s\n%s\n" % (record.id, record.seq))
+
+        # Species membership is unaffected by paralog resolution (longest
+        # mode keeps exactly one sequence per species already present), so
+        # uniq_ids correctly reflects the species composition of what was
+        # just written regardless of paralog_mode.
+        species_counts.update(uniq_ids)
+
+    drop_reasons_path = os.path.join(group_stats_dir, "drop_reasons.tsv")
+    with open(drop_reasons_path, "w") as fh:
+        fh.write("group_id\treason\tdetail\n")
+        for group_id, reason, detail in sorted(drop_reasons):
+            fh.write("%s\t%s\t%s\n" % (group_id, reason, detail))
+    logger.info(
+        "Group filter drop reasons written: %d group(s) removed. Path: %s",
+        len(drop_reasons), drop_reasons_path,
+    )
+
+    species_counts_path = os.path.join(group_stats_dir, "species_counts.tsv")
+    with open(species_counts_path, "w") as fh:
+        fh.write("species_id\tn_groups\n")
+        for species_id, count in sorted(species_counts.items(),
+                                        key=lambda kv: (kv[1], kv[0])):
+            fh.write("%s\t%d\n" % (species_id, count))
+    logger.info(
+        "Group filter species counts written: %d species across surviving groups. Path: %s",
+        len(species_counts), species_counts_path,
+    )
 
 
 def strip_species_from_alignments(

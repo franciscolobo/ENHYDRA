@@ -1,0 +1,33 @@
+# --- Input/Output ---
+inputdir    = test_data/hymenoptera/groups_small
+outdir      = validation/hymenoptera_output_bee_vs_ant_paralogs_small
+anchor      = Apis_mellifera
+max_process = 8
+
+# --- Filtering ---
+min_species     = 5        # minimum number of species per orthogroup
+min_sequences   = 5         # minimum sequences per group after length filtering
+paralogs        = all       # all | remove | longest
+length_filter_sd = 1      # sequences beyond mean ± (sd * length_filter_sd) are removed
+
+# --- Alignment ---
+aligner     = mafft         # mafft | muscle | prank
+mafft_mode  = auto          # auto | linsi | ginsi | einsi | fftnsi | fftns | nwnsi | nwns
+
+# --- Gene set enrichment ---
+gene_sets     = test_data/hymenoptera/GO_annotation/Apis_mellifera_GO_BP.gmt
+min_size      = 5
+max_size      = 1000
+permutations  = 1000
+seed          = 42
+fdr_threshold = 0.2
+
+# --- Report ---
+top_n       = 20            # number of gene sets shown in barplot
+obo_cache   = test_data/obo_cache
+
+# --- Two-list differential mode (optional) ---
+list1      = test_data/hymenoptera/metadata/Bees.txt
+list2      = test_data/hymenoptera/metadata/Ants.txt
+list1_name = Bees
+list2_name = Ants
