@@ -1,4 +1,6 @@
-optimize the output
 create a non-redundant gmt using the OBO file (if GOs have a child-parent relationship and have the same genes, get only the more specific one).
 create a REVIGO-like filter to plot fewer GO terms
-don't include NES plots in the html; instead, leave them in a folder and load them on default 
+export as excel
+show individual alignment identities for the homologs
+checkbox to filter only significants
+show alignments
