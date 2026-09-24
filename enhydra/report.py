@@ -172,6 +172,7 @@ details.aln-tree-term > summary {{ cursor: pointer; font-weight: 600;
 .aln-tree-group {{ font-weight: 600; min-width: 160px; }}
 .aln-tree-gene {{ color: #555; min-width: 200px; }}
 .aln-tree-identity {{ color: #555; min-width: 120px; }}
+.aln-tree-diff {{ color: #1a3a5c; font-weight: 600; min-width: 100px; }}
 a.aln-link {{ color: #1a3a5c; text-decoration: underline dotted; margin-right: 10px; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </style>
@@ -887,6 +888,7 @@ def _build_alignment_tree_html(
     report_dir: str,
     label1: str = "List 1",
     label2: str = "List 2",
+    tables_dir2: str | None = None,
 ) -> str:
     """Build the Alignments tab body: a GO-term-nested tree of alignment pages.
 
@@ -907,6 +909,15 @@ def _build_alignment_tree_html(
     the first gene, in sorted order, that matched) — this is a documented
     simplification to avoid confusing duplicate rows for one group under
     a single term.
+
+    In two-list mode (tables_dir2 given), each row shows both lists'
+    mean identity for that group (from each list's own group2mean.tsv)
+    plus their signed difference (list1 - list2), and rows within a term
+    are sorted by absolute difference descending — surfacing the most
+    divergent groups first so a user can triage without opening every
+    alignment. Groups missing an identity score in either list sort to
+    the end. In single-list mode, each row shows a single plain identity
+    value with no diff/sorting change (there is nothing to diff against).
 
     Args:
         gmt_gene_sets:     {term_id: [gene_id, ...]}, as returned by
@@ -929,14 +940,20 @@ def _build_alignment_tree_html(
                           into, used to convert the absolute paths in
                           alignment_pages1/2 into report-relative links
                           (same convention as enrichment plot linking).
-        label1:            Display label for the first link (the list
-                          name in two-list mode). In single-list mode
-                          (alignment_pages2 is None) this is ignored in
-                          favour of a plain "View alignment" label, since
-                          there is only one link and naming it after a
-                          list would be meaningless.
-        label2:            Display label for the second link (two-list
-                          mode only).
+        label1:            Display label for the first link/score column
+                          (the list name in two-list mode). In
+                          single-list mode (alignment_pages2 is None)
+                          the link label falls back to plain "View
+                          alignment", since naming it after a list would
+                          be meaningless with only one list.
+        label2:            Display label for the second link/score
+                          column (two-list mode only).
+        tables_dir2:       list2's tables/ directory, used to load its
+                          own group2mean.tsv for the per-row identity
+                          comparison. None in single-list mode, or if
+                          two-list identity comparison should be skipped
+                          (falls back to the single plain-identity
+                          display even if alignment_pages2 is given).
 
     Returns:
         HTML string: a filter input plus the nested <details> tree, or a
@@ -946,7 +963,8 @@ def _build_alignment_tree_html(
         return "<p>No alignment pages were generated for this run.</p>"
 
     group_to_genes = _load_group_to_genes(tables_dir1)
-    group_identity = _load_group_identity(tables_dir1)
+    identity1 = _load_group_identity(tables_dir1)
+    identity2 = _load_group_identity(tables_dir2) if tables_dir2 else {}
 
     gene_to_groups: dict[str, list[str]] = {}
     for gid, genes in group_to_genes.items():
@@ -962,20 +980,39 @@ def _build_alignment_tree_html(
          for gid, p in alignment_pages2.items()}
         if alignment_pages2 else {}
     )
-    two_list = bool(alignment_pages2)
+    two_list = bool(alignment_pages2) and tables_dir2 is not None
 
-    term_entries: dict[str, list[tuple[str, str]]] = {}
+    term_entries: dict[str, list[dict]] = {}
     for term_id, genes in gmt_gene_sets.items():
         seen_groups: set[str] = set()
-        entries: list[tuple[str, str]] = []
+        entries: list[dict] = []
         for gene in sorted(genes):
             for group_id in gene_to_groups.get(gene, []):
                 if group_id in seen_groups or group_id not in rel_pages1:
                     continue
                 seen_groups.add(group_id)
-                entries.append((group_id, gene))
+                id1 = identity1.get(group_id)
+                id2 = identity2.get(group_id) if two_list else None
+                diff = (id1 - id2) if (id1 is not None and id2 is not None) else None
+                entries.append({
+                    "group_id": group_id, "gene_id": gene,
+                    "id1": id1, "id2": id2, "diff": diff,
+                })
         if entries:
-            term_entries[term_id] = sorted(entries)
+            if two_list:
+                # Sorted by signed diff (id1 - id2) descending: groups where
+                # list1 is more conserved / list2 is more variable (positive
+                # diff) appear first, sliding down through zero to groups
+                # where list2 is more conserved / list1 is more variable
+                # (negative diff) at the bottom. Missing-diff rows always
+                # sort last regardless of sign. Deliberately signed rather
+                # than by |diff| — the direction of the difference is the
+                # point, not just its magnitude.
+                entries.sort(key=lambda e: (e["diff"] is None,
+                                            -e["diff"] if e["diff"] is not None else 0))
+            else:
+                entries.sort(key=lambda e: e["group_id"])
+            term_entries[term_id] = entries
 
     if not term_entries:
         return "<p>No GO terms could be matched to rendered alignment pages.</p>"
@@ -991,9 +1028,8 @@ def _build_alignment_tree_html(
             len(entries), "" if len(entries) == 1 else "s",
         )
         rows_html = []
-        for group_id, gene_id in entries:
-            identity = group_identity.get(group_id)
-            identity_str = "%.4f" % identity if identity is not None else "N/A"
+        for e in entries:
+            group_id, gene_id = e["group_id"], e["gene_id"]
             link1_label = html.escape(label1) if two_list else "View alignment"
             links = '<a href="%s" target="_blank" class="aln-link">%s</a>' % (
                 rel_pages1[group_id], link1_label,
@@ -1002,6 +1038,22 @@ def _build_alignment_tree_html(
                 links += ' <a href="%s" target="_blank" class="aln-link">%s</a>' % (
                     rel_pages2[group_id], html.escape(label2),
                 )
+
+            if two_list:
+                id1_str = "%.4f" % e["id1"] if e["id1"] is not None else "N/A"
+                id2_str = "%.4f" % e["id2"] if e["id2"] is not None else "N/A"
+                diff_str = "%+.4f" % e["diff"] if e["diff"] is not None else "N/A"
+                score_html = (
+                    '<span class="aln-tree-identity">%s: %s</span>'
+                    '<span class="aln-tree-identity">%s: %s</span>'
+                    '<span class="aln-tree-diff">\u0394: %s</span>'
+                    % (html.escape(label1), id1_str,
+                       html.escape(label2), id2_str, diff_str)
+                )
+            else:
+                id1_str = "%.4f" % e["id1"] if e["id1"] is not None else "N/A"
+                score_html = '<span class="aln-tree-identity">identity: %s</span>' % id1_str
+
             search_key = html.escape(
                 ("%s %s %s %s" % (group_id, gene_id, term_id, term_name)).lower()
             )
@@ -1009,11 +1061,11 @@ def _build_alignment_tree_html(
                 '<div class="aln-tree-row" data-search="%s">'
                 '<span class="aln-tree-group">%s</span>'
                 '<span class="aln-tree-gene">anchor: %s</span>'
-                '<span class="aln-tree-identity">identity: %s</span>'
+                '%s'
                 '<span class="aln-tree-links">%s</span>'
                 "</div>"
                 % (search_key, html.escape(group_id), html.escape(gene_id),
-                   identity_str, links)
+                   score_html, links)
             )
         term_search_key = html.escape(("%s %s" % (term_id, term_name)).lower())
         blocks.append(
@@ -1612,6 +1664,7 @@ def _build_report_impl(
         report_dir=report_dir,
         label1=label1,
         label2=label2,
+        tables_dir2=tables_dir2,
     )
     tab_panels_parts.append(
         '<div id="tab-alignments" class="tab-panel" role="tabpanel">\n'
