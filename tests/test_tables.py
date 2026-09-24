@@ -333,8 +333,7 @@ class TestMakeTablesDropReasons:
         assert reasons["OG0003"] == "no_anchor_sequence"
         assert "OG0001" not in reasons
 
-
-def test_no_anchor_sequence_not_recorded_when_not_required(self, tmp_path):
+    def test_no_anchor_sequence_not_recorded_when_not_required(self, tmp_path):
         """When require_anchor=False (e.g. list2 in two-list mode), a missing
         anchor sequence is expected and must not appear in drop_reasons.tsv,
         even though the group still correctly contributes to group2mean.tsv."""

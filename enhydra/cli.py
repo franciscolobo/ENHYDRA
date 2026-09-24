@@ -18,6 +18,7 @@ from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .stats import aggregate_pipeline_stats, compute_differential_stats
+from .msa_viewer import build_alignment_pages, load_group_anchor
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 ALL_METRICS = ("identity", "zscore", "rank")
@@ -64,6 +65,26 @@ def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bo
 
 def _filter_length_star(args):
     return filter_length(*args)
+
+
+def _reconstruct_alignment_pages(pages_dir: str) -> dict[str, str]:
+    """Rebuild a {group_id: page_path} map from an existing alignments/ dir.
+
+    Used when a --resume/--replot run skips regenerating alignment pages
+    because pages_dir already has content from a prior run. Downstream
+    steps (report building, in a later commit) still need this mapping
+    populated regardless of which branch ran, so it is reconstructed from
+    whatever HTML files are already on disk rather than left undefined —
+    the same "must stay populated either way" concern already handled for
+    tables_dir/stats elsewhere in this module.
+    """
+    if not os.path.isdir(pages_dir):
+        return {}
+    return {
+        os.path.splitext(f)[0]: os.path.abspath(os.path.join(pages_dir, f))
+        for f in os.listdir(pages_dir)
+        if f.endswith(".html")
+    }
 
 
 def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
@@ -158,16 +179,23 @@ def _run_single_list(
             return True
         return False
 
-    subset_dir        = os.path.join(listdir, "subset")
-    length_stats_dir  = os.path.join(listdir, "length_stats")
-    length_filter_dir = os.path.join(listdir, "length_filter")
-    group_filter_dir  = os.path.join(listdir, "group_filter")
-    group_stats_dir   = os.path.join(listdir, "group_filter_stats")
-    alignment_dir     = os.path.join(listdir, "alignment")
-    stripped_dir      = os.path.join(listdir, "alignment_stripped")
-    trimmed_dir       = os.path.join(listdir, "alignment_trimmed")
-    ident_dir         = os.path.join(listdir, "ident_alignment")
-    tables_dir        = os.path.join(listdir, "tables")
+    subset_dir           = os.path.join(listdir, "subset")
+    length_stats_dir      = os.path.join(listdir, "length_stats")
+    length_filter_dir     = os.path.join(listdir, "length_filter")
+    group_filter_dir      = os.path.join(listdir, "group_filter")
+    group_stats_dir       = os.path.join(listdir, "group_filter_stats")
+    alignment_dir         = os.path.join(listdir, "alignment")
+    stripped_dir          = os.path.join(listdir, "alignment_stripped")
+    trimmed_dir           = os.path.join(listdir, "alignment_trimmed")
+    # Sidecar directory for trimAl's -colnumbering output, capturing which
+    # original alignment columns survive trimming. Populated only when
+    # trim_args is set (see the trim_args block below). cli.py's main()
+    # recomputes this exact same path independently — using the same
+    # listdir-based naming convention — when building alignment pages, so
+    # the two must be kept in sync if this naming ever changes.
+    trim_colnumbering_dir = os.path.join(listdir, "alignment_trimmed_colnumbering")
+    ident_dir              = os.path.join(listdir, "ident_alignment")
+    tables_dir             = os.path.join(listdir, "tables")
 
     # These two flags answer genuinely different questions and must not be
     # conflated: 'require_anchor' controls whether filter_groups() *drops*
@@ -291,7 +319,22 @@ def _run_single_list(
                 "Step 3c: Trimming alignment columns with trimAl (%s)",
                 " ".join(trim_args),
             )
-            if not _skip(trimmed_dir, "column trimming"):
+            # Colnumbering capture rides along with the existing -out
+            # trimming call (trimAl supports both flags together — see
+            # msa_viewer module notes), so it is always captured whenever
+            # trimming is enabled at all; there is no separate opt-in flag.
+            #
+            # The skip-guard here deliberately checks *both* trimmed_dir
+            # and trim_colnumbering_dir rather than reusing the plain
+            # _skip(trimmed_dir, ...) helper: if trimmed_dir already has
+            # contents from a run predating this feature, a resumed run
+            # would otherwise skip the whole block forever and never
+            # produce colnumbering sidecar files at all. This mirrors the
+            # aggregate_length_filter_stats() lesson elsewhere in this
+            # function — a resume-guard checking only one of two outputs
+            # a step produces can silently strand the other output.
+            colnumbering_ready = _step_complete(trim_colnumbering_dir)
+            if not (resume and _step_complete(trimmed_dir) and colnumbering_ready):
                 run_trimal_columns(
                     alignment_dir=trimal_input_dir,
                     trimmed_dir=trimmed_dir,
@@ -299,6 +342,12 @@ def _run_single_list(
                     trim_args=trim_args,
                     n_proc=max_process,
                     show_progress=show_progress,
+                    colnumbering_dir=trim_colnumbering_dir,
+                )
+            else:
+                logger.info(
+                    "Skipping column trimming (output already exists: %s, %s)",
+                    trimmed_dir, trim_colnumbering_dir,
                 )
             trimal_input_dir = trimmed_dir
             sbar.update(1)
@@ -541,6 +590,36 @@ def main():
         )
         aggregate_pipeline_stats(outdir, n_input=stats["n_input"])
 
+        # Alignment pages (bucket 3 = every group in group2anchor.tsv).
+        # Rendered once here, not per metric — alignment pages don't
+        # depend on the ranking metric at all. Path naming mirrors the
+        # convention used inside _run_single_list() for trim_colnumbering_dir
+        # (listdir/alignment_trimmed_colnumbering); the two must stay in
+        # sync since this is recomputed independently rather than threaded
+        # through _run_single_list()'s return value.
+        alignment_dir_single   = os.path.join(outdir, "alignment")
+        alignment_pages_dir    = os.path.join(outdir, "alignments")
+        colnumbering_dir_single = (
+            os.path.join(outdir, "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+        if not (resume and _step_complete(alignment_pages_dir)):
+            logger.info("Rendering alignment pages for report...")
+            alignment_pages = build_alignment_pages(
+                alignment_dir=alignment_dir_single,
+                tables_dir=tables_dir,
+                outdir=alignment_pages_dir,
+                anchor_species=parameters['anchor'],
+                colnumbering_dir=colnumbering_dir_single,
+                show_progress=args.quiet,
+            )
+        else:
+            logger.info(
+                "Skipping alignment page generation (output already exists: %s)",
+                alignment_pages_dir,
+            )
+            alignment_pages = _reconstruct_alignment_pages(alignment_pages_dir)
+
         raw_anchor2mean = os.path.join(tables_dir, "anchor2mean.tsv")
         metric_outputs  = {}
 
@@ -695,6 +774,80 @@ def main():
             )
             metric_outputs[m] = {"results_dir": results_dir_m,
                                   "plots_dir":   plots_dir_m}
+
+        # Alignment pages (bucket 3 in two-list mode = every group_id in
+        # differential_scores.tsv, i.e. the intersection compute_differential()
+        # already computed). Built once here using metrics_to_run[0]'s
+        # differential_scores.tsv, not per metric — the group_id set is
+        # expected to be identical across metrics (same intersection of
+        # tables_dir1/tables_dir2, just a different score column), a
+        # simplifying assumption confirmed acceptable rather than
+        # re-validated against every metric's own output.
+        first_metric   = metrics_to_run[0]
+        first_diff_dir = os.path.join(
+            outdir, "differential%s" % (("_%s" % first_metric) if all_metrics else ""),
+        )
+        diff_scores_path = os.path.join(first_diff_dir, "differential_scores.tsv")
+
+        import pandas as _pd
+        diff_group_ids = list(
+            _pd.read_csv(diff_scores_path, sep="\t")["group_id"].astype(str)
+        )
+
+        list1_alignment_dir = os.path.join(outdir, "list1", "alignment")
+        list1_pages_dir      = os.path.join(outdir, "list1", "alignments")
+        list1_colnum_dir     = (
+            os.path.join(outdir, "list1", "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+        list2_alignment_dir = os.path.join(outdir, "list2", "alignment")
+        list2_pages_dir      = os.path.join(outdir, "list2", "alignments")
+        list2_colnum_dir     = (
+            os.path.join(outdir, "list2", "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+
+        if not (resume and _step_complete(list1_pages_dir)):
+            logger.info("Rendering %s alignment pages for report...", list1_name)
+            alignment_pages1 = build_alignment_pages(
+                alignment_dir=list1_alignment_dir,
+                tables_dir=tables_dir1,
+                outdir=list1_pages_dir,
+                group_ids=diff_group_ids,
+                anchor_species=anchor,
+                colnumbering_dir=list1_colnum_dir,
+                show_progress=args.quiet,
+            )
+        else:
+            logger.info(
+                "Skipping %s alignment page generation (output already exists: %s)",
+                list1_name, list1_pages_dir,
+            )
+            alignment_pages1 = _reconstruct_alignment_pages(list1_pages_dir)
+
+        # list2 never contains the anchor species (anchor_species=None
+        # disables pinning), but list1's own anchor gene mapping is passed
+        # through as page context so list2 pages still show which anchor
+        # gene this group corresponds to.
+        list1_anchor_lookup = load_group_anchor(tables_dir1)
+        if not (resume and _step_complete(list2_pages_dir)):
+            logger.info("Rendering %s alignment pages for report...", list2_name)
+            alignment_pages2 = build_alignment_pages(
+                alignment_dir=list2_alignment_dir,
+                tables_dir=tables_dir2,
+                outdir=list2_pages_dir,
+                group_ids=diff_group_ids,
+                anchor_species=None,
+                anchor_gene_lookup=list1_anchor_lookup,
+                colnumbering_dir=list2_colnum_dir,
+                show_progress=args.quiet,
+            )
+        else:
+            logger.info(
+                "Skipping %s alignment page generation (output already exists: %s)",
+                list2_name, list2_pages_dir,
+            )
+            alignment_pages2 = _reconstruct_alignment_pages(list2_pages_dir)
 
         logger.info("Building HTML report")
         if all_metrics:

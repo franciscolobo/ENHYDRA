@@ -54,10 +54,20 @@ IDENTITIES = {
     "OG000006": 0.90,
 }
 
-# Two gene sets that overlap with the four passing anchor gene IDs.
+# Two gene sets exercising GSEApy against the four passing anchor gene IDs.
+#
+# GO:0000001 deliberately covers only 3 of the 4 ranked genes (omits
+# ENSG00000171862 / OG000006), not all 4. A gene set covering 100% of the
+# ranked list is a degenerate case for the classic GSEA running-sum
+# enrichment statistic — there are no "miss" genes left to contribute the
+# complementary term, and GSEApy silently drops such gene sets from its
+# results rather than erroring. An earlier version of this fixture had
+# GO:0000001 cover all 4 genes and was silently excluded from every GSEA
+# run as a result; keeping a non-empty complement here is required for it
+# to appear in gseapy's output at all, not just a style preference.
 _GMT_LINES = [
     "GO:0000001\ttest process alpha\t"
-    "ENSG00000141510\tENSG00000012048\tENSG00000139618\tENSG00000171862",
+    "ENSG00000141510\tENSG00000012048\tENSG00000139618",
     "GO:0000002\ttest process beta\t"
     "ENSG00000139618\tENSG00000171862",
 ]
@@ -184,9 +194,20 @@ def filtered(workspace, input_dir):
         p.mkdir()
 
     for fname in os.listdir(input_dir):
+        # sd_multiplier=1.5 (tighter than the pipeline default of 2.0):
+        # with only 5 species per group, a single extreme outlier
+        # dominates its own stdev calculation enough that no outlier
+        # length can ever exceed mean + 2*stdev (see test_filtering.py's
+        # test_outlier_removed docstring for the same lesson learned
+        # with a larger, 10-baseline sample). 1.5 is comfortably below
+        # the ~1.79 threshold needed to catch OG000006's 3x-length
+        # drerio outlier, while OG000001-3 have zero length variance
+        # (pure substitution mutations, no indels) and so are unaffected
+        # by this choice regardless of value.
         filter_length(
             os.path.join(input_dir, fname),
             str(stats_dir), str(lf_dir),
+            sd_multiplier=1.5,
         )
 
     filter_groups(

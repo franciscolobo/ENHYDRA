@@ -136,7 +136,7 @@ def build_gmt_from_gprofiler(
     with open(gmt_path, "w") as fh:
         for _, row in results.iterrows():
             genes = row.get("intersections")
-            if not genes:
+            if not isinstance(genes, (list, tuple, set)) or len(genes) == 0:
                 continue
             fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], "\t".join(genes)))
             n_terms += 1

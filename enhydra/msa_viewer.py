@@ -17,6 +17,7 @@ __all__ = [
     "compute_column_stats",
     "render_alignment_page",
     "build_alignment_pages",
+    "load_group_anchor",
 ]
 
 _GAP_CHARS = frozenset("-.")
@@ -552,6 +553,20 @@ def _load_group_mean(tables_dir: str) -> dict[str, float]:
             except ValueError:
                 continue
     return result
+
+
+def load_group_anchor(tables_dir: str) -> dict[str, str]:
+    """Load a list's group2anchor.tsv as a {group_id: anchor_gene_id} dict.
+
+    Public (unlike _load_group_mean) because cli.py needs this mapping
+    directly when building an anchor_gene_lookup override for list2's
+    alignment pages in two-list mode — list2's own group2anchor.tsv is
+    expected to be empty by design (list2 never contains the anchor
+    species), so list1's mapping is passed through instead.
+
+    Returns an empty dict if the file does not exist.
+    """
+    return _load_group_anchor(tables_dir)
 
 
 def _load_group_anchor(tables_dir: str) -> dict[str, str]:
