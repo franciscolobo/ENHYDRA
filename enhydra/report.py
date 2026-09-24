@@ -3,6 +3,7 @@ from .io import parse_obo_names as _parse_obo_names
 
 import json
 import os
+import html
 import base64
 import logging
 import urllib.request
@@ -44,12 +45,12 @@ _METRIC_DESCS = {
 # ---------------------------------------------------------------------------
 # Unified report template — one tab shell used for every report, regardless
 # of how many ranking metrics were run. A single-metric report simply has
-# one metric tab plus the Filtering summary tab; a multi-metric report has
-# three metric tabs plus Filtering summary. This replaces what used to be
-# two separate templates (a flat non-tabbed layout for single-metric
-# reports, and a tabbed layout for multi-metric reports) — they had been
-# drifting into near-duplicates anyway, and the Filtering summary tab needs
-# to appear in both cases.
+# one metric tab plus the Alignments and Filtering summary tabs; a
+# multi-metric report has three metric tabs plus the same two. This
+# replaces what used to be two separate templates (a flat non-tabbed layout
+# for single-metric reports, and a tabbed layout for multi-metric reports)
+# — they had been drifting into near-duplicates anyway, and the Filtering
+# summary / Alignments tabs need to appear in both cases.
 # ---------------------------------------------------------------------------
 
 _TEMPLATE = """\
@@ -158,6 +159,20 @@ table.reason-table th, table.reason-table td {{ border: 1px solid #e0e0e0;
     padding: 5px 10px; font-size: 12.5px; text-align: left; }}
 table.reason-table th {{ background: #eef2f6; }}
 p.no-drops {{ color: #2f7d3c; font-size: 0.88em; margin: 4px 0 16px; }}
+.aln-tree-controls {{ margin-bottom: 14px; }}
+.aln-tree-controls input {{ width: 100%; max-width: 480px; padding: 8px 12px;
+    font-size: 13px; border: 1px solid #ccc; border-radius: 4px;
+    box-sizing: border-box; }}
+details.aln-tree-term {{ background: #fafbfc; border: 1px solid #e0e0e0;
+    border-radius: 6px; margin-bottom: 8px; padding: 8px 14px; }}
+details.aln-tree-term > summary {{ cursor: pointer; font-weight: 600;
+    color: #1a3a5c; padding: 4px 0; }}
+.aln-tree-row {{ display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
+    padding: 6px 4px 6px 20px; border-top: 1px solid #eee; font-size: 13px; }}
+.aln-tree-group {{ font-weight: 600; min-width: 160px; }}
+.aln-tree-gene {{ color: #555; min-width: 200px; }}
+.aln-tree-identity {{ color: #555; min-width: 120px; }}
+a.aln-link {{ color: #1a3a5c; text-decoration: underline dotted; margin-right: 10px; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </style>
 </head>
@@ -362,6 +377,26 @@ $(document).ready(function() {{
             }}
         }});
     }});
+    var alignFilterInput = document.getElementById('aln-tree-filter');
+    if (alignFilterInput) {{
+        alignFilterInput.addEventListener('input', function() {{
+            var q = this.value.trim().toLowerCase();
+            document.querySelectorAll('#aln-tree .aln-tree-term').forEach(function(term) {{
+                var termMatch = (term.getAttribute('data-term-search') || '').indexOf(q) !== -1;
+                var rows = term.querySelectorAll('.aln-tree-row');
+                var anyRowMatch = false;
+                rows.forEach(function(row) {{
+                    var rowMatch = !q || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
+                    row.style.display = rowMatch ? '' : 'none';
+                    if (rowMatch) anyRowMatch = true;
+                }});
+                var show = !q || termMatch || anyRowMatch;
+                term.style.display = show ? '' : 'none';
+                if (q && show) {{ term.open = true; }}
+                if (!q) {{ term.open = false; }}
+            }});
+        }});
+    }}
     $(document).on('click', '.go-link', function(e) {{
         e.preventDefault();
         var goId   = $(this).data('goid');
@@ -513,12 +548,12 @@ def _tsv_to_details_html(tsv_path: str, html_path: str, title: str) -> bool:
         cells = "".join("<td>%s</td>" % c for c in row)
         row_lines.append('<tr data-reason="%s">%s</tr>' % (reason_val, cells))
 
-    html = _DETAILS_PAGE_TEMPLATE.format(
+    html_content = _DETAILS_PAGE_TEMPLATE.format(
         title=title, header_html=header_html,
         rows_html="\n".join(row_lines), n_rows=len(rows),
     )
     with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(html)
+        fh.write(html_content)
     return True
 
 
@@ -795,6 +830,204 @@ def _build_filtering_summary_tab_content(
         '<div class="filtering-summary-two-list">%s'
         '<div class="filtering-cols">%s%s</div></div>'
         % (overlap_html, col1, col2)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Alignments tab (GO-term-nested alignment page browser)
+# ---------------------------------------------------------------------------
+
+def _load_group_to_genes(tables_dir: str) -> dict[str, list[str]]:
+    """Load group2anchor.tsv as {group_id: [anchor_gene_id, ...]}.
+
+    Unlike msa_viewer.load_group_anchor() (which keeps only the last
+    gene_id per group_id, sufficient for single-line page metadata), this
+    preserves every row for a group — a group can map to more than one
+    anchor gene under --paralogs all, and GO-term membership needs to be
+    checked against all of them, not just whichever row happened to be
+    read last.
+    """
+    path = os.path.join(tables_dir, "group2anchor.tsv")
+    result: dict[str, list[str]] = {}
+    if not os.path.isfile(path):
+        return result
+    with open(path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                continue
+            result.setdefault(fields[0], []).append(fields[1])
+    return result
+
+
+def _load_group_identity(tables_dir: str) -> dict[str, float]:
+    """Load group2mean.tsv as {group_id: mean_identity}."""
+    path = os.path.join(tables_dir, "group2mean.tsv")
+    result: dict[str, float] = {}
+    if not os.path.isfile(path):
+        return result
+    with open(path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                continue
+            try:
+                result[fields[0]] = float(fields[1])
+            except ValueError:
+                continue
+    return result
+
+
+def _build_alignment_tree_html(
+    gmt_gene_sets: dict[str, list[str]],
+    tables_dir1: str | None,
+    obo_names: dict[str, str],
+    alignment_pages1: dict[str, str] | None,
+    alignment_pages2: dict[str, str] | None,
+    report_dir: str,
+    label1: str = "List 1",
+    label2: str = "List 2",
+) -> str:
+    """Build the Alignments tab body: a GO-term-nested tree of alignment pages.
+
+    Membership is determined by list1's (or the single list's)
+    group2anchor.tsv — the only source of anchor-gene -> GMT mapping that
+    exists — intersected with whichever groups actually received a
+    rendered page in alignment_pages1. In two-list mode, alignment_pages1
+    is already restricted by cli.py to the group_id column of
+    differential_scores.tsv (i.e. bucket 3: groups that actually fed
+    GSEA), so no separate intersection check against that file is needed
+    here.
+
+    A GO term is only listed if at least one of its genes maps to a group
+    with a rendered page; terms are sorted by matched-group count
+    descending. If a group has more than one anchor gene under
+    --paralogs all and more than one of those genes falls under the same
+    term, the group is still listed only once for that term (paired with
+    the first gene, in sorted order, that matched) — this is a documented
+    simplification to avoid confusing duplicate rows for one group under
+    a single term.
+
+    Args:
+        gmt_gene_sets:     {term_id: [gene_id, ...]}, as returned by
+                          _gmt_gene_sets().
+        tables_dir1:       list1's (or the single list's) tables/
+                          directory. None disables the tab content
+                          (returns an explanatory message) rather than
+                          raising.
+        obo_names:         {term_id: term_name}, for display alongside
+                          each GO ID.
+        alignment_pages1:  {group_id: absolute_path}, as returned by
+                          build_alignment_pages() for the single list /
+                          list1. None or empty disables the tab content.
+        alignment_pages2:  {group_id: absolute_path} for list2, or None
+                          in single-list mode. When given, each leaf
+                          shows a second link labelled with label2,
+                          shown only for groups that also have a list2
+                          page.
+        report_dir:        Directory report.html itself will be written
+                          into, used to convert the absolute paths in
+                          alignment_pages1/2 into report-relative links
+                          (same convention as enrichment plot linking).
+        label1:            Display label for the first link (the list
+                          name in two-list mode). In single-list mode
+                          (alignment_pages2 is None) this is ignored in
+                          favour of a plain "View alignment" label, since
+                          there is only one link and naming it after a
+                          list would be meaningless.
+        label2:            Display label for the second link (two-list
+                          mode only).
+
+    Returns:
+        HTML string: a filter input plus the nested <details> tree, or a
+        placeholder message if no data is available to build it from.
+    """
+    if not tables_dir1 or not alignment_pages1:
+        return "<p>No alignment pages were generated for this run.</p>"
+
+    group_to_genes = _load_group_to_genes(tables_dir1)
+    group_identity = _load_group_identity(tables_dir1)
+
+    gene_to_groups: dict[str, list[str]] = {}
+    for gid, genes in group_to_genes.items():
+        for gene in genes:
+            gene_to_groups.setdefault(gene, []).append(gid)
+
+    rel_pages1 = {
+        gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+        for gid, p in alignment_pages1.items()
+    }
+    rel_pages2 = (
+        {gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+         for gid, p in alignment_pages2.items()}
+        if alignment_pages2 else {}
+    )
+    two_list = bool(alignment_pages2)
+
+    term_entries: dict[str, list[tuple[str, str]]] = {}
+    for term_id, genes in gmt_gene_sets.items():
+        seen_groups: set[str] = set()
+        entries: list[tuple[str, str]] = []
+        for gene in sorted(genes):
+            for group_id in gene_to_groups.get(gene, []):
+                if group_id in seen_groups or group_id not in rel_pages1:
+                    continue
+                seen_groups.add(group_id)
+                entries.append((group_id, gene))
+        if entries:
+            term_entries[term_id] = sorted(entries)
+
+    if not term_entries:
+        return "<p>No GO terms could be matched to rendered alignment pages.</p>"
+
+    sorted_terms = sorted(term_entries.items(), key=lambda kv: -len(kv[1]))
+
+    blocks = []
+    for term_id, entries in sorted_terms:
+        term_name = obo_names.get(term_id, "")
+        summary_label = "%s%s (%d group%s)" % (
+            html.escape(term_id),
+            " \u2014 %s" % html.escape(term_name) if term_name else "",
+            len(entries), "" if len(entries) == 1 else "s",
+        )
+        rows_html = []
+        for group_id, gene_id in entries:
+            identity = group_identity.get(group_id)
+            identity_str = "%.4f" % identity if identity is not None else "N/A"
+            link1_label = html.escape(label1) if two_list else "View alignment"
+            links = '<a href="%s" target="_blank" class="aln-link">%s</a>' % (
+                rel_pages1[group_id], link1_label,
+            )
+            if two_list and group_id in rel_pages2:
+                links += ' <a href="%s" target="_blank" class="aln-link">%s</a>' % (
+                    rel_pages2[group_id], html.escape(label2),
+                )
+            search_key = html.escape(
+                ("%s %s %s %s" % (group_id, gene_id, term_id, term_name)).lower()
+            )
+            rows_html.append(
+                '<div class="aln-tree-row" data-search="%s">'
+                '<span class="aln-tree-group">%s</span>'
+                '<span class="aln-tree-gene">anchor: %s</span>'
+                '<span class="aln-tree-identity">identity: %s</span>'
+                '<span class="aln-tree-links">%s</span>'
+                "</div>"
+                % (search_key, html.escape(group_id), html.escape(gene_id),
+                   identity_str, links)
+            )
+        term_search_key = html.escape(("%s %s" % (term_id, term_name)).lower())
+        blocks.append(
+            '<details class="aln-tree-term" data-term-search="%s">'
+            "<summary>%s</summary>%s</details>"
+            % (term_search_key, summary_label, "".join(rows_html))
+        )
+
+    return (
+        '<div class="aln-tree-controls">'
+        '<input type="text" id="aln-tree-filter" '
+        'placeholder="Filter by GO ID, term name, group ID, or gene ID..."/>'
+        "</div>"
+        '<div id="aln-tree">%s</div>' % "".join(blocks)
     )
 
 
@@ -1214,36 +1447,36 @@ def _results_table_html(
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
 
-    html = (
+    html_content = (
         '<table id="%s" class="display compact" style="width:100%%">'
         '<thead><tr>%s</tr><tr class="filter-row">%s</tr></thead>'
         "<tbody>%s</tbody></table>"
     ) % (table_id, header_cells, filter_cells, rows)
 
-    return html, numeric_col_indices, full_sets_js, leadedge_js
+    return html_content, numeric_col_indices, full_sets_js, leadedge_js
 
 
 def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
-    html = ""
+    html_content = ""
     for stem, caption in names:
         svg_path = os.path.join(plots_dir, stem + ".svg")
         png_path = os.path.join(plots_dir, stem + ".png")
         if os.path.isfile(svg_path):
             with open(svg_path, encoding="utf-8") as fh:
                 svg_content = fh.read()
-            html += (
+            html_content += (
                 '<div class="plot-block">'
                 '<p class="plot-caption">%s (hover for details)</p>'
                 '%s</div>'
             ) % (caption, svg_content)
         elif os.path.isfile(png_path):
             uri = _img_to_base64(png_path)
-            html += (
+            html_content += (
                 '<div class="plot-block">'
                 '<p class="plot-caption">%s</p>'
                 '<img src="%s" alt="%s"/></div>'
             ) % (caption, uri, caption)
-    return html
+    return html_content
 
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1498,8 @@ def _build_report_impl(
     pipeline_stats_path1: str | None,
     pipeline_stats_path2: str | None,
     differential_stats_path: str | None,
+    alignment_pages1: dict[str, str] | None = None,
+    alignment_pages2: dict[str, str] | None = None,
 ):
     logger.info("Building HTML report (%d metric tab(s))...", len(metric_data))
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
@@ -1360,6 +1595,33 @@ def _build_report_impl(
         )
         first = False
 
+    # Alignments tab — appended after the metric tabs, before Filtering
+    # summary. Built from list1's (or the single list's) group2anchor.tsv
+    # plus whichever groups actually received a rendered alignment page;
+    # see _build_alignment_tree_html() for the full membership rules.
+    tab_buttons_parts.append(
+        '    <button class="tab-btn" data-metric="alignments" '
+        'role="tab" aria-controls="tab-alignments">Alignments</button>'
+    )
+    alignment_tree_html = _build_alignment_tree_html(
+        gmt_gene_sets=gene_sets_all,
+        tables_dir1=tables_dir1,
+        obo_names=term_names,
+        alignment_pages1=alignment_pages1,
+        alignment_pages2=alignment_pages2,
+        report_dir=report_dir,
+        label1=label1,
+        label2=label2,
+    )
+    tab_panels_parts.append(
+        '<div id="tab-alignments" class="tab-panel" role="tabpanel">\n'
+        '  <p class="metric-desc">Alignments for every orthogroup that fed '
+        'GSEA, nested by GO term. Columns shown hatched/dimmed, if any, '
+        'were removed by trimAl before identity estimation.</p>\n'
+        '  %s\n'
+        '</div>\n' % alignment_tree_html
+    )
+
     # Filtering summary tab — always appended last; never the default-active
     # tab (the JS default-click targets the first .tab-btn in DOM order,
     # which is always one of the metric tabs above).
@@ -1385,7 +1647,7 @@ def _build_report_impl(
         '</div>\n' % filtering_html
     )
 
-    html = _TEMPLATE.format(
+    html_content = _TEMPLATE.format(
         title=title, dt_css=dt_css,
         tab_buttons="\n".join(tab_buttons_parts),
         tab_panels="\n".join(tab_panels_parts),
@@ -1396,7 +1658,7 @@ def _build_report_impl(
         numeric_cols_map=json.dumps(numeric_cols_map),
     )
     with open(report_path, "w", encoding="utf-8") as fh:
-        fh.write(html)
+        fh.write(html_content)
     logger.info("HTML report written to: %s", report_path)
 
 
@@ -1421,8 +1683,11 @@ def build_report(
     pipeline_stats_path1: str | None = None,
     pipeline_stats_path2: str | None = None,
     differential_stats_path: str | None = None,
+    alignment_pages1: dict[str, str] | None = None,
+    alignment_pages2: dict[str, str] | None = None,
 ):
-    """Build a single-metric HTML report (one enrichment tab + Filtering summary).
+    """Build a single-metric HTML report (one enrichment tab + Alignments +
+    Filtering summary).
 
     Thin wrapper around _build_report_impl() with a one-entry metric_data
     dict, so single-metric and multi-metric reports share one implementation
@@ -1438,6 +1703,8 @@ def build_report(
         pipeline_stats_path1=pipeline_stats_path1,
         pipeline_stats_path2=pipeline_stats_path2,
         differential_stats_path=differential_stats_path,
+        alignment_pages1=alignment_pages1,
+        alignment_pages2=alignment_pages2,
     )
 
 
@@ -1456,9 +1723,12 @@ def build_multi_metric_report(
     pipeline_stats_path1: str | None = None,
     pipeline_stats_path2: str | None = None,
     differential_stats_path: str | None = None,
+    alignment_pages1: dict[str, str] | None = None,
+    alignment_pages2: dict[str, str] | None = None,
 ):
     """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
-    including the Filtering summary tab appended after the metric tabs.
+    including the Alignments and Filtering summary tabs appended after the
+    metric tabs.
     """
     _build_report_impl(
         metric_data=metric_data, report_path=report_path, obo_path=obo_path,
@@ -1469,4 +1739,6 @@ def build_multi_metric_report(
         pipeline_stats_path1=pipeline_stats_path1,
         pipeline_stats_path2=pipeline_stats_path2,
         differential_stats_path=differential_stats_path,
+        alignment_pages1=alignment_pages1,
+        alignment_pages2=alignment_pages2,
     )

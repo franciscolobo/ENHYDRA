@@ -660,6 +660,7 @@ def main():
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
+                alignment_pages1=alignment_pages,
             )
         else:
             build_report(
@@ -672,6 +673,7 @@ def main():
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
+                alignment_pages1=alignment_pages,
             )
 
         for m in metrics_to_run:
@@ -865,6 +867,8 @@ def main():
                 pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
                 pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
+                alignment_pages1=alignment_pages1,
+                alignment_pages2=alignment_pages2,
             )
         else:
             build_report(
@@ -883,6 +887,8 @@ def main():
                 pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
                 pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
+                alignment_pages1=alignment_pages1,
+                alignment_pages2=alignment_pages2,
             )
 
         for m in metrics_to_run:
