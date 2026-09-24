@@ -289,11 +289,17 @@ def filter_groups(
       'below_min_sequences', 'missing_anchor', 'below_min_species',
       'paralogs_removed'. Groups dropped earlier (e.g. by filter_length)
       are not included here — this file only covers this step's decisions.
-    - species_counts.tsv: one row per species, with the number of
-      surviving (written) groups that species appears in, sorted ascending
-      by count so an underrepresented genome sorts to the top. Useful for
-      spotting a genome that is systematically thin (e.g. due to
-      consistently failing the anchor or length checks upstream).
+    - species_counts.tsv: one row per species, with three columns:
+      n_groups_before (number of groups in length_filter_dir — this step's
+      input — that contain that species, counted regardless of whether the
+      group ultimately passes this step), n_groups_after (number of
+      surviving/written groups that species appears in), and pct_survived
+      (n_groups_after / n_groups_before, as a percentage). Rows are sorted
+      ascending by n_groups_after so an underrepresented genome sorts to the
+      top. Useful for spotting a genome that is systematically thin (e.g.
+      due to consistently failing the anchor or length checks upstream) or
+      one that is well represented going in but disproportionately dropped
+      at this specific step (e.g. because it drives paralog removal).
 
     Args:
         length_filter_dir: Directory of length-filtered FASTA files.
@@ -321,7 +327,8 @@ def filter_groups(
     files = os.listdir(length_filter_dir)
 
     drop_reasons:  list[tuple[str, str, str]] = []
-    species_counts: Counter = Counter()
+    species_counts_before: Counter = Counter()
+    species_counts_after:  Counter = Counter()
 
     for file in tqdm(files, desc="  groups", unit="group",
                      leave=False, disable=not show_progress):
@@ -343,6 +350,11 @@ def filter_groups(
 
         species_ids = [r.id.split("|")[0] for r in records]
         uniq_ids    = set(species_ids)
+
+        # Counted before any of this step's pass/fail decisions, so
+        # n_groups_before reflects every species present in this step's
+        # input regardless of whether the group ends up surviving.
+        species_counts_before.update(uniq_ids)
 
         if require_anchor and anchor not in uniq_ids:
             logger.warning(
@@ -392,7 +404,7 @@ def filter_groups(
         # mode keeps exactly one sequence per species already present), so
         # uniq_ids correctly reflects the species composition of what was
         # just written regardless of paralog_mode.
-        species_counts.update(uniq_ids)
+        species_counts_after.update(uniq_ids)
 
     drop_reasons_path = os.path.join(group_stats_dir, "drop_reasons.tsv")
     with open(drop_reasons_path, "w") as fh:
@@ -406,13 +418,17 @@ def filter_groups(
 
     species_counts_path = os.path.join(group_stats_dir, "species_counts.tsv")
     with open(species_counts_path, "w") as fh:
-        fh.write("species_id\tn_groups\n")
-        for species_id, count in sorted(species_counts.items(),
-                                        key=lambda kv: (kv[1], kv[0])):
-            fh.write("%s\t%d\n" % (species_id, count))
+        fh.write("species_id\tn_groups_before\tn_groups_after\tpct_survived\n")
+        for species_id, n_before in sorted(
+            species_counts_before.items(),
+            key=lambda kv: (species_counts_after.get(kv[0], 0), kv[0]),
+        ):
+            n_after = species_counts_after.get(species_id, 0)
+            pct     = round(100.0 * n_after / n_before, 1) if n_before else 0.0
+            fh.write("%s\t%d\t%d\t%.1f\n" % (species_id, n_before, n_after, pct))
     logger.info(
-        "Group filter species counts written: %d species across surviving groups. Path: %s",
-        len(species_counts), species_counts_path,
+        "Group filter species counts written: %d species across this step's input. Path: %s",
+        len(species_counts_before), species_counts_path,
     )
 
 

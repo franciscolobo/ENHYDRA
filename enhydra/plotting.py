@@ -268,7 +268,7 @@ def _save_identity_scatter_svg(
     Each circle represents one orthogroup.  Hovering shows the orthogroup ID,
     anchor gene ID, list 1 score, list 2 score, and differential score.
     Color encodes the differential score on an RdBu scale (blue = more
-    conserved in list 1, red = more conserved in list 2).
+    variable in list 2, red = more variable in list 1).
 
     Args:
         x:             List 1 scores, indexed by group_id.
@@ -470,10 +470,10 @@ def plot_differential_distribution(
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.hist(scores[scores >= 0], bins=40, color=PALETTE["positive"],
                 edgecolor="white", linewidth=0.5,
-                label="More conserved in %s" % name1)
+                label="More variable in %s" % name2)
         ax.hist(scores[scores < 0], bins=40, color=PALETTE["negative"],
                 edgecolor="white", linewidth=0.5,
-                label="More conserved in %s" % name2)
+                label="More variable in %s" % name1)
         ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
         ax.set_xlabel(xlabel, fontsize=12)
         ax.set_ylabel("Number of orthogroups", fontsize=12)

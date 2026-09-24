@@ -78,17 +78,43 @@ def _trimal_worker(args: tuple) -> None:
             "trimal failed on %s:\n%s" % (input_seq, e.stderr.decode())
         )
 
+def _extract_colnumbering_line(stdout_text: str) -> str:
+    """Return the '#ColumnsMap' line from trimAl -colnumbering stdout.
+
+    trimAl prints the '#ColumnsMap' line (retained original-column indices)
+    to stdout even when -out is also given and the trimmed alignment itself
+    is written to file. Isolating just this line for the sidecar file keeps
+    it to a single line instead of duplicating alignment data, and avoids
+    the column-index parser ever seeing unrelated digits.
+
+    Falls back to the last non-empty line if no '#ColumnsMap'-prefixed line
+    is found, in case a different trimAl version omits the label.
+    """
+    lines = [l for l in stdout_text.splitlines() if l.strip()]
+    for line in lines:
+        if line.startswith("#ColumnsMap"):
+            return line
+    return lines[-1] if lines else ""
+
 
 def _trimal_columns_worker(args: tuple) -> None:
-    input_seq, output_seq, trimal_path, trim_args = args
+    input_seq, output_seq, trimal_path, trim_args, colnumbering_path = args
     cmd = [trimal_path, "-in", input_seq, "-out", output_seq] + list(trim_args)
+    if colnumbering_path is not None:
+        cmd = cmd + ["-colnumbering"]
     try:
-        subprocess.run(cmd, stderr=subprocess.PIPE, check=True)
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+        )
     except subprocess.CalledProcessError as e:
         raise EnhydraToolError(
             "trimal column trimming failed on %s:\n%s"
             % (input_seq, e.stderr.decode())
         )
+    if colnumbering_path is not None:
+        colmap_line = _extract_colnumbering_line(result.stdout.decode())
+        with open(colnumbering_path, "w") as fh:
+            fh.write(colmap_line + "\n")
 
 
 def run_trimal_columns(
@@ -98,25 +124,42 @@ def run_trimal_columns(
     trim_args: list[str],
     n_proc: int = 1,
     show_progress: bool = False,
+    colnumbering_dir: str | None = None,
 ):
     """Trim alignment columns with trimAl before identity estimation.
 
     Args:
-        alignment_dir: Directory of (untrimmed) alignment files.
-        trimmed_dir:   Directory where column-trimmed alignments are written.
-        trimal_path:   Path to the trimAl executable.
-        trim_args:     trimAl CLI flags controlling the trimming mode, as
-                       returned by utils.resolve_trim_args() — e.g.
-                       ['-gt', '0.5'], ['-strict'], ['-strictplus'], or
-                       ['-automated1'].
-        n_proc:        Number of parallel worker processes.
-        show_progress: Show a tqdm progress bar.
+        alignment_dir:    Directory of (untrimmed) alignment files.
+        trimmed_dir:       Directory where column-trimmed alignments are written.
+        trimal_path:       Path to the trimAl executable.
+        trim_args:         trimAl CLI flags controlling the trimming mode, as
+                           returned by utils.resolve_trim_args() — e.g.
+                           ['-gt', '0.5'], ['-strict'], ['-strictplus'], or
+                           ['-automated1'].
+        n_proc:            Number of parallel worker processes.
+        show_progress:     Show a tqdm progress bar.
+        colnumbering_dir:  If given, also capture -colnumbering output per
+                           group as a sidecar file
+                           '<colnumbering_dir>/<file>.colnumbering', recording
+                           which original-alignment columns survived
+                           trimming (for later use masking trimmed columns
+                           when rendering an alignment). This runs alongside
+                           the existing -out trimming call rather than as a
+                           second trimAl invocation, since trimAl supports
+                           both flags together. Defaults to None (no
+                           colnumbering capture), preserving prior behaviour
+                           for callers that don't need it.
     """
     os.makedirs(trimmed_dir, exist_ok=True)
+    if colnumbering_dir is not None:
+        os.makedirs(colnumbering_dir, exist_ok=True)
+
     args_list = [
         (os.path.join(alignment_dir, f),
          os.path.join(trimmed_dir, f),
-         trimal_path, trim_args)
+         trimal_path, trim_args,
+         os.path.join(colnumbering_dir, f + ".colnumbering")
+         if colnumbering_dir is not None else None)
         for f in os.listdir(alignment_dir)
     ]
     _run_pool(_trimal_columns_worker, args_list, n_proc, show_progress)
