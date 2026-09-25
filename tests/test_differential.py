@@ -33,11 +33,24 @@ class TestNormaliseScores:
         assert result.min() > 0
         assert result.max() <= 1.0
 
-    def test_rank_highest_identity_lowest_rank_value(self):
-        """Rank=1/N should go to the most conserved (highest identity) group."""
+    def test_rank_highest_identity_gets_highest_rank_value(self):
+        """Rank=1.0 (N/N) should go to the most conserved (highest identity)
+        group, matching normalise_scores()'s own documented convention
+        ("1 = most conserved").
+
+        A prior version of this test asserted the opposite direction
+        (idxmin() instead of idxmax()), matching a since-fixed bug in the
+        'rank' branch of normalise_scores() itself (it used
+        ascending=False instead of ascending=True). The test was wrong in
+        the same direction as the code, so it passed despite the bug —
+        see test_all_three_metrics_agree_in_sign below for the test that
+        actually would have caught it via compute_differential().
+        """
         s = self._series([0.9, 0.5, 0.7])
         result = normalise_scores(s, "rank")
-        assert result.idxmin() == "OG0000"   # 0.9 gets rank 1 → 1/3
+        assert result.idxmax() == "OG0000"          # 0.9 is highest -> rank 3/3
+        assert result["OG0000"] == pytest.approx(1.0)
+        assert result["OG0001"] == pytest.approx(1 / 3)   # 0.5 is lowest -> rank 1/3
 
     def test_unknown_metric_raises(self):
         s = self._series([0.8, 0.6])
@@ -156,3 +169,56 @@ class TestComputeDifferential:
         compute_differential(t1, t2, diff_dir, metric="identity")
         assert os.path.isfile(os.path.join(diff_dir, "differential_scores.tsv"))
         assert os.path.isfile(os.path.join(diff_dir, "anchor2mean.tsv"))
+
+    def test_all_three_metrics_agree_in_sign(self, tmp_path):
+        """Regression test for a metric-specific sign-inversion bug.
+
+        For a group that is clearly more conserved *relative to its own
+        list's distribution* in list 1 than in list 2, all three ranking
+        metrics (identity, zscore, rank) must agree the differential score
+        is positive. A silent ascending/descending mistake in any one
+        metric's own normalisation (as previously happened for 'rank' in
+        normalise_scores(), which used ascending=False instead of
+        ascending=True) flips that metric's sign relative to the other two
+        without raising any error — GSEA's own statistics are symmetric
+        under negation, so the bug never surfaced as a crash, only as
+        rank-metric NES signs disagreeing with identity/zscore for
+        genuinely-enriched gene sets, and the Cross-metric consensus tab
+        misreporting real 2/3 agreement as "Mixed direction".
+
+        OG1 is deliberately an extreme high performer in list1's own
+        distribution (its max) while sitting near the *average* of list2's
+        distribution — not just uniformly shifted or rescaled relative to
+        the rest of its own list, since z-score and (up to ties) rank are
+        both invariant to a shared additive/multiplicative transform
+        applied to an entire list, and would trivially agree on sign for a
+        less carefully constructed case regardless of any sign bug.
+        """
+        group2mean1 = [
+            ("OG1", 0.95), ("OG2", 0.50), ("OG3", 0.55),
+            ("OG4", 0.60), ("OG5", 0.45),
+        ]
+        group2mean2 = [
+            ("OG1", 0.50), ("OG2", 0.50), ("OG3", 0.55),
+            ("OG4", 0.60), ("OG5", 0.45),
+        ]
+        group2anchor = [(g, "gene_%s" % g) for g, _ in group2mean1]
+
+        t1 = _make_tables_dir(tmp_path, "t1_sign",
+            group2mean=group2mean1, group2anchor=group2anchor)
+        t2 = _make_tables_dir(tmp_path, "t2_sign",
+            group2mean=group2mean2, group2anchor=group2anchor)
+
+        for metric in ("identity", "zscore", "rank"):
+            diff_dir = str(tmp_path / ("diff_sign_%s" % metric))
+            compute_differential(t1, t2, diff_dir, metric=metric)
+            scores = pd.read_csv(
+                os.path.join(diff_dir, "differential_scores.tsv"), sep="\t"
+            ).set_index("group_id")["score"]
+            assert scores["OG1"] > 0, (
+                "metric=%s gave OG1 a non-positive differential score "
+                "(%.4f), even though OG1 is the top performer within "
+                "list1's own distribution but only average within "
+                "list2's — all three metrics must agree this is positive."
+                % (metric, scores["OG1"])
+            )

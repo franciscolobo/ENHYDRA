@@ -8,6 +8,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
+from .differential import normalise_scores
+
 logging.getLogger("fontTools").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
@@ -232,12 +234,11 @@ def _save_gsea_barplot_svg(
             "text-anchor": "end", "font-size": "10", "fill": "#1a3a5c",
         }).text = go_id
 
-        fdr_x      = to_px(nes) + 5 if nes > 0 else to_px(nes) - 5
-        fdr_anchor = "start" if nes > 0 else "end"
-        ET.SubElement(g, "text", {
-            "x": str(fdr_x), "y": str(y + bar_h // 2 + 4),
-            "text-anchor": fdr_anchor, "font-size": "9", "fill": "#555",
-        }).text = "FDR=%.3f" % row["FDR q-val"]
+        # FDR is intentionally not drawn on the bar itself — for negative
+        # NES bars it would sit on the same (left) side as the GO ID
+        # label above, and the two would overlap for short bars or long
+        # GO IDs. The FDR value is still available via this bar's own
+        # data-tip attribute (tip_text, set below), shown on hover.
 
         ET.SubElement(g, "rect", {
             "x": str(margin_left), "y": str(y),
@@ -262,6 +263,7 @@ def _save_identity_scatter_svg(
     label1: str,
     label2: str,
     vmax: float,
+    title: str = "Identity comparison between lists",
 ):
     """Generate an interactive SVG scatter plot with per-point hover tooltips.
 
@@ -271,7 +273,11 @@ def _save_identity_scatter_svg(
     variable in list 2, red = more variable in list 1).
 
     Args:
-        x:             List 1 scores, indexed by group_id.
+        x:             List 1 scores, indexed by group_id. Callers are
+                       expected to pass the same metric-transformed values
+                       (raw identity, z-score, or rank) used to produce
+                       the differential score in `c` — see
+                       plot_identity_scatter()'s own docstring.
         y:             List 2 scores, indexed by group_id.
         c:             Differential scores, indexed by group_id.
         group2anchor:  group_id → anchor gene ID.
@@ -280,6 +286,10 @@ def _save_identity_scatter_svg(
         label2:        Y-axis label.
         vmax:          Differential score magnitude used for colour saturation
                        (typically the 95th percentile of abs(c)).
+        title:         Plot title. Defaults to the identity-metric wording
+                       for backward compatibility with any direct callers;
+                       plot_identity_scatter() always passes an explicit,
+                       metric-aware title.
     """
     import xml.etree.ElementTree as ET
 
@@ -287,9 +297,17 @@ def _save_identity_scatter_svg(
     pw, ph = 370, 370
     sw, sh = ml + pw + mr, mt + ph + mb
 
-    lo  = min(float(x.min()), float(y.min())) - 0.02
-    hi  = max(float(x.max()), float(y.max())) + 0.02
-    rng = hi - lo or 1.0
+    # Padding is proportional to the data's own range rather than a fixed
+    # absolute offset — see plot_identity_scatter()'s own note on this,
+    # since identity (~0-1), z-score (roughly -3 to 3), and rank (0-1)
+    # spans differ substantially and a fixed pad tuned for one looks wrong
+    # on another.
+    data_min = min(float(x.min()), float(y.min()))
+    data_max = max(float(x.max()), float(y.max()))
+    span     = data_max - data_min
+    pad      = span * 0.03 if span > 0 else 0.02
+    lo, hi   = data_min - pad, data_max + pad
+    rng      = hi - lo or 1.0
 
     def spx(v):  return ml + (v - lo) / rng * pw
     def spy(v):  return mt + ph - (v - lo) / rng * ph   # y-axis flipped
@@ -305,7 +323,7 @@ def _save_identity_scatter_svg(
         "x": str(sw // 2), "y": "20",
         "text-anchor": "middle", "font-size": "12",
         "font-weight": "bold", "fill": "#1a3a5c",
-    }).text = "Identity comparison between lists"
+    }).text = title
 
     # Axes
     ax_y = mt + ph
@@ -382,11 +400,27 @@ def plot_identity_scatter(
     label1: str = "List 1 mean identity",
     label2: str = "List 2 mean identity",
     metric: str = "identity",
+    title: str = "Identity comparison between lists",
 ):
     """Scatter plot of list 1 vs list 2 scores for common orthogroups.
 
     Produces both a static PNG (for publication) and an SVG with per-point
     hover tooltips showing orthogroup ID, anchor gene ID, and scores.
+
+    The x/y axes show each group's *metric-transformed* score — raw mean
+    identity, z-score, or normalised rank, matching whichever metric this
+    plot is generated for — not always raw identity regardless of metric.
+    Each list's scores are transformed independently via
+    differential.normalise_scores(), exactly as compute_differential()
+    does when computing the differential score shown as this plot's point
+    colour: for zscore and rank, a group's position depends on its
+    standing *within its own list's distribution*, not a shared scale
+    between the two lists. Previously this always plotted raw identity on
+    both axes regardless of metric, so the zscore/rank report tabs showed
+    axis labels naming the metric next to data that was actually still
+    raw identity — the scatter looked identical across all three tabs
+    (only point colour differed) and never actually displayed a
+    rank-transformed or z-score-transformed value.
 
     Args:
         tables_dir1:      Path to list 1's tables/ directory.
@@ -395,10 +429,26 @@ def plot_identity_scatter(
         plots_dir:        Output directory for plots.
         label1:           X-axis label.
         label2:           Y-axis label.
-        metric:           Metric name (used in hover tooltip labels).
+        metric:           Metric name ('identity', 'zscore', or 'rank').
+                          Determines both the hover tooltip/axis labelling
+                          (via the caller) and, critically, how each
+                          list's raw group2mean.tsv values are transformed
+                          before plotting.
+        title:            Plot title. Defaults to identity-metric wording
+                          for callers that don't override it; make_differential_plots()
+                          always passes a metric-aware title.
     """
-    s1   = _load_group2mean(tables_dir1)
-    s2   = _load_group2mean(tables_dir2)
+    s1_raw = _load_group2mean(tables_dir1)
+    s2_raw = _load_group2mean(tables_dir2)
+
+    # Each list normalised independently against its own distribution —
+    # matching compute_differential()'s own per-list normalisation for
+    # zscore/rank — so these are the same per-group values that actually
+    # produced the differential score used for this plot's point colour,
+    # rather than always raw identity.
+    s1 = normalise_scores(s1_raw, metric)
+    s2 = normalise_scores(s2_raw, metric)
+
     diff = pd.read_csv(diff_scores_path, sep="\t").set_index("group_id")["score"]
 
     common = s1.index.intersection(s2.index)
@@ -425,17 +475,26 @@ def plot_identity_scatter(
 
     vmax = float(c.abs().quantile(0.95)) or 1.0
 
+    # Padding is proportional to the data's own range rather than a fixed
+    # absolute offset, since identity (~0-1), z-score (roughly -3 to 3),
+    # and rank (0-1) spans differ substantially — a fixed 0.02 pad reads
+    # fine for identity/rank but is imperceptible on a z-score scale.
+    data_min = min(float(x.min()), float(y.min()))
+    data_max = max(float(x.max()), float(y.max()))
+    span     = data_max - data_min
+    pad      = span * 0.03 if span > 0 else 0.02
+
     # Static PNG / PDF
     with plt.style.context(FIGURE_STYLE):
         fig, ax = plt.subplots(figsize=(6, 6))
         sc = ax.scatter(x, y, c=c, cmap="RdBu", alpha=0.5, s=8,
                         vmin=-vmax, vmax=vmax)
-        lims = [min(x.min(), y.min()) - 0.02, max(x.max(), y.max()) + 0.02]
+        lims = [data_min - pad, data_max + pad]
         ax.plot(lims, lims, "k--", linewidth=0.8, alpha=0.5)
         ax.set_xlim(lims); ax.set_ylim(lims)
         ax.set_xlabel(label1, fontsize=12)
         ax.set_ylabel(label2, fontsize=12)
-        ax.set_title("Identity comparison between lists", fontsize=13)
+        ax.set_title(title, fontsize=13)
         cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
         cbar.set_label("Differential score", fontsize=10)
         fig.tight_layout()
@@ -445,7 +504,7 @@ def plot_identity_scatter(
     _save_identity_scatter_svg(
         x, y, c, group2anchor,
         out_path=os.path.join(plots_dir, "identity_scatter.svg"),
-        label1=label1, label2=label2, vmax=vmax,
+        label1=label1, label2=label2, vmax=vmax, title=title,
     )
 
 
@@ -519,6 +578,11 @@ def make_differential_plots(
 
     _mlabels = {"identity": "mean identity", "zscore": "z-score", "rank": "rank"}
     mlabel   = _mlabels.get(metric, metric)
+    # Scatter title mirrors the axis-label metric wording (capitalised),
+    # so e.g. "Z-score comparison between lists" rather than always
+    # "Identity comparison between lists" regardless of which metric's
+    # values are actually being plotted (see plot_identity_scatter()).
+    scatter_title = "%s comparison between lists" % (mlabel[:1].upper() + mlabel[1:])
 
     plot_identity_distribution(
         os.path.join(diff_dir, "anchor2mean.tsv"),
@@ -530,6 +594,7 @@ def make_differential_plots(
         label1="%s %s" % (name1, mlabel),
         label2="%s %s" % (name2, mlabel),
         metric=metric,
+        title=scatter_title,
     )
     plot_differential_distribution(diff_scores, plots_dir, metric=metric,
                                    name1=name1, name2=name2)

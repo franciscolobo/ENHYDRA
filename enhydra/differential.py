@@ -31,7 +31,23 @@ def normalise_scores(
         return (scores - scores.mean()) / scores.std()
     elif metric == "rank":
         n = len(scores)
-        return scores.rank(ascending=False) / n
+        # ascending=True: the highest raw score gets the highest rank
+        # (N), so dividing by N gives the most-conserved group a value
+        # near 1.0 and the least-conserved group a value near 1/N —
+        # matching this function's own documented convention above
+        # ("1 = most conserved") and cli.py's/report.py's independent
+        # single-list implementations of the same transform. This was
+        # previously ascending=False here (differential/two-list mode
+        # only), which silently inverted every rank-metric differential
+        # score's sign relative to identity/zscore and relative to
+        # single-list mode's own rank scores — GSEA's statistics are
+        # symmetric under negation, so this did not surface as an error;
+        # it surfaced as rank-metric NES signs disagreeing with
+        # identity/zscore for the same gene sets, and the Cross-metric
+        # consensus tab misreporting genuine 2/3 agreement as "Mixed
+        # direction". See test_differential.py's
+        # test_all_three_metrics_agree_in_sign for the regression test.
+        return scores.rank(ascending=True) / n
     else:
         raise ValueError(
             "Unknown metric '%s'. Choose 'identity', 'zscore', or 'rank'." % metric
