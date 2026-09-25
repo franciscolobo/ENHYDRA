@@ -173,6 +173,13 @@ details.aln-tree-term > summary {{ cursor: pointer; font-weight: 600;
 .aln-tree-gene {{ color: #555; min-width: 200px; }}
 .aln-tree-identity {{ color: #555; min-width: 120px; }}
 .aln-tree-diff {{ color: #1a3a5c; font-weight: 600; min-width: 100px; }}
+.gene-chip-list {{ display: flex; flex-wrap: wrap; gap: 6px; text-align: left;
+    font-family: 'Courier New', monospace; font-size: 12px; }}
+.gene-chip {{ background: #eef2f6; border-radius: 4px; padding: 3px 8px;
+    display: inline-flex; align-items: center; gap: 5px; }}
+.gene-chip-badge {{ background: #1a3a5c; color: white; border-radius: 3px;
+    padding: 1px 5px; font-size: 10px; font-weight: 700; text-decoration: none; }}
+.gene-chip-badge:hover {{ background: #12293f; }}
 a.aln-link {{ color: #1a3a5c; text-decoration: underline dotted; margin-right: 10px; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </style>
@@ -208,6 +215,8 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 var enrichmentPlotsMap = {enrichment_plots_map};
 var fullGeneSets       = {full_gene_sets_js};
 var leadingEdgeMap     = {leading_edge_map_js};
+var fullGeneSetsHtml   = {full_gene_sets_html_js};
+var leadingEdgeHtmlMap = {leading_edge_html_map_js};
 var numericColsMap     = {numeric_cols_map};
 var dtInstances        = {{}};
 var colFiltersMap      = {{}};
@@ -301,6 +310,12 @@ function showTextModal(title, text) {{
     $('#modal-title').text(title);
     $('#modal-img').hide();
     $('#modal-text').text(text).show();
+    $('#modal-overlay').addClass('active');
+}}
+function showHtmlModal(title, htmlContent) {{
+    $('#modal-title').text(title);
+    $('#modal-img').hide();
+    $('#modal-text').html(htmlContent).show();
     $('#modal-overlay').addClass('active');
 }}
 function tableToXLSX(tableSelector, numericCols, fullGeneSetsMap, leadEdgeMap, filename, onlyFiltered) {{
@@ -409,17 +424,19 @@ $(document).ready(function() {{
     $(document).on('click', '.geneset-link', function(e) {{
         e.preventDefault();
         var goId = $(this).data('goid');
-        var text = fullGeneSets[goId];
-        if (text !== undefined) showTextModal(goId + ' \u2014 full gene set', text);
+        var htmlContent = fullGeneSetsHtml[goId];
+        if (htmlContent !== undefined) {{
+            showHtmlModal(goId + ' \u2014 full gene set', htmlContent);
+        }}
     }});
     $(document).on('click', '.leadedge-link', function(e) {{
         e.preventDefault();
         var goId   = $(this).data('goid');
         var metric = $(this).data('metric');
-        var map    = metric ? leadingEdgeMap[metric] : undefined;
-        var text   = map ? map[goId] : undefined;
-        if (text !== undefined) {{
-            showTextModal(goId + ' \u2014 leading edge genes (' + metric + ')', text);
+        var map    = metric ? leadingEdgeHtmlMap[metric] : undefined;
+        var htmlContent = map ? map[goId] : undefined;
+        if (htmlContent !== undefined) {{
+            showHtmlModal(goId + ' \u2014 leading edge genes (' + metric + ')', htmlContent);
         }}
     }});
     $(document).on('click', '.sig-toggle-btn', function() {{
@@ -617,9 +634,20 @@ def _funnel_html(name: str, stats: dict) -> str:
         ("Input groups",         stats.get("n_input")),
         ("After length filter",  stats.get("n_after_length_filter")),
         ("After group filter",   stats.get("n_after_group_filter")),
-        ("Final groups",         stats.get("n_final_groups")),
-        ("Anchor-mapped",        stats.get("n_anchor_mapped")),
     ]
+    # The divergence filter is optional and off by default (see
+    # stats.aggregate_pipeline_stats()'s doc comment on auto-detection).
+    # A run that never enabled it has no meaningful count to show here —
+    # inserting a permanently dashed/empty funnel step for every ordinary
+    # run would be clutter, not information, so the step is only added
+    # when it actually ran for this list.
+    if stats.get("n_after_divergence_filter") is not None:
+        steps.append((
+            "After divergence filter", stats.get("n_after_divergence_filter")
+        ))
+    steps.append(("Final groups",  stats.get("n_final_groups")))
+    steps.append(("Anchor-mapped", stats.get("n_anchor_mapped")))
+
     parts = []
     for i, (label, val) in enumerate(steps):
         if i > 0:
@@ -678,6 +706,61 @@ def _species_counts_table_html(tsv_path: str | None, table_id: str) -> str:
     )
 
 
+def _divergence_filter_reasons_html(
+    ds: dict,
+    detail_links: dict[str, str | None],
+    heading_tag: str = "h5",
+) -> str:
+    """Build the two divergence-filter drop-reason subsections, if that
+    step ran for this list.
+
+    Both subsections ('sequences removed' and 'groups dropped') link to
+    the same drop_reasons.tsv details page — that file carries both
+    reasons in one 'reason' column, and the generic '?reason=' query-param
+    filtering already used by every other _reason_table_html() call (see
+    _generate_drop_details_pages()/_tsv_to_details_html()) narrows the
+    details page to just the relevant rows on click, with no special
+    handling needed here for this being a shared file.
+
+    Args:
+        ds:            The 'drop_summary' dict from pipeline_stats.json.
+                      If it has no 'divergence_filter' key, the step did
+                      not run for this list and an empty string is
+                      returned — no heading, no placeholder text, since
+                      showing a permanently-empty divergence filter
+                      section on every ordinary run (where this filter is
+                      off by default) would be clutter.
+        detail_links:  Output of _generate_drop_details_pages(), used to
+                      resolve the 'divergence_filter_drop_reasons' link.
+        heading_tag:   'h4' in single-list mode, 'h5' in the two-list
+                      per-column blocks — matches the surrounding
+                      section's own heading level in each caller.
+
+    Returns:
+        HTML string, or "" if the divergence filter did not run.
+    """
+    if "divergence_filter" not in ds:
+        return ""
+    div_ds = ds["divergence_filter"]
+    detail_link = detail_links.get("divergence_filter_drop_reasons")
+    return (
+        "<%s>Divergence filter \u2014 sequences removed</%s>"
+        % (heading_tag, heading_tag)
+        + _reason_table_html(
+            div_ds.get("sequences_removed", {}),
+            detail_link,
+            "No sequences were removed by the divergence filter.",
+        )
+        + "<%s>Divergence filter \u2014 groups dropped</%s>"
+        % (heading_tag, heading_tag)
+        + _reason_table_html(
+            div_ds.get("groups_dropped", {}),
+            detail_link,
+            "No groups were dropped by the divergence filter.",
+        )
+    )
+
+
 def _one_list_filtering_block(
     name: str,
     pipeline_stats_path: str | None,
@@ -717,6 +800,7 @@ def _one_list_filtering_block(
             detail_links.get("group_filter_drop_reasons"),
             "No groups were removed at the group filter step.",
         )
+        + _divergence_filter_reasons_html(ds, detail_links, heading_tag="h5")
         + "<h5>Tables step \u2014 anomalies</h5>"
         + _reason_table_html(
             ds.get("tables", {}),
@@ -781,6 +865,7 @@ def _build_filtering_summary_tab_content(
                 detail_links.get("group_filter_drop_reasons"),
                 "No groups were removed at the group filter step.",
             )
+            + _divergence_filter_reasons_html(ds, detail_links, heading_tag="h4")
             + "<h4>Tables step \u2014 anomalies</h4>"
             + _reason_table_html(
                 ds.get("tables", {}),
@@ -861,8 +946,10 @@ def _load_group_to_genes(tables_dir: str) -> dict[str, list[str]]:
     return result
 
 
-def _load_group_identity(tables_dir: str) -> dict[str, float]:
+def _load_group_identity(tables_dir: str | None) -> dict[str, float]:
     """Load group2mean.tsv as {group_id: mean_identity}."""
+    if not tables_dir:
+        return {}
     path = os.path.join(tables_dir, "group2mean.tsv")
     result: dict[str, float] = {}
     if not os.path.isfile(path):
@@ -912,12 +999,16 @@ def _build_alignment_tree_html(
 
     In two-list mode (tables_dir2 given), each row shows both lists'
     mean identity for that group (from each list's own group2mean.tsv)
-    plus their signed difference (list1 - list2), and rows within a term
-    are sorted by absolute difference descending — surfacing the most
-    divergent groups first so a user can triage without opening every
-    alignment. Groups missing an identity score in either list sort to
-    the end. In single-list mode, each row shows a single plain identity
-    value with no diff/sorting change (there is nothing to diff against).
+    plus their signed difference (list1 - list2). Rows within a term are
+    sorted by that signed difference descending: groups where list1 is
+    more conserved / list2 is more variable (positive diff) appear
+    first, sliding down through zero to groups where list2 is more
+    conserved / list1 is more variable (negative diff) at the bottom.
+    Deliberately signed rather than by |diff| — the direction of the
+    difference is the point, not just its magnitude. Rows missing a
+    score in either list sort to the end regardless of sign. In
+    single-list mode, each row shows a single plain identity value, and
+    rows are sorted by group_id (there is nothing to diff against).
 
     Args:
         gmt_gene_sets:     {term_id: [gene_id, ...]}, as returned by
@@ -1000,14 +1091,6 @@ def _build_alignment_tree_html(
                 })
         if entries:
             if two_list:
-                # Sorted by signed diff (id1 - id2) descending: groups where
-                # list1 is more conserved / list2 is more variable (positive
-                # diff) appear first, sliding down through zero to groups
-                # where list2 is more conserved / list1 is more variable
-                # (negative diff) at the bottom. Missing-diff rows always
-                # sort last regardless of sign. Deliberately signed rather
-                # than by |diff| — the direction of the difference is the
-                # point, not just its magnitude.
                 entries.sort(key=lambda e: (e["diff"] is None,
                                             -e["diff"] if e["diff"] is not None else 0))
             else:
@@ -1081,6 +1164,102 @@ def _build_alignment_tree_html(
         "</div>"
         '<div id="aln-tree">%s</div>' % "".join(blocks)
     )
+
+
+def _build_gene_to_page_links(
+    tables_dir1: str | None,
+    alignment_pages1: dict[str, str] | None,
+    alignment_pages2: dict[str, str] | None,
+    report_dir: str,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Build {gene_id: (list1_relpath_or_None, list2_relpath_or_None)}.
+
+    Used to turn plain gene IDs in the "Full gene set" / "Leading edge"
+    modals into links to their pre-rendered alignment page, alongside the
+    GO-term tree (Alignments tab) which serves the same underlying data
+    but organised by GO term rather than by gene.
+
+    If a gene's group (from list1's group2anchor.tsv) has no rendered
+    page in alignment_pages1, that gene is simply absent from the
+    returned dict — callers should render it as plain, non-linked text.
+    If a gene happens to map to more than one group (possible under
+    --paralogs all, though unusual), the first matching group encountered
+    is used — a documented simplification, consistent with the same
+    choice already made in _build_alignment_tree_html().
+
+    Args:
+        tables_dir1:       list1's (or the single list's) tables/
+                          directory. None returns an empty dict.
+        alignment_pages1:  {group_id: absolute_path} for the single list
+                          or list1. None or empty returns an empty dict.
+        alignment_pages2:  {group_id: absolute_path} for list2, or None
+                          in single-list mode.
+        report_dir:        Directory report.html will be written into,
+                          used to compute relative link paths.
+
+    Returns:
+        Dict mapping gene_id to a (list1_link, list2_link) tuple, where
+        each element is a report-relative path string or None if that
+        list has no page for this gene's group.
+    """
+    if not tables_dir1 or not alignment_pages1:
+        return {}
+
+    group_to_genes = _load_group_to_genes(tables_dir1)
+    rel_pages1 = {
+        gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+        for gid, p in alignment_pages1.items()
+    }
+    rel_pages2 = (
+        {gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+         for gid, p in alignment_pages2.items()}
+        if alignment_pages2 else {}
+    )
+
+    gene_to_page: dict[str, tuple[str | None, str | None]] = {}
+    for group_id, genes in group_to_genes.items():
+        if group_id not in rel_pages1:
+            continue
+        link1 = rel_pages1[group_id]
+        link2 = rel_pages2.get(group_id)
+        for gene in genes:
+            if gene not in gene_to_page:
+                gene_to_page[gene] = (link1, link2)
+    return gene_to_page
+
+
+def _gene_chip_list_html(
+    gene_ids: list[str],
+    gene_to_page: dict[str, tuple[str | None, str | None]],
+) -> str:
+    """Render a list of gene IDs as chips, linked to alignment pages where
+    a mapping exists in gene_to_page, plain text otherwise.
+
+    Each linked gene shows small 'L1'/'L2' badge links (rather than full
+    list-name labels, which would be too cramped at chip scale) opening
+    that list's alignment page in a new tab. A gene with only a list1
+    link (single-list mode, or a two-list gene whose group has no list2
+    page) shows only the L1 badge.
+    """
+    chips = []
+    for gene in gene_ids:
+        link1, link2 = gene_to_page.get(gene, (None, None))
+        badges = ""
+        if link1:
+            badges += (
+                '<a href="%s" target="_blank" class="gene-chip-badge" '
+                'title="View alignment">L1</a>' % link1
+            )
+        if link2:
+            badges += (
+                '<a href="%s" target="_blank" class="gene-chip-badge" '
+                'title="View alignment">L2</a>' % link2
+            )
+        chips.append(
+            '<span class="gene-chip">%s%s</span>'
+            % (html.escape(gene), (" " + badges) if badges else "")
+        )
+    return '<div class="gene-chip-list">%s</div>' % "".join(chips)
 
 
 # ---------------------------------------------------------------------------
@@ -1374,11 +1553,25 @@ def _results_table_html(
     col1_label: str = "List 1",
     col2_label: str = "List 2",
     gene_sets: dict[str, list[str]] | None = None,
-) -> tuple[str, list[int], dict[str, str], dict[str, str]]:
+    gene_to_page: dict[str, tuple[str | None, str | None]] | None = None,
+) -> tuple[str, list[int], dict[str, str], dict[str, str], dict[str, str], dict[str, str]]:
+    """Build the enrichment results DataTable HTML for one metric.
+
+    Returns a 6-tuple:
+        (table_html, numeric_col_indices,
+         full_gene_sets_text, leading_edge_text,
+         full_gene_sets_html, leading_edge_html)
+
+    The *_text dicts are unchanged plain newline-joined gene lists, used
+    for the Excel export (tableToXLSX() splits these on newline — turning
+    them into HTML would corrupt the exported cells). The *_html dicts are
+    a parallel rendering of the same gene lists as clickable chips (via
+    _gene_chip_list_html()), used only for the on-screen modal display.
+    """
     df = df.copy()
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
-        return "<p>No results to display.</p>", [], {}, {}
+        return "<p>No results to display.</p>", [], {}, {}, {}, {}
 
     df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
 
@@ -1394,8 +1587,11 @@ def _results_table_html(
         lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
 
+    gene_to_page = gene_to_page or {}
     full_sets_js: dict[str, str] = {}
     leadedge_js:  dict[str, str] = {}
+    full_sets_html_js: dict[str, str] = {}
+    leadedge_html_js:  dict[str, str] = {}
 
     if gene_sets:
         def _full_set_cell(term_id):
@@ -1403,6 +1599,7 @@ def _results_table_html(
             if not genes:
                 return ""
             full_sets_js[term_id] = "\n".join(genes)
+            full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
             return "View (%d)" % len(genes)
         df["Full gene set"] = df["Term"].apply(_full_set_cell)
 
@@ -1416,6 +1613,7 @@ def _results_table_html(
             if not genes:
                 return ""
             leadedge_js[row["Term"]] = "\n".join(genes)
+            leadedge_html_js[row["Term"]] = _gene_chip_list_html(genes, gene_to_page)
             return "View (%d)" % len(genes)
         df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
 
@@ -1505,7 +1703,9 @@ def _results_table_html(
         "<tbody>%s</tbody></table>"
     ) % (table_id, header_cells, filter_cells, rows)
 
-    return html_content, numeric_col_indices, full_sets_js, leadedge_js
+    return (html_content, numeric_col_indices,
+            full_sets_js, leadedge_js,
+            full_sets_html_js, leadedge_html_js)
 
 
 def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
@@ -1583,12 +1783,22 @@ def _build_report_impl(
 
     report_dir = os.path.dirname(os.path.abspath(report_path))
 
+    # Built once (not per metric) — feeds the "Full gene set" / "Leading
+    # edge" modal chip links below. Independent of which metric is being
+    # rendered, since it only depends on group2anchor.tsv + the rendered
+    # alignment page maps.
+    gene_to_page = _build_gene_to_page_links(
+        tables_dir1, alignment_pages1, alignment_pages2, report_dir,
+    )
+
     tab_buttons_parts    = []
     tab_panels_parts     = []
     enrichment_plots_map = {}
     numeric_cols_map      = {}
     full_gene_sets_accum  = {}
     leading_edge_map      = {}
+    full_gene_sets_html_accum = {}
+    leading_edge_html_map     = {}
     first = True
     for metric, paths in metric_data.items():
         label       = METRIC_LABELS.get(metric, metric.capitalize())
@@ -1607,18 +1817,22 @@ def _build_report_impl(
             df = _augment_with_per_term_scores(
                 df, effective_gmt, tables_dir1, tables_dir2, metric
             )
-            tbl_html, num_cols, full_sets_js, leadedge_js = _results_table_html(
+            (tbl_html, num_cols, full_sets_js, leadedge_js,
+             full_sets_html_js, leadedge_html_js) = _results_table_html(
                 df, term_names, plot_idx, fdr_threshold,
                 metric=metric, col1_label=label1, col2_label=label2,
-                gene_sets=gene_sets_all,
+                gene_sets=gene_sets_all, gene_to_page=gene_to_page,
             )
             numeric_cols_map[metric] = num_cols
             full_gene_sets_accum.update(full_sets_js)
             leading_edge_map[metric] = leadedge_js
+            full_gene_sets_html_accum.update(full_sets_html_js)
+            leading_edge_html_map[metric] = leadedge_html_js
         else:
             tbl_html = "<p>No GSEA results found for this metric.</p>"
             numeric_cols_map[metric] = []
             leading_edge_map[metric] = {}
+            leading_edge_html_map[metric] = {}
         plots_html = _plot_section(plots_dir, plot_names)
         desc       = "" if single_metric else _METRIC_DESCS.get(metric, "")
         desc_html  = ('<p class="metric-desc">%s</p>' % desc) if desc else ""
@@ -1631,7 +1845,7 @@ def _build_report_impl(
             '  <p>Significant gene sets (FDR&nbsp;&lt;&nbsp;{fdr}) highlighted '
             'in blue. Click a GO ID to view its enrichment plot, or "View" '
             'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the '
-            'gene lists as text.</p>\n'
+            'gene lists, with links to alignment pages where available.</p>\n'
             '  <p>'
             '<button class="sig-toggle-btn" data-metric="{m}">Show only significant</button> '
             '<button class="export-btn export-xlsx-btn" data-metric="{m}">'
@@ -1708,6 +1922,8 @@ def _build_report_impl(
         enrichment_plots_map=json.dumps(enrichment_plots_map),
         full_gene_sets_js=json.dumps(full_gene_sets_accum),
         leading_edge_map_js=json.dumps(leading_edge_map),
+        full_gene_sets_html_js=json.dumps(full_gene_sets_html_accum),
+        leading_edge_html_map_js=json.dumps(leading_edge_html_map),
         numeric_cols_map=json.dumps(numeric_cols_map),
     )
     with open(report_path, "w", encoding="utf-8") as fh:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import random
 import logging
 import statistics
@@ -468,3 +469,319 @@ def strip_species_from_alignments(
         with open(out_path, "w") as fh:
             for r in records:
                 fh.write(">%s\n%s\n" % (r.id, r.seq))
+
+
+# ---------------------------------------------------------------------------
+# Divergent-sequence filter
+# ---------------------------------------------------------------------------
+#
+# A single highly-divergent sequence within an otherwise well-conserved
+# group can drag down (or otherwise distort) the group's mean pairwise
+# identity — the exact metric ENHYDRA ranks orthogroups by — even though
+# the divergence may reflect a misannotation, a paralog mistakenly grouped
+# with true orthologs, or a genuinely fast-evolving lineage that shouldn't
+# dominate the whole group's score. This filter identifies such sequences
+# using trimAl's own per-sequence "identity to most similar sequence"
+# values (from `trimal -sident`), rather than a full pairwise average,
+# since a sequence's relationship to its single closest match is a more
+# direct signal of "does this sequence belong here at all" than its
+# average identity against every other member (which is already diluted
+# by the rest of the group).
+#
+# Sequences whose identity-to-closest-match falls more than
+# `sd_multiplier` standard deviations below the group's own mean are
+# flagged. Removing a flagged sequence invalidates the existing alignment
+# for the survivors — the divergent sequence likely forced spurious gap
+# placement elsewhere in the alignment — so surviving sequences are
+# de-gapped and handed back to the caller for realignment from scratch,
+# rather than simply deleting a row from the existing alignment.
+
+_SIDENT_MOST_SIMILAR_HEADER = (
+    "## Identity for most similar pair-wise sequences matrix"
+)
+
+
+def parse_sident_most_similar(sident_path: str) -> dict[str, tuple[float, str]]:
+    """Parse the "most similar pairwise sequences" section of trimAl -sident output.
+
+    trimAl's `-sident` output includes several sections; this parses only the
+    one giving each sequence's identity to its single closest match, e.g.:
+
+        ## Identity for most similar pair-wise sequences matrix
+        seqA    0.3716    seqH
+        seqB    0.9983    seqC
+        ...
+
+    Each data line is whitespace-delimited: sequence_id, identity (float),
+    closest_match_id. Parsing stops at the first blank line after the
+    section header (or at EOF), so later sections in the same file are not
+    accidentally included.
+
+    Args:
+        sident_path: Path to a trimAl -sident output file (as written by
+                    alignment.run_trimal()).
+
+    Returns:
+        Dict mapping sequence_id to (identity_to_closest_match, closest_id).
+        Empty dict if the section header is not found (e.g. trimAl produced
+        no output for a degenerate alignment, or the file is some other
+        format entirely) — callers should treat this the same as "nothing
+        to filter" rather than raise, since a missing/malformed section is
+        recoverable by simply skipping the filter for that group.
+
+    Raises:
+        FileNotFoundError: If sident_path does not exist.
+    """
+    with open(sident_path) as fh:
+        lines = fh.readlines()
+
+    result: dict[str, tuple[float, str]] = {}
+    in_section = False
+    for raw_line in lines:
+        line = raw_line.rstrip("\n")
+        if line.startswith(_SIDENT_MOST_SIMILAR_HEADER):
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if not line.strip():
+            break   # end of section
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        seq_id, identity_str, closest_id = fields[0], fields[1], fields[2]
+        try:
+            identity = float(identity_str)
+        except ValueError:
+            continue
+        result[seq_id] = (identity, closest_id)
+
+    return result
+
+
+def detect_divergent_sequences(
+    identities: dict[str, tuple[float, str]],
+    sd_multiplier: float = 2.0,
+) -> tuple[set[str], float, float]:
+    """Flag sequences whose identity-to-closest-match is an outlier on the low end.
+
+    A sequence is flagged if its identity value falls more than
+    sd_multiplier standard deviations below the mean of all values in
+    `identities`. Only the low tail is considered — an unusually *high*
+    identity-to-closest-match is not a sign a sequence doesn't belong.
+
+    Args:
+        identities:    {seq_id: (identity_to_closest, closest_seq_id)}, as
+                      returned by parse_sident_most_similar(). Must contain
+                      at least 2 entries (mean/SD are undefined otherwise —
+                      callers are expected to have already gated on group
+                      size before calling this).
+        sd_multiplier: Number of standard deviations below the mean beyond
+                      which a sequence is flagged (default: 2.0).
+
+    Returns:
+        Tuple of (flagged_seq_ids, mean, stdev).
+
+    Raises:
+        statistics.StatisticsError: If identities has fewer than 2 entries.
+    """
+    values = [identity for identity, _closest in identities.values()]
+    mean   = statistics.mean(values)
+    stdev  = statistics.stdev(values)
+    lower_bound = mean - sd_multiplier * stdev
+
+    flagged = {
+        seq_id for seq_id, (identity, _closest) in identities.items()
+        if identity < lower_bound
+    }
+    return flagged, mean, stdev
+
+
+def filter_divergent_sequences(
+    alignment_dir: str,
+    sident_dir: str,
+    filtered_dir: str,
+    realign_input_dir: str,
+    stats_dir: str,
+    min_species: int,
+    min_sequences: int = 2,
+    sd_multiplier: float = 2.0,
+    show_progress: bool = False,
+) -> set[str]:
+    """Detect and remove highly divergent sequences from each group's alignment.
+
+    For every alignment in alignment_dir with a matching trimAl -sident
+    output in sident_dir (see alignment.run_trimal()):
+
+    - Groups with fewer sequences than min_species are left untouched and
+      copied as-is into filtered_dir. With too few sequences, a single
+      outlier can drag the mean/SD enough to escape detection entirely
+      (the same lesson already documented on test_filtering.py's
+      test_outlier_removed for the length filter), so detection is not
+      attempted at all below this size rather than attempted unreliably.
+    - Groups with a -sident file that has fewer than 2 parseable entries
+      (e.g. trimAl produced no usable output) are likewise left untouched,
+      since mean/SD cannot be computed.
+    - Groups with no sequence flagged by detect_divergent_sequences() are
+      left untouched and copied as-is into filtered_dir.
+    - Groups with one or more flagged sequences have those sequences
+      removed. The alignment itself is now stale for the survivors — a
+      divergent sequence typically forces spurious gaps elsewhere in the
+      alignment — so the survivors' original (de-gapped) sequences are
+      written to realign_input_dir instead of being written to
+      filtered_dir directly. Filenames in realign_input_dir use the bare
+      group_id (no extension), matching group_filter_dir's convention, so
+      that running these through alignment.run_aligner() with
+      alignment_dir=filtered_dir produces the correctly-named
+      '<group_id>.aln' output directly in filtered_dir with no separate
+      renaming step required. Callers are expected to make that
+      run_aligner() call themselves after this function returns, only for
+      groups that actually needed it (i.e. only if realign_input_dir ends
+      up non-empty).
+    - Groups that fall below min_species or min_sequences after removing
+      their flagged sequence(s) are dropped entirely: nothing is written
+      to either filtered_dir or realign_input_dir for that group.
+
+    Every filtering decision is logged to stats_dir/drop_reasons.tsv
+    (columns: group_id, sequence_id, identity_to_closest, pct_diff_from_avg,
+    reason), opened in write mode so re-runs produce clean output rather
+    than appending duplicates. 'reason' is one of:
+      - 'removed_divergent_sequence': this sequence was pruned; the group
+        survives (to realignment). identity_to_closest and
+        pct_diff_from_avg (identity_to_closest / group_mean, matching the
+        same ratio convention used in filter_length's own drop_reasons)
+        are populated.
+      - 'below_min_species_after_divergence_filter': the entire group was
+        dropped because removing its flagged sequence(s) left it under
+        min_species or min_sequences. sequence_id holds a comma-separated
+        list of every sequence that had been flagged (the group, not any
+        single sequence, is what was ultimately dropped), and
+        identity_to_closest/pct_diff_from_avg are left blank.
+
+    Args:
+        alignment_dir:      Directory of alignments to check. Expected to
+                            be the point in the pipeline after anchor
+                            stripping (if applicable) but before column
+                            trimming, so that trimming subsequently
+                            operates on the corrected alignment.
+        sident_dir:         Directory of trimAl -sident output for the same
+                            alignments, e.g. as produced by a prior call to
+                            alignment.run_trimal(alignment_dir=alignment_dir,
+                            ident_dir=sident_dir, ...). Filenames are
+                            expected as '<alignment_filename>.ident'.
+        filtered_dir:       Directory where the final, corrected alignments
+                            are written: untouched groups go here directly;
+                            pruned groups land here once the caller has run
+                            them back through the aligner.
+        realign_input_dir:  Directory where surviving (de-gapped) sequences
+                            of pruned groups are written, awaiting
+                            realignment by the caller.
+        stats_dir:          Directory where drop_reasons.tsv is written.
+        min_species:        Minimum number of distinct species required
+                            after pruning, and also the minimum sequence
+                            count required before attempting divergence
+                            detection at all (see above).
+        min_sequences:      Minimum number of sequences required after
+                            pruning (default: 2).
+        sd_multiplier:      Number of SDs below the mean identity-to-
+                            closest-match beyond which a sequence is
+                            flagged (default: 2.0).
+        show_progress:      Show a tqdm progress bar.
+
+    Returns:
+        Set of group_ids dropped entirely by this step.
+    """
+    os.makedirs(filtered_dir, exist_ok=True)
+    os.makedirs(realign_input_dir, exist_ok=True)
+    os.makedirs(stats_dir, exist_ok=True)
+
+    drop_reasons:   list[tuple[str, str, str, str, str]] = []
+    dropped_groups: set[str] = set()
+
+    files = [f for f in os.listdir(alignment_dir)
+             if os.path.isfile(os.path.join(alignment_dir, f))]
+
+    for file in tqdm(files, desc="  groups", unit="group",
+                     leave=False, disable=not show_progress):
+        group_id    = file.split(".")[0]
+        aln_path    = os.path.join(alignment_dir, file)
+        sident_path = os.path.join(sident_dir, file + ".ident")
+
+        n_records = sum(1 for _ in SeqIO.parse(aln_path, "fasta"))
+
+        if n_records < min_species:
+            shutil.copyfile(aln_path, os.path.join(filtered_dir, file))
+            continue
+
+        if not os.path.isfile(sident_path):
+            logger.warning(
+                "No -sident output found for '%s' (expected: %s) — "
+                "skipping divergence filter for this group.",
+                file, sident_path,
+            )
+            shutil.copyfile(aln_path, os.path.join(filtered_dir, file))
+            continue
+
+        identities = parse_sident_most_similar(sident_path)
+        if len(identities) < 2:
+            shutil.copyfile(aln_path, os.path.join(filtered_dir, file))
+            continue
+
+        flagged, mean, _stdev = detect_divergent_sequences(
+            identities, sd_multiplier=sd_multiplier,
+        )
+
+        if not flagged:
+            shutil.copyfile(aln_path, os.path.join(filtered_dir, file))
+            continue
+
+        records   = list(SeqIO.parse(aln_path, "fasta"))
+        survivors = [r for r in records if r.id not in flagged]
+        species_ids = {r.id.split("|")[0] for r in survivors}
+
+        # Checked before logging per-sequence removal reasons: if the group
+        # ends up dropped entirely, only the single group-level drop row is
+        # written (below) — logging both would double-count the same
+        # sequences under two different reasons for a group that never
+        # actually reaches realignment.
+        if len(survivors) < min_sequences or len(species_ids) < min_species:
+            logger.warning(
+                "Group %s: removing %d divergent sequence(s) leaves only "
+                "%d sequence(s) / %d species — below minimum. Group dropped.",
+                group_id, len(flagged), len(survivors), len(species_ids),
+            )
+            drop_reasons.append((
+                group_id, ",".join(sorted(flagged)), "", "",
+                "below_min_species_after_divergence_filter",
+            ))
+            dropped_groups.add(group_id)
+            continue
+
+        for seq_id in sorted(flagged):
+            identity_val, _closest = identities[seq_id]
+            pct_diff = (identity_val / mean) if mean else 0.0
+            drop_reasons.append((
+                group_id, seq_id, "%.4f" % identity_val,
+                "%.4f" % pct_diff, "removed_divergent_sequence",
+            ))
+
+        realign_out_path = os.path.join(realign_input_dir, group_id)
+        with open(realign_out_path, "w") as fh:
+            for r in survivors:
+                seq = str(r.seq).replace("-", "").replace(".", "")
+                fh.write(">%s\n%s\n" % (r.id, seq))
+
+    drop_reasons_path = os.path.join(stats_dir, "drop_reasons.tsv")
+    with open(drop_reasons_path, "w") as fh:
+        fh.write(
+            "group_id\tsequence_id\tidentity_to_closest\tpct_diff_from_avg\treason\n"
+        )
+        for row in sorted(drop_reasons, key=lambda r: (r[0], r[1])):
+            fh.write("%s\t%s\t%s\t%s\t%s\n" % row)
+    logger.info(
+        "Divergence filter: %d sequence(s) removed, %d group(s) dropped entirely. Path: %s",
+        sum(1 for r in drop_reasons if r[4] == "removed_divergent_sequence"),
+        len(dropped_groups), drop_reasons_path,
+    )
+
+    return dropped_groups

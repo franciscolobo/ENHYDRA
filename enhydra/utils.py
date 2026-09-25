@@ -135,3 +135,41 @@ def resolve_trim_args(trim: str | float | None) -> list[str] | None:
             "0 and 1 (used as trimAl's -gt gap threshold)." % (trim,)
         )
     return ["-gt", str(value)]
+
+
+def resolve_divergence_filter_sd(value: str | float | None) -> float | None:
+    """Translate the 'divergence_filter_sd' config parameter into a threshold.
+
+    Used by the post-alignment divergent-sequence filter (see
+    filtering.filter_divergent_sequences()): sequences whose trimAl -sident
+    identity-to-closest-match falls more than this many standard deviations
+    below the group's own mean are flagged, removed, and the group is
+    realigned without them.
+
+    Args:
+        value: One of:
+            - '' or None      : divergence filtering disabled (returns None).
+            - a positive number (str or float): the SD multiplier threshold.
+
+    Returns:
+        The threshold as a float, or None if filtering is disabled.
+
+    Raises:
+        EnhydraConfigError: If value is set but is not a positive number.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        sd = float(value)
+    except (TypeError, ValueError):
+        raise EnhydraConfigError(
+            "Invalid 'divergence_filter_sd' value: %r. Must be a positive "
+            "number (standard deviations below the mean identity-to-"
+            "closest-match)." % (value,)
+        )
+    if sd <= 0:
+        raise EnhydraConfigError(
+            "Invalid 'divergence_filter_sd' value: %r. Must be a positive "
+            "number." % (value,)
+        )
+    return sd

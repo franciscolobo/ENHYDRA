@@ -7,9 +7,11 @@ import multiprocessing
 from tqdm import tqdm
 
 from .io import read_config_file, read_species_list, parse_obo_names
-from .utils import check_parameters, check_lists, resolve_trim_args
+from .utils import check_parameters, check_lists, resolve_trim_args, \
+    resolve_divergence_filter_sd
 from .filtering import filter_length, filter_groups, subset_groups, \
-    strip_species_from_alignments, aggregate_length_filter_stats
+    strip_species_from_alignments, aggregate_length_filter_stats, \
+    filter_divergent_sequences
 from .alignment import run_aligner, run_trimal, run_trimal_columns
 from .tables import make_tables
 from .gsea import run_gsea
@@ -142,7 +144,7 @@ def _log_summary(
 
 
 # ---------------------------------------------------------------------------
-# Core pipeline: filter → align → (trim) → identity → tables
+# Core pipeline: filter → align → (divergence filter) → (trim) → identity → tables
 # ---------------------------------------------------------------------------
 
 def _run_single_list(
@@ -166,6 +168,7 @@ def _run_single_list(
     label: str = "",
     exclude_from_identity: set[str] | None = None,
     trim_args: list[str] | None = None,
+    divergence_filter_sd: float | None = None,
     require_anchor_in_tables: bool | None = None,
 ) -> tuple[str, dict]:
     logger = logging.getLogger(__name__)
@@ -186,6 +189,18 @@ def _run_single_list(
     group_stats_dir       = os.path.join(listdir, "group_filter_stats")
     alignment_dir         = os.path.join(listdir, "alignment")
     stripped_dir          = os.path.join(listdir, "alignment_stripped")
+    # Divergent-sequence filter (see filtering.filter_divergent_sequences()):
+    # a scratch trimAl -sident pass, the filter's own pruned/passthrough
+    # output, the de-gapped survivors awaiting realignment, and this step's
+    # own drop-reason log. Positioned after anchor-stripping (so an
+    # injected anchor is never itself a candidate for removal here) and
+    # before column trimming (so trimming subsequently operates on the
+    # corrected, post-pruning alignment rather than one still distorted by
+    # a divergent sequence's spurious gap placement).
+    divergence_sident_dir   = os.path.join(listdir, "divergence_sident")
+    divergence_filtered_dir = os.path.join(listdir, "alignment_divergence_filtered")
+    divergence_realign_dir  = os.path.join(listdir, "divergence_realign_input")
+    divergence_stats_dir    = os.path.join(listdir, "divergence_filter_stats")
     trimmed_dir           = os.path.join(listdir, "alignment_trimmed")
     # Sidecar directory for trimAl's -colnumbering output, capturing which
     # original alignment columns survive trimming. Populated only when
@@ -212,12 +227,20 @@ def _run_single_list(
     # expected (list2 never contains the anchor's own species) and should
     # stay silent. Defaulting to require_anchor when not given preserves
     # single-list mode's existing behaviour unchanged.
+    #
+    # Note this is independent of the divergence filter potentially
+    # removing the anchor sequence from the *identity computation*: this
+    # step's make_tables() call always reads gene-ID mapping from the
+    # original alignment_dir (see below), which the divergence filter
+    # never modifies in place, so a group whose anchor happened to be its
+    # divergent outlier still resolves to the correct anchor gene ID here
+    # — only the identity score itself reflects the outlier's removal.
     if require_anchor_in_tables is None:
         require_anchor_in_tables = require_anchor
 
     os.makedirs(listdir, exist_ok=True)
     n_steps = (5 + (species is not None) + bool(exclude_from_identity)
-               + bool(trim_args))
+               + bool(divergence_filter_sd) + bool(trim_args))
 
     with tqdm(total=n_steps, desc=_desc("starting"),
               unit="step", disable=not show_progress, leave=True) as sbar:
@@ -313,10 +336,70 @@ def _run_single_list(
             trimal_input_dir = stripped_dir
             sbar.update(1)
 
+        if divergence_filter_sd:
+            sbar.set_description(_desc("divergence filter"))
+            logger.info(
+                "Step 3c: Filtering highly divergent sequences "
+                "(sd_multiplier=%s)", divergence_filter_sd,
+            )
+            # Same two-output resume-guard lesson already applied to column
+            # trimming below: check every output this step produces
+            # (filtered alignments AND the stats log), not just one, or a
+            # resumed run whose divergence_filtered_dir predates this
+            # feature could skip the block forever and never produce
+            # drop_reasons.tsv at all.
+            divergence_ready = (
+                _step_complete(divergence_filtered_dir)
+                and _step_complete(divergence_stats_dir, ["drop_reasons.tsv"])
+            )
+            if not (resume and divergence_ready):
+                os.makedirs(divergence_sident_dir, exist_ok=True)
+                run_trimal(
+                    alignment_dir=trimal_input_dir,
+                    ident_dir=divergence_sident_dir,
+                    trimal_path=trimal_path,
+                    n_proc=max_process,
+                    show_progress=show_progress,
+                )
+                filter_divergent_sequences(
+                    alignment_dir=trimal_input_dir,
+                    sident_dir=divergence_sident_dir,
+                    filtered_dir=divergence_filtered_dir,
+                    realign_input_dir=divergence_realign_dir,
+                    stats_dir=divergence_stats_dir,
+                    min_species=min_species,
+                    min_sequences=min_sequences,
+                    sd_multiplier=divergence_filter_sd,
+                    show_progress=show_progress,
+                )
+                n_to_realign = (
+                    len(os.listdir(divergence_realign_dir))
+                    if os.path.isdir(divergence_realign_dir) else 0
+                )
+                if n_to_realign:
+                    logger.info(
+                        "Realigning %d group(s) after divergent sequence "
+                        "removal...", n_to_realign,
+                    )
+                    run_aligner(
+                        group_filter_dir=divergence_realign_dir,
+                        alignment_dir=divergence_filtered_dir,
+                        aligner=aligner,
+                        parameters=parameters,
+                        show_progress=show_progress,
+                    )
+            else:
+                logger.info(
+                    "Skipping divergence filtering (output already exists: "
+                    "%s, %s)", divergence_filtered_dir, divergence_stats_dir,
+                )
+            trimal_input_dir = divergence_filtered_dir
+            sbar.update(1)
+
         if trim_args:
             sbar.set_description(_desc("trimming columns"))
             logger.info(
-                "Step 3c: Trimming alignment columns with trimAl (%s)",
+                "Step 3d: Trimming alignment columns with trimAl (%s)",
                 " ".join(trim_args),
             )
             # Colnumbering capture rides along with the existing -out
@@ -424,6 +507,18 @@ def _build_arg_parser():
                              "(mapped to trimAl's -strict, -strictplus, "
                              "-automated1 respectively). If unset (default), "
                              "no column trimming is performed.")
+    parser.add_argument("--divergence-filter-sd", type=float, default=None,
+                        help="Remove sequences whose trimAl -sident identity "
+                             "to their closest match falls more than this "
+                             "many standard deviations below the group's "
+                             "mean, then realign the group without them. "
+                             "Runs after alignment (and after anchor "
+                             "stripping in two-list mode) but before column "
+                             "trimming. Groups with fewer than min_species "
+                             "sequences are exempt from this check, since "
+                             "too few sequences make the mean/SD unreliable. "
+                             "If unset (default), no divergence filtering is "
+                             "performed.")
     parser.add_argument("--all-metrics", action="store_true", default=False,
                         help="Run GSEA for all three ranking metrics and produce "
                              "a tabbed HTML report.")
@@ -470,6 +565,8 @@ def main():
     min_sequences = parameters['min_sequences']
     paralogs      = _resolve(args.paralogs,      parameters['paralogs'],      'all')
     trim          = _resolve(args.trim,          parameters['trim'],          '')
+    divergence_filter_sd_raw = _resolve(
+        args.divergence_filter_sd, parameters['divergence_filter_sd'], '')
     metric        = _resolve(args.metric,        parameters['metric'],        'zscore')
     gene_sets     = _resolve(args.gene_sets,     parameters['gene_sets'],     None)
     organism      = _resolve(args.organism,      parameters['organism'],      None)
@@ -500,6 +597,11 @@ def main():
     except EnhydraConfigError as e:
         sys.exit("Configuration error: %s" % e)
 
+    try:
+        divergence_filter_sd = resolve_divergence_filter_sd(divergence_filter_sd_raw)
+    except EnhydraConfigError as e:
+        sys.exit("Configuration error: %s" % e)
+
     if not gene_sets and not organism:
         parser.error(
             "A gene set source is required. Set 'gene_sets' or 'organism' in "
@@ -524,9 +626,10 @@ def main():
     logger.info("Welcome to Enhydra")
     logger.info(
         "Resolved parameters: metric=%s, all_metrics=%s, replot=%s, "
-        "paralogs=%s, trim=%s, min_species=%d, permutations=%d, "
-        "fdr_threshold=%.2f",
+        "paralogs=%s, trim=%s, divergence_filter_sd=%s, min_species=%d, "
+        "permutations=%d, fdr_threshold=%.2f",
         metric, all_metrics, replot, paralogs, (trim or "none"),
+        (divergence_filter_sd if divergence_filter_sd else "none"),
         min_species, permutations, fdr_threshold,
     )
 
@@ -556,6 +659,7 @@ def main():
         resume=resume,
         show_progress=args.quiet,
         trim_args=trim_args,
+        divergence_filter_sd=divergence_filter_sd,
     )
 
     # In two-list mode, default to all three metrics for a tabbed comparison.
@@ -597,11 +701,27 @@ def main():
         # (listdir/alignment_trimmed_colnumbering); the two must stay in
         # sync since this is recomputed independently rather than threaded
         # through _run_single_list()'s return value.
-        alignment_dir_single   = os.path.join(outdir, "alignment")
+        # If the divergence filter ran, its output (post-removal, and
+        # re-aligned for affected groups) is the alignment that identity
+        # was actually computed from — rendering the raw pre-filter
+        # 'alignment' dir here would show a since-removed sequence still
+        # present, with a mean-identity figure in the metadata panel that
+        # no longer matches what's on screen. This mirrors the existing
+        # trim_colnumbering_dir naming duplication note just above: this
+        # path must stay in sync with _run_single_list()'s own
+        # divergence_filtered_dir naming if that ever changes.
+        alignment_dir_single   = os.path.join(
+            outdir,
+            "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
+        )
         alignment_pages_dir    = os.path.join(outdir, "alignments")
         colnumbering_dir_single = (
             os.path.join(outdir, "alignment_trimmed_colnumbering")
             if trim_args else None
+        )
+        divergence_drop_reasons_path_single = (
+            os.path.join(outdir, "divergence_filter_stats", "drop_reasons.tsv")
+            if divergence_filter_sd else None
         )
         if not (resume and _step_complete(alignment_pages_dir)):
             logger.info("Rendering alignment pages for report...")
@@ -611,6 +731,7 @@ def main():
                 outdir=alignment_pages_dir,
                 anchor_species=parameters['anchor'],
                 colnumbering_dir=colnumbering_dir_single,
+                divergence_drop_reasons_path=divergence_drop_reasons_path_single,
                 show_progress=args.quiet,
             )
         else:
@@ -796,17 +917,31 @@ def main():
             _pd.read_csv(diff_scores_path, sep="\t")["group_id"].astype(str)
         )
 
-        list1_alignment_dir = os.path.join(outdir, "list1", "alignment")
+        list1_alignment_dir = os.path.join(
+            outdir, "list1",
+            "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
+        )
         list1_pages_dir      = os.path.join(outdir, "list1", "alignments")
         list1_colnum_dir     = (
             os.path.join(outdir, "list1", "alignment_trimmed_colnumbering")
             if trim_args else None
         )
-        list2_alignment_dir = os.path.join(outdir, "list2", "alignment")
+        list1_divergence_drop_reasons_path = (
+            os.path.join(outdir, "list1", "divergence_filter_stats", "drop_reasons.tsv")
+            if divergence_filter_sd else None
+        )
+        list2_alignment_dir = os.path.join(
+            outdir, "list2",
+            "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
+        )
         list2_pages_dir      = os.path.join(outdir, "list2", "alignments")
         list2_colnum_dir     = (
             os.path.join(outdir, "list2", "alignment_trimmed_colnumbering")
             if trim_args else None
+        )
+        list2_divergence_drop_reasons_path = (
+            os.path.join(outdir, "list2", "divergence_filter_stats", "drop_reasons.tsv")
+            if divergence_filter_sd else None
         )
 
         if not (resume and _step_complete(list1_pages_dir)):
@@ -818,6 +953,7 @@ def main():
                 group_ids=diff_group_ids,
                 anchor_species=anchor,
                 colnumbering_dir=list1_colnum_dir,
+                divergence_drop_reasons_path=list1_divergence_drop_reasons_path,
                 show_progress=args.quiet,
             )
         else:
@@ -842,6 +978,7 @@ def main():
                 anchor_species=None,
                 anchor_gene_lookup=list1_anchor_lookup,
                 colnumbering_dir=list2_colnum_dir,
+                divergence_drop_reasons_path=list2_divergence_drop_reasons_path,
                 show_progress=args.quiet,
             )
         else:

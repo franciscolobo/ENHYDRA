@@ -86,6 +86,123 @@ class TestAggregatePipelineStats:
         assert not (d / "pipeline_stats.json").is_file()
 
 
+class TestAggregatePipelineStatsDivergenceFilter:
+    """Divergence filtering is optional and off by default — this class
+    verifies both the 'never ran' (absent-key) and 'ran' (populated) paths,
+    per aggregate_pipeline_stats()'s documented auto-detection behaviour."""
+
+    def _make_listdir(self, tmp_path):
+        d = tmp_path / "list1"
+        for sub in ("length_filter", "length_filter_stats",
+                    "group_filter", "group_filter_stats", "tables"):
+            (d / sub).mkdir(parents=True)
+        return d
+
+    def test_not_run_omits_key_and_count_is_none(self, tmp_path):
+        """No divergence_filter_stats/drop_reasons.tsv on disk at all —
+        the step never ran for this list."""
+        d = self._make_listdir(tmp_path)
+        summary = aggregate_pipeline_stats(str(d), n_input=5)
+
+        assert summary["n_after_divergence_filter"] is None
+        assert "divergence_filter" not in summary["drop_summary"]
+        assert "divergence_filter_drop_reasons" not in summary["detail_files"]
+
+    def test_ran_with_no_drops_still_detected_and_populated(self, tmp_path):
+        """The step ran (file exists) but removed nothing — this must be
+        distinguishable from 'never ran': n_after_divergence_filter should
+        be a real (zero-or-more) count, and the drop_summary key should be
+        present with empty reason dicts, not absent."""
+        d = self._make_listdir(tmp_path)
+        (d / "alignment_divergence_filtered").mkdir()
+        (d / "OG1.aln").write_text("")   # unrelated stray file, ignored by count
+        for f in ("OG1.aln", "OG2.aln"):
+            (d / "alignment_divergence_filtered" / f).touch()
+        div_stats_dir = d / "divergence_filter_stats"
+        div_stats_dir.mkdir()
+        _write_tsv(
+            div_stats_dir / "drop_reasons.tsv",
+            ["group_id", "sequence_id", "identity_to_closest",
+             "pct_diff_from_avg", "reason"],
+            [],   # header only — ran, but nothing dropped
+        )
+
+        summary = aggregate_pipeline_stats(str(d), n_input=5)
+
+        assert summary["n_after_divergence_filter"] == 2
+        assert "divergence_filter" in summary["drop_summary"]
+        assert summary["drop_summary"]["divergence_filter"] == {
+            "sequences_removed": {}, "groups_dropped": {},
+        }
+
+    def test_ran_with_drops_splits_sequences_and_groups(self, tmp_path):
+        d = self._make_listdir(tmp_path)
+        (d / "alignment_divergence_filtered").mkdir()
+        for f in ("OG1.aln", "OG2.aln"):
+            (d / "alignment_divergence_filtered" / f).touch()
+        div_stats_dir = d / "divergence_filter_stats"
+        div_stats_dir.mkdir()
+        _write_tsv(
+            div_stats_dir / "drop_reasons.tsv",
+            ["group_id", "sequence_id", "identity_to_closest",
+             "pct_diff_from_avg", "reason"],
+            [
+                ("OG1", "sp1|g1", "0.3716", "0.4062", "removed_divergent_sequence"),
+                ("OG1", "sp2|g2", "0.4000", "0.4372", "removed_divergent_sequence"),
+                ("OG3", "sp1|g1,sp2|g2", "", "",
+                 "below_min_species_after_divergence_filter"),
+            ],
+        )
+
+        summary = aggregate_pipeline_stats(str(d), n_input=5)
+        ds = summary["drop_summary"]["divergence_filter"]
+
+        assert ds["sequences_removed"] == {"removed_divergent_sequence": 2}
+        assert ds["groups_dropped"] == {
+            "below_min_species_after_divergence_filter": 1,
+        }
+
+    def test_detail_file_link_present_only_when_ran(self, tmp_path):
+        d = self._make_listdir(tmp_path)
+        (d / "alignment_divergence_filtered").mkdir()
+        div_stats_dir = d / "divergence_filter_stats"
+        div_stats_dir.mkdir()
+        _write_tsv(
+            div_stats_dir / "drop_reasons.tsv",
+            ["group_id", "sequence_id", "identity_to_closest",
+             "pct_diff_from_avg", "reason"],
+            [("OG1", "sp1|g1", "0.3", "0.4", "removed_divergent_sequence")],
+        )
+
+        summary = aggregate_pipeline_stats(str(d), n_input=5)
+        assert summary["detail_files"]["divergence_filter_drop_reasons"] == \
+            os.path.join("divergence_filter_stats", "drop_reasons.tsv")
+
+    def test_other_stages_unaffected_by_divergence_filter_presence(self, tmp_path):
+        """Adding divergence filter output must not disturb the existing
+        funnel counts or other stages' drop reasons."""
+        d = self._make_listdir(tmp_path)
+        for f in ("OG1", "OG2", "OG3"):
+            (d / "length_filter" / f).touch()
+        for f in ("OG1", "OG2"):
+            (d / "group_filter" / f).touch()
+        (d / "alignment_divergence_filtered").mkdir()
+        (d / "alignment_divergence_filtered" / "OG1.aln").touch()
+        div_stats_dir = d / "divergence_filter_stats"
+        div_stats_dir.mkdir()
+        _write_tsv(
+            div_stats_dir / "drop_reasons.tsv",
+            ["group_id", "sequence_id", "identity_to_closest",
+             "pct_diff_from_avg", "reason"],
+            [("OG2", "sp1|g1", "0.3", "0.4", "removed_divergent_sequence")],
+        )
+
+        summary = aggregate_pipeline_stats(str(d), n_input=5)
+        assert summary["n_after_length_filter"] == 3
+        assert summary["n_after_group_filter"] == 2
+        assert summary["n_after_divergence_filter"] == 1
+
+
 class TestComputeDifferentialStats:
 
     def test_overlap_counts(self, tmp_path):

@@ -1,0 +1,88 @@
+============================================================
+Divergent-sequence filter: before/after comparison
+============================================================
+Groups compared:      72
+Groups unchanged:     0
+Groups with removals: 72
+Groups dropped entirely: 3
+
+--- Groups with sequences removed ---
+group_id                         n_before    n_after  n_removed
+HGDOG12002at7399_lengthfilter          24         15          9
+HGDOG12003at7399_lengthfilter          18         14          4
+HGDOG12044at7399_lengthfilter          36         26         10
+HGDOG12053at7399_lengthfilter          16         10          6
+HGDOG12100at7399_lengthfilter          19         15          4
+HGDOG12147at7399_lengthfilter          19         15          4
+HGDOG12156at7399_lengthfilter          18         14          4
+HGDOG12158at7399_lengthfilter          18         11          7
+HGDOG12160at7399_lengthfilter          19         11          8
+HGDOG12164at7399_lengthfilter          17         11          6
+HGDOG12166at7399_lengthfilter          40         27         13
+HGDOG12175at7399_lengthfilter          16          9          7
+HGDOG1219at7399_lengthfilter           12          9          3
+HGDOG12205at7399_lengthfilter          19         12          7
+HGDOG12207at7399_lengthfilter          17         10          7
+HGDOG12227at7399_lengthfilter          18         15          3
+HGDOG12233at7399_lengthfilter          15          8          7
+HGDOG12244at7399_lengthfilter          18         12          6
+HGDOG12266at7399_lengthfilter          18         11          7
+HGDOG12280at7399_lengthfilter          17         11          6
+HGDOG12289at7399_lengthfilter          19         11          8
+HGDOG1228at7399_lengthfilter           19         11          8
+HGDOG12297at7399_lengthfilter          17         12          5
+HGDOG1230at7399_lengthfilter           17         10          7
+HGDOG12312at7399_lengthfilter          18         11          7
+HGDOG12329at7399_lengthfilter          18         12          6
+HGDOG12365at7399_lengthfilter          18         14          4
+HGDOG12378at7399_lengthfilter          16         10          6
+HGDOG12407at7399_lengthfilter          19         12          7
+HGDOG12415at7399_lengthfilter          19         12          7
+HGDOG12426at7399_lengthfilter          19          9         10
+HGDOG12435at7399_lengthfilter          19         13          6
+HGDOG12451at7399_lengthfilter          14         10          4
+HGDOG12466at7399_lengthfilter          18         12          6
+HGDOG12468at7399_lengthfilter          19         11          8
+HGDOG12506at7399_lengthfilter          18         11          7
+HGDOG12516at7399_lengthfilter          18          9          9
+HGDOG12522at7399_lengthfilter          18         11          7
+HGDOG1254at7399_lengthfilter           17         11          6
+HGDOG12551at7399_lengthfilter          16          9          7
+HGDOG12568at7399_lengthfilter          15         12          3
+HGDOG12572at7399_lengthfilter          10          6          4
+HGDOG12606at7399_lengthfilter          17         11          6
+HGDOG12611at7399_lengthfilter          15          9          6
+HGDOG12612at7399_lengthfilter          18         11          7
+HGDOG12615at7399_lengthfilter          16          9          7
+HGDOG12618at7399_lengthfilter          20         12          8
+HGDOG12619at7399_lengthfilter           7          5          2
+HGDOG12625at7399_lengthfilter          17         10          7
+HGDOG1263at7399_lengthfilter           17         11          6
+HGDOG12660at7399_lengthfilter          19          9         10
+HGDOG12699at7399_lengthfilter          19         14          5
+HGDOG12728at7399_lengthfilter          10          8          2
+HGDOG12737at7399_lengthfilter          40         27         13
+HGDOG12746at7399_lengthfilter          19         13          6
+HGDOG12747at7399_lengthfilter          13          7          6
+HGDOG12753at7399_lengthfilter          16          9          7
+HGDOG12758at7399_lengthfilter          18         10          8
+HGDOG12785at7399_lengthfilter          18         12          6
+HGDOG12796at7399_lengthfilter          19         11          8
+HGDOG12818at7399_lengthfilter          17         10          7
+HGDOG1281at7399_lengthfilter           18         11          7
+HGDOG12823at7399_lengthfilter          18         15          3
+HGDOG12827at7399_lengthfilter          23         13         10
+HGDOG12836at7399_lengthfilter          18         13          5
+HGDOG12900at7399_lengthfilter          18         12          6
+HGDOG12915at7399_lengthfilter          16         11          5
+HGDOG12933at7399_lengthfilter          18         14          4
+HGDOG12944at7399_lengthfilter          19         14          5
+HGDOG12953at7399_lengthfilter          19         10          9
+HGDOG12975at7399_lengthfilter          12          6          6
+HGDOG12991at7399_lengthfilter          19         18          1
+
+--- Groups dropped entirely (see divergence_filter_stats/drop_reasons.tsv for reason) ---
+  HGDOG12456at7399_lengthfilter.aln
+  HGDOG12598at7399_lengthfilter.aln
+  HGDOG12830at7399_lengthfilter.aln
+

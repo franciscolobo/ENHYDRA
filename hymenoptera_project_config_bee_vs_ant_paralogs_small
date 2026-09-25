@@ -8,7 +8,7 @@ max_process = 8
 min_species     = 5        # minimum number of species per orthogroup
 min_sequences   = 5         # minimum sequences per group after length filtering
 paralogs        = all       # all | remove | longest
-length_filter_sd = 1      # sequences beyond mean ± (sd * length_filter_sd) are removed
+length_filter_sd = 0.2      # sequences beyond mean ± (sd * length_filter_sd) are removed
 
 # --- Alignment ---
 aligner     = mafft         # mafft | muscle | prank

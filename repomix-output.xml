@@ -32,7 +32,7 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
-- Only files matching these patterns are included: enhydra/**, README.md, tests/**
+- Only files matching these patterns are included: enhydra/**, tests/**, README.md, pyproject.toml
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -50,6 +50,7 @@ enhydra/
   filtering.py
   gsea.py
   io.py
+  msa_viewer.py
   orthofinder.py
   plotting.py
   report.py
@@ -77,8 +78,10 @@ tests/
   test_gsea.py
   test_integration.py
   test_io.py
+  test_msa_viewer.py
   test_stats.py
   test_tables.py
+pyproject.toml
 README.md
 </directory_structure>
 
@@ -2958,493 +2961,6 @@ class TestCheckOverlap:
         _check_overlap(ranked, gmt)
 </file>
 
-<file path="tests/test_integration.py">
-"""Integration tests for the ENHYDRA pipeline.
-
-Exercises the full filter → tables → GSEA → report path using pre-canned
-fixture files in place of MAFFT and trimAl output. No external tools are
-required.
-
-Run selectively:
-    pytest -m integration             # integration tests only
-    pytest -m "not integration"       # unit tests only (fast CI)
-"""
-from __future__ import annotations
-
-import os
-import shutil
-
-import pytest
-from Bio import SeqIO
-
-from enhydra.filtering import filter_length, filter_groups
-from enhydra.tables import make_tables
-from enhydra.gsea import run_gsea
-from enhydra.differential import compute_differential
-from enhydra.report import build_report, build_multi_metric_report
-from enhydra.plotting import make_single_list_plots
-
-pytestmark = pytest.mark.integration
-
-
-# ---------------------------------------------------------------------------
-# Constants (mirror generate_test_data.py)
-# ---------------------------------------------------------------------------
-
-ANCHOR      = "hsapiens"
-SPECIES     = [ANCHOR, "mmusculus", "drerio", "ggallus", "xtropicalis"]
-BASE_LEN    = 400
-MUT_RATE    = 0.15
-AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
-
-# Ensembl IDs used as anchor gene IDs — must match the GMT gene sets below.
-ANCHOR_GENE_IDS = [
-    "ENSG00000141510",  # OG000001  TP53
-    "ENSG00000012048",  # OG000002  BRCA1
-    "ENSG00000139618",  # OG000003  BRCA2
-    "ENSG00000157764",  # OG000004  BRAF  — filtered (no anchor in group)
-    "ENSG00000133703",  # OG000005  KRAS  — filtered (only 2 species)
-    "ENSG00000171862",  # OG000006  PTEN
-]
-
-# Identity values assigned to the four groups that pass all filters.
-IDENTITIES = {
-    "OG000001": 0.85,
-    "OG000002": 0.75,
-    "OG000003": 0.65,
-    "OG000006": 0.90,
-}
-
-# Two gene sets that overlap with the four passing anchor gene IDs.
-_GMT_LINES = [
-    "GO:0000001\ttest process alpha\t"
-    "ENSG00000141510\tENSG00000012048\tENSG00000139618\tENSG00000171862",
-    "GO:0000002\ttest process beta\t"
-    "ENSG00000139618\tENSG00000171862",
-]
-
-# list2 identities (inverted rankings relative to list1) used in
-# the differential mode fixture.
-_LIST2_IDENTITIES = {
-    "OG000001": 0.60,
-    "OG000002": 0.70,
-    "OG000003": 0.80,
-    "OG000006": 0.65,
-}
-
-
-# ---------------------------------------------------------------------------
-# Sequence helpers
-# ---------------------------------------------------------------------------
-
-def _rng_seq(length: int, seed: int) -> str:
-    import random
-    rng = random.Random(seed)
-    return "".join(rng.choices(AMINO_ACIDS, k=length))
-
-
-def _mutate(seq: str, rate: float, seed: int) -> str:
-    import random
-    rng = random.Random(seed)
-    aa = list(seq)
-    for i in range(len(aa)):
-        if rng.random() < rate:
-            aa[i] = rng.choice(AMINO_ACIDS)
-    return "".join(aa)
-
-
-def _write_fasta(path: str, entries: list[tuple[str, str]]) -> None:
-    with open(path, "w") as fh:
-        for header, seq in entries:
-            fh.write(">%s\n%s\n" % (header, seq))
-
-
-def _write_ident(path: str, identity: float) -> None:
-    with open(path, "w") as fh:
-        fh.write("## AverageIdentity %.6f\n" % identity)
-
-
-# ---------------------------------------------------------------------------
-# Session-scoped fixtures
-# (each fixture runs once; downstream fixtures reuse its output path)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-def workspace(tmp_path_factory):
-    """Root temp directory shared across all integration fixtures."""
-    return tmp_path_factory.mktemp("integration")
-
-
-@pytest.fixture(scope="session")
-def input_dir(workspace):
-    """Synthetic FASTA input groups mirroring generate_test_data.py.
-
-    OG000001–3 : all 5 species, anchor present  → pass all filters
-    OG000004   : no anchor species              → removed by filter_groups
-    OG000005   : only 2 species                 → removed by filter_groups
-    OG000006   : drerio sequence is 3× longer   → drerio removed by filter_length;
-                 remaining 4 species pass
-    """
-    d = workspace / "input"
-    d.mkdir()
-    non_anchor = [sp for sp in SPECIES if sp != ANCHOR]
-
-    # OG000001–3: clean groups
-    for i in range(1, 4):
-        name = "OG%06d" % i
-        base = _rng_seq(BASE_LEN, seed=hash(name) & 0xFFFF)
-        entries = [("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[i - 1]), base)]
-        for sp in non_anchor:
-            entries.append((
-                "%s|%s_%s" % (sp, name, sp[:3].upper()),
-                _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF),
-            ))
-        _write_fasta(str(d / name), entries)
-
-    # OG000004: no anchor
-    name = "OG000004"
-    base = _rng_seq(BASE_LEN, seed=40)
-    _write_fasta(str(d / name), [
-        ("%s|%s_%s" % (sp, name, sp[:3].upper()),
-         _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF))
-        for sp in non_anchor
-    ])
-
-    # OG000005: only 2 species
-    _write_fasta(str(d / "OG000005"), [
-        ("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[4]), _rng_seq(BASE_LEN, seed=50)),
-        ("mmusculus|OG000005_MMU",                _rng_seq(BASE_LEN, seed=51)),
-    ])
-
-    # OG000006: drerio is 3× longer than the rest
-    name = "OG000006"
-    base = _rng_seq(BASE_LEN, seed=60)
-    entries = []
-    for sp in SPECIES:
-        gid = ANCHOR_GENE_IDS[5] if sp == ANCHOR else "%s_%s" % (name, sp[:3].upper())
-        seq = (_rng_seq(BASE_LEN * 3, seed=61)
-               if sp == "drerio"
-               else _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF))
-        entries.append(("%s|%s" % (sp, gid), seq))
-    _write_fasta(str(d / name), entries)
-
-    return str(d)
-
-
-@pytest.fixture(scope="session")
-def filtered(workspace, input_dir):
-    """Run filter_length (serially) then filter_groups.
-
-    Returns:
-        Tuple of (length_filter_dir, group_filter_dir).
-    """
-    stats_dir = workspace / "length_stats"
-    lf_dir    = workspace / "length_filter"
-    gf_dir    = workspace / "group_filter"
-    for p in (stats_dir, lf_dir, gf_dir):
-        p.mkdir()
-
-    for fname in os.listdir(input_dir):
-        filter_length(
-            os.path.join(input_dir, fname),
-            str(stats_dir), str(lf_dir),
-        )
-
-    filter_groups(
-        length_filter_dir=str(lf_dir),
-        group_filter_dir=str(gf_dir),
-        anchor=ANCHOR,
-        min_species=4,
-    )
-    return str(lf_dir), str(gf_dir)
-
-
-@pytest.fixture(scope="session")
-def alignment_dir(workspace):
-    """Pre-canned alignment files — bypasses MAFFT entirely.
-
-    Files are minimal valid FASTA sequences of uniform length (no real
-    alignment required since make_tables only parses headers and the
-    AverageIdentity is supplied separately via the ident fixture).
-    """
-    d = workspace / "alignment"
-    d.mkdir()
-    non_anchor = [sp for sp in SPECIES if sp != ANCHOR]
-
-    # OG000001–3: all 5 species
-    for i in range(1, 4):
-        name = "OG%06d" % i
-        base = _rng_seq(BASE_LEN, seed=hash(name) & 0xFFFF)
-        entries = [("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[i - 1]), base)]
-        for sp in non_anchor:
-            entries.append((
-                "%s|%s_%s" % (sp, name, sp[:3].upper()),
-                _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF),
-            ))
-        _write_fasta(str(d / (name + ".aln")), entries)
-
-    # OG000006: 4 species (drerio already removed by filter_length)
-    name = "OG000006"
-    base = _rng_seq(BASE_LEN, seed=60)
-    entries = [("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[5]), base)]
-    for sp in [s for s in SPECIES if s not in (ANCHOR, "drerio")]:
-        entries.append((
-            "%s|%s_%s" % (sp, name, sp[:3].upper()),
-            _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF),
-        ))
-    _write_fasta(str(d / (name + ".aln")), entries)
-
-    return str(d)
-
-
-@pytest.fixture(scope="session")
-def ident_dir(workspace):
-    """Pre-canned trimAl identity files — bypasses trimAl entirely."""
-    d = workspace / "ident"
-    d.mkdir()
-    for og, identity in IDENTITIES.items():
-        _write_ident(str(d / (og + ".aln.ident")), identity)
-    return str(d)
-
-
-@pytest.fixture(scope="session")
-def tables_dir(workspace, alignment_dir, ident_dir):
-    """Run make_tables on the pre-canned alignment + ident fixtures."""
-    d = str(workspace / "tables")
-    make_tables(alignment_dir, ident_dir, d, anchor=ANCHOR)
-    return d
-
-
-@pytest.fixture(scope="session")
-def gmt_file(workspace):
-    """Tiny GMT whose gene IDs match the four passing anchor sequences."""
-    path = workspace / "test.gmt"
-    path.write_text("\n".join(_GMT_LINES) + "\n")
-    return str(path)
-
-
-@pytest.fixture(scope="session")
-def gsea_dir(workspace, tables_dir, gmt_file):
-    """Run GSEApy prerank on the fixture data."""
-    d = str(workspace / "enrichment")
-    run_gsea(
-        anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
-        results_dir=d,
-        gene_sets=gmt_file,
-        permutations=100,
-        min_size=2,
-        max_size=500,
-        seed=42,
-    )
-    return d
-
-
-@pytest.fixture(scope="session")
-def diff_dir(workspace, tables_dir):
-    """Compute differential scores between list1 (IDENTITIES) and list2
-    (_LIST2_IDENTITIES), which have deliberately inverted rankings.
-
-    OG000001: list1=0.85 > list2=0.60  → positive differential score
-    OG000003: list1=0.65 < list2=0.80  → negative differential score
-    """
-    tbl2 = workspace / "tables2"
-    tbl2.mkdir()
-
-    with open(str(tbl2 / "group2mean.tsv"), "w") as fh:
-        for og, val in _LIST2_IDENTITIES.items():
-            fh.write("%s\t%.6f\n" % (og, val))
-
-    # group2anchor is the same for both lists (same anchor gene IDs)
-    shutil.copy(
-        os.path.join(tables_dir, "group2anchor.tsv"),
-        str(tbl2 / "group2anchor.tsv"),
-    )
-
-    d = str(workspace / "differential")
-    compute_differential(
-        tables_dir1=tables_dir,
-        tables_dir2=str(tbl2),
-        diff_dir=d,
-        metric="zscore",
-    )
-    return d
-
-
-# ---------------------------------------------------------------------------
-# Tests: filtering
-# ---------------------------------------------------------------------------
-
-class TestFilteringIntegration:
-
-    def test_og4_removed_no_anchor(self, filtered):
-        _, gf_dir = filtered
-        assert not any("OG000004" in n for n in os.listdir(gf_dir))
-
-    def test_og5_removed_too_few_species(self, filtered):
-        _, gf_dir = filtered
-        assert not any("OG000005" in n for n in os.listdir(gf_dir))
-
-    def test_og1_to_3_pass(self, filtered):
-        _, gf_dir = filtered
-        names = os.listdir(gf_dir)
-        for i in range(1, 4):
-            assert any("OG%06d" % i in n for n in names)
-
-    def test_og6_drerio_removed_by_length_filter(self, filtered):
-        lf_dir, _ = filtered
-        lf_path = os.path.join(lf_dir, "OG000006_lengthfilter")
-        ids = [r.id for r in SeqIO.parse(lf_path, "fasta")]
-        assert not any(i.startswith("drerio") for i in ids)
-
-    def test_og6_passes_group_filter_with_four_species(self, filtered):
-        _, gf_dir = filtered
-        assert any("OG000006" in n for n in os.listdir(gf_dir))
-
-
-# ---------------------------------------------------------------------------
-# Tests: tables
-# ---------------------------------------------------------------------------
-
-class TestTablesIntegration:
-
-    def _read_tsv(self, path):
-        with open(path) as fh:
-            return [line.strip().split("\t") for line in fh if line.strip()]
-
-    def test_group2mean_has_four_groups(self, tables_dir):
-        rows = self._read_tsv(os.path.join(tables_dir, "group2mean.tsv"))
-        assert len(rows) == 4
-
-    def test_group2mean_values_match_fixtures(self, tables_dir):
-        rows   = self._read_tsv(os.path.join(tables_dir, "group2mean.tsv"))
-        result = {r[0]: float(r[1]) for r in rows}
-        for og, expected in IDENTITIES.items():
-            assert abs(result[og] - expected) < 1e-5
-
-    def test_anchor2mean_has_correct_gene_ids(self, tables_dir):
-        rows     = self._read_tsv(os.path.join(tables_dir, "anchor2mean.tsv"))
-        gene_ids = {r[0] for r in rows}
-        expected = {
-            ANCHOR_GENE_IDS[0],   # OG000001
-            ANCHOR_GENE_IDS[1],   # OG000002
-            ANCHOR_GENE_IDS[2],   # OG000003
-            ANCHOR_GENE_IDS[5],   # OG000006
-        }
-        assert gene_ids == expected
-
-    def test_group2anchor_maps_correctly(self, tables_dir):
-        rows    = self._read_tsv(os.path.join(tables_dir, "group2anchor.tsv"))
-        mapping = {r[0]: r[1] for r in rows}
-        assert mapping["OG000001"] == ANCHOR_GENE_IDS[0]
-        assert mapping["OG000006"] == ANCHOR_GENE_IDS[5]
-
-
-# ---------------------------------------------------------------------------
-# Tests: GSEA
-# ---------------------------------------------------------------------------
-
-class TestGSEAIntegration:
-
-    def test_results_csv_written(self, gsea_dir):
-        assert os.path.isfile(
-            os.path.join(gsea_dir, "gseapy.gene_set.prerank.report.csv")
-        )
-
-    def test_results_have_expected_columns(self, gsea_dir):
-        import pandas as pd
-        df = pd.read_csv(
-            os.path.join(gsea_dir, "gseapy.gene_set.prerank.report.csv")
-        )
-        for col in ("Term", "NES", "NOM p-val", "FDR q-val"):
-            assert col in df.columns
-
-    def test_both_gene_sets_tested(self, gsea_dir):
-        import pandas as pd
-        df = pd.read_csv(
-            os.path.join(gsea_dir, "gseapy.gene_set.prerank.report.csv")
-        )
-        assert set(df["Term"]) == {"GO:0000001", "GO:0000002"}
-
-
-# ---------------------------------------------------------------------------
-# Tests: differential
-# ---------------------------------------------------------------------------
-
-class TestDifferentialIntegration:
-
-    def test_anchor2mean_written(self, diff_dir):
-        assert os.path.isfile(os.path.join(diff_dir, "anchor2mean.tsv"))
-
-    def test_differential_scores_written(self, diff_dir):
-        assert os.path.isfile(os.path.join(diff_dir, "differential_scores.tsv"))
-
-    def test_all_common_groups_present(self, diff_dir):
-        import pandas as pd
-        df = pd.read_csv(os.path.join(diff_dir, "differential_scores.tsv"), sep="\t")
-        assert set(df["group_id"]) == set(IDENTITIES.keys())
-
-    def test_score_signs_reflect_rankings(self, diff_dir):
-        """OG000001 is more conserved in list1 than list2 → positive score.
-        OG000003 is more conserved in list2 than list1 → negative score.
-        This holds regardless of the normalisation details of zscore mode.
-        """
-        import pandas as pd
-        df = (pd.read_csv(os.path.join(diff_dir, "differential_scores.tsv"), sep="\t")
-                .set_index("group_id"))
-        assert df.loc["OG000001", "score"] > 0
-        assert df.loc["OG000003", "score"] < 0
-
-
-# ---------------------------------------------------------------------------
-# Tests: report
-# ---------------------------------------------------------------------------
-
-class TestReportIntegration:
-
-    def test_single_metric_report_written(self, workspace, gsea_dir, tables_dir):
-        plots_dir   = str(workspace / "plots_single")
-        report_path = str(workspace / "report_single.html")
-        make_single_list_plots(
-            anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
-            results_dir=gsea_dir,
-            plots_dir=plots_dir,
-        )
-        build_report(
-            results_dir=gsea_dir,
-            plots_dir=plots_dir,
-            report_path=report_path,
-            mode="single",
-        )
-        assert os.path.isfile(report_path)
-        content = open(report_path).read()
-        assert "ENHYDRA" in content
-        assert "GO:0000001" in content
-        assert "GO:0000002" in content
-
-    def test_multi_metric_report_has_all_tab_labels(self, workspace, gsea_dir, tables_dir):
-        from enhydra.report import METRIC_LABELS
-        metric_data = {}
-        for m in ("identity", "zscore", "rank"):
-            plots_dir = str(workspace / ("plots_multi_" + m))
-            make_single_list_plots(
-                anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
-                results_dir=gsea_dir,
-                plots_dir=plots_dir,
-            )
-            metric_data[m] = {"results_dir": gsea_dir, "plots_dir": plots_dir}
-
-        report_path = str(workspace / "report_multi.html")
-        build_multi_metric_report(
-            metric_data=metric_data,
-            report_path=report_path,
-            mode="single",
-        )
-        assert os.path.isfile(report_path)
-        content = open(report_path).read()
-        for label in METRIC_LABELS.values():
-            assert label in content
-</file>
-
 <file path="tests/test_io.py">
 """Tests for enhydra.io."""
 
@@ -4185,6 +3701,514 @@ if __name__ == "__main__":
     main(sys.argv[1])
 </file>
 
+<file path="tests/test_integration.py">
+"""Integration tests for the ENHYDRA pipeline.
+
+Exercises the full filter → tables → GSEA → report path using pre-canned
+fixture files in place of MAFFT and trimAl output. No external tools are
+required.
+
+Run selectively:
+    pytest -m integration             # integration tests only
+    pytest -m "not integration"       # unit tests only (fast CI)
+"""
+from __future__ import annotations
+
+import os
+import shutil
+
+import pytest
+from Bio import SeqIO
+
+from enhydra.filtering import filter_length, filter_groups
+from enhydra.tables import make_tables
+from enhydra.gsea import run_gsea
+from enhydra.differential import compute_differential
+from enhydra.report import build_report, build_multi_metric_report
+from enhydra.plotting import make_single_list_plots
+
+pytestmark = pytest.mark.integration
+
+
+# ---------------------------------------------------------------------------
+# Constants (mirror generate_test_data.py)
+# ---------------------------------------------------------------------------
+
+ANCHOR      = "hsapiens"
+SPECIES     = [ANCHOR, "mmusculus", "drerio", "ggallus", "xtropicalis"]
+BASE_LEN    = 400
+MUT_RATE    = 0.15
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+
+# Ensembl IDs used as anchor gene IDs — must match the GMT gene sets below.
+ANCHOR_GENE_IDS = [
+    "ENSG00000141510",  # OG000001  TP53
+    "ENSG00000012048",  # OG000002  BRCA1
+    "ENSG00000139618",  # OG000003  BRCA2
+    "ENSG00000157764",  # OG000004  BRAF  — filtered (no anchor in group)
+    "ENSG00000133703",  # OG000005  KRAS  — filtered (only 2 species)
+    "ENSG00000171862",  # OG000006  PTEN
+]
+
+# Identity values assigned to the four groups that pass all filters.
+IDENTITIES = {
+    "OG000001": 0.85,
+    "OG000002": 0.75,
+    "OG000003": 0.65,
+    "OG000006": 0.90,
+}
+
+# Two gene sets exercising GSEApy against the four passing anchor gene IDs.
+#
+# GO:0000001 deliberately covers only 3 of the 4 ranked genes (omits
+# ENSG00000171862 / OG000006), not all 4. A gene set covering 100% of the
+# ranked list is a degenerate case for the classic GSEA running-sum
+# enrichment statistic — there are no "miss" genes left to contribute the
+# complementary term, and GSEApy silently drops such gene sets from its
+# results rather than erroring. An earlier version of this fixture had
+# GO:0000001 cover all 4 genes and was silently excluded from every GSEA
+# run as a result; keeping a non-empty complement here is required for it
+# to appear in gseapy's output at all, not just a style preference.
+_GMT_LINES = [
+    "GO:0000001\ttest process alpha\t"
+    "ENSG00000141510\tENSG00000012048\tENSG00000139618",
+    "GO:0000002\ttest process beta\t"
+    "ENSG00000139618\tENSG00000171862",
+]
+
+# list2 identities (inverted rankings relative to list1) used in
+# the differential mode fixture.
+_LIST2_IDENTITIES = {
+    "OG000001": 0.60,
+    "OG000002": 0.70,
+    "OG000003": 0.80,
+    "OG000006": 0.65,
+}
+
+
+# ---------------------------------------------------------------------------
+# Sequence helpers
+# ---------------------------------------------------------------------------
+
+def _rng_seq(length: int, seed: int) -> str:
+    import random
+    rng = random.Random(seed)
+    return "".join(rng.choices(AMINO_ACIDS, k=length))
+
+
+def _mutate(seq: str, rate: float, seed: int) -> str:
+    import random
+    rng = random.Random(seed)
+    aa = list(seq)
+    for i in range(len(aa)):
+        if rng.random() < rate:
+            aa[i] = rng.choice(AMINO_ACIDS)
+    return "".join(aa)
+
+
+def _write_fasta(path: str, entries: list[tuple[str, str]]) -> None:
+    with open(path, "w") as fh:
+        for header, seq in entries:
+            fh.write(">%s\n%s\n" % (header, seq))
+
+
+def _write_ident(path: str, identity: float) -> None:
+    with open(path, "w") as fh:
+        fh.write("## AverageIdentity %.6f\n" % identity)
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped fixtures
+# (each fixture runs once; downstream fixtures reuse its output path)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def workspace(tmp_path_factory):
+    """Root temp directory shared across all integration fixtures."""
+    return tmp_path_factory.mktemp("integration")
+
+
+@pytest.fixture(scope="session")
+def input_dir(workspace):
+    """Synthetic FASTA input groups mirroring generate_test_data.py.
+
+    OG000001–3 : all 5 species, anchor present  → pass all filters
+    OG000004   : no anchor species              → removed by filter_groups
+    OG000005   : only 2 species                 → removed by filter_groups
+    OG000006   : drerio sequence is 3× longer   → drerio removed by filter_length;
+                 remaining 4 species pass
+    """
+    d = workspace / "input"
+    d.mkdir()
+    non_anchor = [sp for sp in SPECIES if sp != ANCHOR]
+
+    # OG000001–3: clean groups
+    for i in range(1, 4):
+        name = "OG%06d" % i
+        base = _rng_seq(BASE_LEN, seed=hash(name) & 0xFFFF)
+        entries = [("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[i - 1]), base)]
+        for sp in non_anchor:
+            entries.append((
+                "%s|%s_%s" % (sp, name, sp[:3].upper()),
+                _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF),
+            ))
+        _write_fasta(str(d / name), entries)
+
+    # OG000004: no anchor
+    name = "OG000004"
+    base = _rng_seq(BASE_LEN, seed=40)
+    _write_fasta(str(d / name), [
+        ("%s|%s_%s" % (sp, name, sp[:3].upper()),
+         _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF))
+        for sp in non_anchor
+    ])
+
+    # OG000005: only 2 species
+    _write_fasta(str(d / "OG000005"), [
+        ("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[4]), _rng_seq(BASE_LEN, seed=50)),
+        ("mmusculus|OG000005_MMU",                _rng_seq(BASE_LEN, seed=51)),
+    ])
+
+    # OG000006: drerio is 3× longer than the rest
+    name = "OG000006"
+    base = _rng_seq(BASE_LEN, seed=60)
+    entries = []
+    for sp in SPECIES:
+        gid = ANCHOR_GENE_IDS[5] if sp == ANCHOR else "%s_%s" % (name, sp[:3].upper())
+        seq = (_rng_seq(BASE_LEN * 3, seed=61)
+               if sp == "drerio"
+               else _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF))
+        entries.append(("%s|%s" % (sp, gid), seq))
+    _write_fasta(str(d / name), entries)
+
+    return str(d)
+
+
+@pytest.fixture(scope="session")
+def filtered(workspace, input_dir):
+    """Run filter_length (serially) then filter_groups.
+
+    Returns:
+        Tuple of (length_filter_dir, group_filter_dir).
+    """
+    stats_dir = workspace / "length_stats"
+    lf_dir    = workspace / "length_filter"
+    gf_dir    = workspace / "group_filter"
+    for p in (stats_dir, lf_dir, gf_dir):
+        p.mkdir()
+
+    for fname in os.listdir(input_dir):
+        # sd_multiplier=1.5 (tighter than the pipeline default of 2.0):
+        # with only 5 species per group, a single extreme outlier
+        # dominates its own stdev calculation enough that no outlier
+        # length can ever exceed mean + 2*stdev (see test_filtering.py's
+        # test_outlier_removed docstring for the same lesson learned
+        # with a larger, 10-baseline sample). 1.5 is comfortably below
+        # the ~1.79 threshold needed to catch OG000006's 3x-length
+        # drerio outlier, while OG000001-3 have zero length variance
+        # (pure substitution mutations, no indels) and so are unaffected
+        # by this choice regardless of value.
+        filter_length(
+            os.path.join(input_dir, fname),
+            str(stats_dir), str(lf_dir),
+            sd_multiplier=1.5,
+        )
+
+    filter_groups(
+        length_filter_dir=str(lf_dir),
+        group_filter_dir=str(gf_dir),
+        anchor=ANCHOR,
+        min_species=4,
+    )
+    return str(lf_dir), str(gf_dir)
+
+
+@pytest.fixture(scope="session")
+def alignment_dir(workspace):
+    """Pre-canned alignment files — bypasses MAFFT entirely.
+
+    Files are minimal valid FASTA sequences of uniform length (no real
+    alignment required since make_tables only parses headers and the
+    AverageIdentity is supplied separately via the ident fixture).
+    """
+    d = workspace / "alignment"
+    d.mkdir()
+    non_anchor = [sp for sp in SPECIES if sp != ANCHOR]
+
+    # OG000001–3: all 5 species
+    for i in range(1, 4):
+        name = "OG%06d" % i
+        base = _rng_seq(BASE_LEN, seed=hash(name) & 0xFFFF)
+        entries = [("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[i - 1]), base)]
+        for sp in non_anchor:
+            entries.append((
+                "%s|%s_%s" % (sp, name, sp[:3].upper()),
+                _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF),
+            ))
+        _write_fasta(str(d / (name + ".aln")), entries)
+
+    # OG000006: 4 species (drerio already removed by filter_length)
+    name = "OG000006"
+    base = _rng_seq(BASE_LEN, seed=60)
+    entries = [("%s|%s" % (ANCHOR, ANCHOR_GENE_IDS[5]), base)]
+    for sp in [s for s in SPECIES if s not in (ANCHOR, "drerio")]:
+        entries.append((
+            "%s|%s_%s" % (sp, name, sp[:3].upper()),
+            _mutate(base, MUT_RATE, seed=hash(name + sp) & 0xFFFF),
+        ))
+    _write_fasta(str(d / (name + ".aln")), entries)
+
+    return str(d)
+
+
+@pytest.fixture(scope="session")
+def ident_dir(workspace):
+    """Pre-canned trimAl identity files — bypasses trimAl entirely."""
+    d = workspace / "ident"
+    d.mkdir()
+    for og, identity in IDENTITIES.items():
+        _write_ident(str(d / (og + ".aln.ident")), identity)
+    return str(d)
+
+
+@pytest.fixture(scope="session")
+def tables_dir(workspace, alignment_dir, ident_dir):
+    """Run make_tables on the pre-canned alignment + ident fixtures."""
+    d = str(workspace / "tables")
+    make_tables(alignment_dir, ident_dir, d, anchor=ANCHOR)
+    return d
+
+
+@pytest.fixture(scope="session")
+def gmt_file(workspace):
+    """Tiny GMT whose gene IDs match the four passing anchor sequences."""
+    path = workspace / "test.gmt"
+    path.write_text("\n".join(_GMT_LINES) + "\n")
+    return str(path)
+
+
+@pytest.fixture(scope="session")
+def gsea_dir(workspace, tables_dir, gmt_file):
+    """Run GSEApy prerank on the fixture data."""
+    d = str(workspace / "enrichment")
+    run_gsea(
+        anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+        results_dir=d,
+        gene_sets=gmt_file,
+        permutations=100,
+        min_size=2,
+        max_size=500,
+        seed=42,
+    )
+    return d
+
+
+@pytest.fixture(scope="session")
+def diff_dir(workspace, tables_dir):
+    """Compute differential scores between list1 (IDENTITIES) and list2
+    (_LIST2_IDENTITIES), which have deliberately inverted rankings.
+
+    OG000001: list1=0.85 > list2=0.60  → positive differential score
+    OG000003: list1=0.65 < list2=0.80  → negative differential score
+    """
+    tbl2 = workspace / "tables2"
+    tbl2.mkdir()
+
+    with open(str(tbl2 / "group2mean.tsv"), "w") as fh:
+        for og, val in _LIST2_IDENTITIES.items():
+            fh.write("%s\t%.6f\n" % (og, val))
+
+    # group2anchor is the same for both lists (same anchor gene IDs)
+    shutil.copy(
+        os.path.join(tables_dir, "group2anchor.tsv"),
+        str(tbl2 / "group2anchor.tsv"),
+    )
+
+    d = str(workspace / "differential")
+    compute_differential(
+        tables_dir1=tables_dir,
+        tables_dir2=str(tbl2),
+        diff_dir=d,
+        metric="zscore",
+    )
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Tests: filtering
+# ---------------------------------------------------------------------------
+
+class TestFilteringIntegration:
+
+    def test_og4_removed_no_anchor(self, filtered):
+        _, gf_dir = filtered
+        assert not any("OG000004" in n for n in os.listdir(gf_dir))
+
+    def test_og5_removed_too_few_species(self, filtered):
+        _, gf_dir = filtered
+        assert not any("OG000005" in n for n in os.listdir(gf_dir))
+
+    def test_og1_to_3_pass(self, filtered):
+        _, gf_dir = filtered
+        names = os.listdir(gf_dir)
+        for i in range(1, 4):
+            assert any("OG%06d" % i in n for n in names)
+
+    def test_og6_drerio_removed_by_length_filter(self, filtered):
+        lf_dir, _ = filtered
+        lf_path = os.path.join(lf_dir, "OG000006_lengthfilter")
+        ids = [r.id for r in SeqIO.parse(lf_path, "fasta")]
+        assert not any(i.startswith("drerio") for i in ids)
+
+    def test_og6_passes_group_filter_with_four_species(self, filtered):
+        _, gf_dir = filtered
+        assert any("OG000006" in n for n in os.listdir(gf_dir))
+
+
+# ---------------------------------------------------------------------------
+# Tests: tables
+# ---------------------------------------------------------------------------
+
+class TestTablesIntegration:
+
+    def _read_tsv(self, path):
+        with open(path) as fh:
+            return [line.strip().split("\t") for line in fh if line.strip()]
+
+    def test_group2mean_has_four_groups(self, tables_dir):
+        rows = self._read_tsv(os.path.join(tables_dir, "group2mean.tsv"))
+        assert len(rows) == 4
+
+    def test_group2mean_values_match_fixtures(self, tables_dir):
+        rows   = self._read_tsv(os.path.join(tables_dir, "group2mean.tsv"))
+        result = {r[0]: float(r[1]) for r in rows}
+        for og, expected in IDENTITIES.items():
+            assert abs(result[og] - expected) < 1e-5
+
+    def test_anchor2mean_has_correct_gene_ids(self, tables_dir):
+        rows     = self._read_tsv(os.path.join(tables_dir, "anchor2mean.tsv"))
+        gene_ids = {r[0] for r in rows}
+        expected = {
+            ANCHOR_GENE_IDS[0],   # OG000001
+            ANCHOR_GENE_IDS[1],   # OG000002
+            ANCHOR_GENE_IDS[2],   # OG000003
+            ANCHOR_GENE_IDS[5],   # OG000006
+        }
+        assert gene_ids == expected
+
+    def test_group2anchor_maps_correctly(self, tables_dir):
+        rows    = self._read_tsv(os.path.join(tables_dir, "group2anchor.tsv"))
+        mapping = {r[0]: r[1] for r in rows}
+        assert mapping["OG000001"] == ANCHOR_GENE_IDS[0]
+        assert mapping["OG000006"] == ANCHOR_GENE_IDS[5]
+
+
+# ---------------------------------------------------------------------------
+# Tests: GSEA
+# ---------------------------------------------------------------------------
+
+class TestGSEAIntegration:
+
+    def test_results_csv_written(self, gsea_dir):
+        assert os.path.isfile(
+            os.path.join(gsea_dir, "gseapy.gene_set.prerank.report.csv")
+        )
+
+    def test_results_have_expected_columns(self, gsea_dir):
+        import pandas as pd
+        df = pd.read_csv(
+            os.path.join(gsea_dir, "gseapy.gene_set.prerank.report.csv")
+        )
+        for col in ("Term", "NES", "NOM p-val", "FDR q-val"):
+            assert col in df.columns
+
+    def test_both_gene_sets_tested(self, gsea_dir):
+        import pandas as pd
+        df = pd.read_csv(
+            os.path.join(gsea_dir, "gseapy.gene_set.prerank.report.csv")
+        )
+        assert set(df["Term"]) == {"GO:0000001", "GO:0000002"}
+
+
+# ---------------------------------------------------------------------------
+# Tests: differential
+# ---------------------------------------------------------------------------
+
+class TestDifferentialIntegration:
+
+    def test_anchor2mean_written(self, diff_dir):
+        assert os.path.isfile(os.path.join(diff_dir, "anchor2mean.tsv"))
+
+    def test_differential_scores_written(self, diff_dir):
+        assert os.path.isfile(os.path.join(diff_dir, "differential_scores.tsv"))
+
+    def test_all_common_groups_present(self, diff_dir):
+        import pandas as pd
+        df = pd.read_csv(os.path.join(diff_dir, "differential_scores.tsv"), sep="\t")
+        assert set(df["group_id"]) == set(IDENTITIES.keys())
+
+    def test_score_signs_reflect_rankings(self, diff_dir):
+        """OG000001 is more conserved in list1 than list2 → positive score.
+        OG000003 is more conserved in list2 than list1 → negative score.
+        This holds regardless of the normalisation details of zscore mode.
+        """
+        import pandas as pd
+        df = (pd.read_csv(os.path.join(diff_dir, "differential_scores.tsv"), sep="\t")
+                .set_index("group_id"))
+        assert df.loc["OG000001", "score"] > 0
+        assert df.loc["OG000003", "score"] < 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: report
+# ---------------------------------------------------------------------------
+
+class TestReportIntegration:
+
+    def test_single_metric_report_written(self, workspace, gsea_dir, tables_dir):
+        plots_dir   = str(workspace / "plots_single")
+        report_path = str(workspace / "report_single.html")
+        make_single_list_plots(
+            anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+            results_dir=gsea_dir,
+            plots_dir=plots_dir,
+        )
+        build_report(
+            results_dir=gsea_dir,
+            plots_dir=plots_dir,
+            report_path=report_path,
+            mode="single",
+        )
+        assert os.path.isfile(report_path)
+        content = open(report_path).read()
+        assert "ENHYDRA" in content
+        assert "GO:0000001" in content
+        assert "GO:0000002" in content
+
+    def test_multi_metric_report_has_all_tab_labels(self, workspace, gsea_dir, tables_dir):
+        from enhydra.report import METRIC_LABELS
+        metric_data = {}
+        for m in ("identity", "zscore", "rank"):
+            plots_dir = str(workspace / ("plots_multi_" + m))
+            make_single_list_plots(
+                anchor2mean_path=os.path.join(tables_dir, "anchor2mean.tsv"),
+                results_dir=gsea_dir,
+                plots_dir=plots_dir,
+            )
+            metric_data[m] = {"results_dir": gsea_dir, "plots_dir": plots_dir}
+
+        report_path = str(workspace / "report_multi.html")
+        build_multi_metric_report(
+            metric_data=metric_data,
+            report_path=report_path,
+            mode="single",
+        )
+        assert os.path.isfile(report_path)
+        content = open(report_path).read()
+        for label in METRIC_LABELS.values():
+            assert label in content
+</file>
+
 <file path="tests/test_filtering.py">
 """Tests for enhydra.filtering."""
 
@@ -4559,6 +4583,1180 @@ class TestFilterLengthStats:
         assert rows1 == [] and rows2 == []
 </file>
 
+<file path="tests/test_msa_viewer.py">
+"""Tests for enhydra.msa_viewer."""
+
+import os
+from enhydra.msa_viewer import (
+    parse_trimal_colnumbering,
+    compute_column_stats,
+    render_alignment_page,
+    build_alignment_pages,
+)
+
+def _write(path, content):
+    with open(path, "w") as fh:
+        fh.write(content)
+
+
+class TestParseTrimalColnumbering:
+
+    def test_plain_comma_separated(self, tmp_path):
+        f = tmp_path / "OG0001.colnumbering"
+        _write(str(f), "0, 1, 2, 4, 5, 6, 9, 10\n")
+        assert parse_trimal_colnumbering(str(f)) == {0, 1, 2, 4, 5, 6, 9, 10}
+
+    def test_with_header_line(self, tmp_path):
+        """Some trimAl versions prepend a '## ColumnsMap' style header."""
+        f = tmp_path / "OG0002.colnumbering"
+        _write(str(f), "## ColumnsMap\n0, 1, 2, 3, 5, 6\n")
+        assert parse_trimal_colnumbering(str(f)) == {0, 1, 2, 3, 5, 6}
+
+    def test_no_delimiter_whitespace_only(self, tmp_path):
+        f = tmp_path / "OG0003.colnumbering"
+        _write(str(f), "0 1 2 3 7 8\n")
+        assert parse_trimal_colnumbering(str(f)) == {0, 1, 2, 3, 7, 8}
+
+    def test_empty_file_returns_empty_set(self, tmp_path):
+        f = tmp_path / "OG0004.colnumbering"
+        _write(str(f), "")
+        assert parse_trimal_colnumbering(str(f)) == set()
+
+    def test_no_parseable_integers_returns_empty_set(self, tmp_path):
+        f = tmp_path / "OG0005.colnumbering"
+        _write(str(f), "no columns retained\n")
+        assert parse_trimal_colnumbering(str(f)) == set()
+
+    def test_missing_file_raises(self, tmp_path):
+        import pytest
+        with pytest.raises(FileNotFoundError):
+            parse_trimal_colnumbering(str(tmp_path / "nonexistent.colnumbering"))
+
+    def test_single_column_retained(self, tmp_path):
+        f = tmp_path / "OG0006.colnumbering"
+        _write(str(f), "42\n")
+        assert parse_trimal_colnumbering(str(f)) == {42}
+
+    def test_zero_is_a_valid_retained_column(self, tmp_path):
+        """Column index 0 must not be treated as falsy/absent."""
+        f = tmp_path / "OG0007.colnumbering"
+        _write(str(f), "0\n")
+        assert parse_trimal_colnumbering(str(f)) == {0}
+
+import math
+import pytest
+from enhydra.msa_viewer import compute_column_stats
+
+
+class TestComputeColumnStats:
+
+    def test_all_identical_column(self):
+        identities, entropies = compute_column_stats(["A", "A", "A", "A"])
+        assert identities == [1.0]
+        assert entropies == [0.0]
+
+    def test_all_gap_column(self):
+        identities, entropies = compute_column_stats(["-", "-", "-"])
+        assert identities == [0.0]
+        assert entropies == [0.0]
+
+    def test_maximally_diverse_column(self):
+        """4 distinct residues, each once: identity=1/4, entropy=2 bits
+        normalised by log2(20)."""
+        identities, entropies = compute_column_stats(["A", "C", "D", "E"])
+        assert identities[0] == pytest.approx(0.25)
+        expected_entropy = 2.0 / math.log2(20)
+        assert entropies[0] == pytest.approx(expected_entropy, abs=1e-6)
+
+    def test_three_of_four_same(self):
+        identities, entropies = compute_column_stats(["A", "A", "A", "C"])
+        assert identities[0] == pytest.approx(0.75)
+        p_a, p_c = 0.75, 0.25
+        expected_bits = -(p_a * math.log2(p_a) + p_c * math.log2(p_c))
+        assert entropies[0] == pytest.approx(expected_bits / math.log2(20), abs=1e-6)
+
+    def test_gaps_excluded_from_calculation(self):
+        """Column 'A','C','-','A': gap excluded, identity computed over the
+        3 non-gap residues only."""
+        identities, entropies = compute_column_stats(["A", "C", "-", "A"])
+        assert identities[0] == pytest.approx(2 / 3)
+        p_a, p_c = 2 / 3, 1 / 3
+        expected_bits = -(p_a * math.log2(p_a) + p_c * math.log2(p_c))
+        assert entropies[0] == pytest.approx(expected_bits / math.log2(20), abs=1e-6)
+
+    def test_dot_character_also_treated_as_gap(self):
+        identities, _ = compute_column_stats(["A", "A", ".", "A"])
+        assert identities[0] == pytest.approx(1.0)
+
+    def test_tie_for_most_common_residue(self):
+        """2 A's and 2 C's: identity uses the shared max count (2/4),
+        regardless of which residue is 'the' most common."""
+        identities, _ = compute_column_stats(["A", "A", "C", "C"])
+        assert identities[0] == pytest.approx(0.5)
+
+    def test_lowercase_residues_treated_as_uppercase(self):
+        identities, entropies = compute_column_stats(["a", "A", "a", "A"])
+        assert identities[0] == pytest.approx(1.0)
+        assert entropies[0] == pytest.approx(0.0)
+
+    def test_single_sequence_alignment(self):
+        identities, entropies = compute_column_stats(["ACDE"])
+        assert identities == [1.0, 1.0, 1.0, 1.0]
+        assert entropies == [0.0, 0.0, 0.0, 0.0]
+
+    def test_multi_column_alignment_returns_one_value_per_column(self):
+        seqs = ["AAC-", "AAG-", "AAT-"]
+        identities, entropies = compute_column_stats(seqs)
+        assert len(identities) == 4
+        assert len(entropies) == 4
+        # Columns 0 and 1 are fully conserved.
+        assert identities[0] == pytest.approx(1.0)
+        assert identities[1] == pytest.approx(1.0)
+        # Column 2 has three distinct residues (C, G, T), no majority.
+        assert identities[2] == pytest.approx(1 / 3)
+        # Column 3 is all-gap.
+        assert identities[3] == 0.0
+        assert entropies[3] == 0.0
+
+    def test_empty_sequence_list_returns_empty_lists(self):
+        assert compute_column_stats([]) == ([], [])
+
+    def test_zero_width_sequences_return_empty_lists(self):
+        assert compute_column_stats(["", "", ""]) == ([], [])
+
+    def test_unequal_sequence_lengths_raises(self):
+        with pytest.raises(ValueError, match="same length"):
+            compute_column_stats(["ACD", "AC"])
+
+    def test_entropy_values_always_bounded(self):
+        """Sanity check across a variety of columns: entropy must stay in
+        [0, 1] regardless of residue diversity."""
+        test_columns = [
+            ["A", "A", "A"],
+            ["A", "C", "D", "E", "F", "G", "H", "I"],
+            ["A", "-", "-"],
+            ["A", "C"],
+        ]
+        for col in test_columns:
+            _, entropies = compute_column_stats(col)
+            assert 0.0 <= entropies[0] <= 1.0
+
+    def test_identity_values_always_bounded(self):
+        test_columns = [
+            ["A", "A", "A"],
+            ["A", "C", "D", "E"],
+            ["-", "-", "-"],
+        ]
+        for col in test_columns:
+            identities, _ = compute_column_stats(col)
+            assert 0.0 <= identities[0] <= 1.0
+
+class TestRenderAlignmentPage:
+
+    def _records(self):
+        return [
+            ("Species_a|GENE_A", "ACD-EFG"),
+            ("Species_b|GENE_B", "ACDEEFG"),
+            ("Species_c|GENE_C", "ACD-EFG"),
+        ]
+
+    def test_creates_file(self, tmp_path):
+        out = tmp_path / "OG0001.html"
+        render_alignment_page("OG0001", self._records(), str(out))
+        assert out.is_file()
+
+    def test_contains_group_and_metadata(self, tmp_path):
+        out = tmp_path / "OG0001.html"
+        render_alignment_page(
+            "OG0001", self._records(), str(out),
+            anchor_gene_id="ENSG00000141510",
+            anchor_species="Species_a",
+            mean_identity=0.85,
+        )
+        content = out.read_text()
+        assert "OG0001" in content
+        assert "ENSG00000141510" in content
+        assert "Species_a" in content
+        assert "0.8500" in content
+
+    def test_no_anchor_species_no_warning(self, tmp_path):
+        out = tmp_path / "OG0001.html"
+        render_alignment_page("OG0001", self._records(), str(out))
+        content = out.read_text()
+        assert '<div class="warning">' not in content
+
+    def test_anchor_pinned_to_top(self, tmp_path):
+        out = tmp_path / "OG0001.html"
+        render_alignment_page(
+            "OG0001", self._records(), str(out), anchor_species="Species_c",
+        )
+        content = out.read_text()
+        # The pinned anchor's row-label should appear before the others.
+        pos_c = content.index("Species_c|GENE_C")
+        pos_a = content.index("Species_a|GENE_A")
+        pos_b = content.index("Species_b|GENE_B")
+        assert pos_c < pos_a
+        assert pos_c < pos_b
+    def test_anchor_not_found_adds_warning_and_preserves_order(self, tmp_path):
+        out = tmp_path / "OG0001.html"
+        render_alignment_page(
+            "OG0001", self._records(), str(out), anchor_species="Nonexistent_species",
+        )
+        content = out.read_text()
+        assert '<div class="warning">' in content
+        assert "Nonexistent_species" in content
+        pos_a = content.index("Species_a|GENE_A")
+        pos_b = content.index("Species_b|GENE_B")
+        pos_c = content.index("Species_c|GENE_C")
+        assert pos_a < pos_b < pos_c   # original order unchanged
+
+    def test_masked_columns_get_trimmed_class(self, tmp_path):
+        out = tmp_path / "OG0001.html"
+        # Records are 7 columns wide; mask out column index 3 (the gap column).
+        retained = {0, 1, 2, 4, 5, 6}
+        render_alignment_page(
+            "OG0001", self._records(), str(out), retained_columns=retained,
+        )
+        content = out.read_text()
+        assert 'class="aa trimmed"' in content
+        assert "trimmed by trimAl" in content
+        assert "Trimmed columns" in content
+        assert "1 of 7 removed" in content
+
+    def test_no_retained_columns_means_no_masking(self, tmp_path):
+        out = tmp_path / "OG0001.html"
+        render_alignment_page("OG0001", self._records(), str(out))
+        content = out.read_text()
+        assert 'class="aa trimmed"' not in content
+        assert "Trimmed columns" not in content
+
+    def test_all_aa_spans_present_including_gaps(self, tmp_path):
+        """7 columns x 3 sequences = 21 residue spans, gaps included."""
+        out = tmp_path / "OG0001.html"
+        render_alignment_page("OG0001", self._records(), str(out))
+        content = out.read_text()
+        assert content.count('class="aa"') + content.count('class="aa trimmed"') == 21
+
+    def test_block_width_wraps_into_multiple_blocks(self, tmp_path):
+        records = [("Sp_a|G1", "A" * 130), ("Sp_b|G2", "A" * 130)]
+        out = tmp_path / "OG0002.html"
+        render_alignment_page("OG0002", records, str(out), block_width=60)
+        content = out.read_text()
+        # 130 columns / 60 per block -> 3 blocks (60, 60, 10)
+        assert content.count('class="aln-block"') == 3
+        assert "Columns 1\u201360" in content
+        assert "Columns 121\u2013130" in content
+
+    def test_raises_on_empty_records(self, tmp_path):
+        import pytest
+        out = tmp_path / "OG0003.html"
+        with pytest.raises(ValueError, match="must not be empty"):
+            render_alignment_page("OG0003", [], str(out))
+
+    def test_raises_on_unequal_length_sequences(self, tmp_path):
+        """Propagated from compute_column_stats()."""
+        import pytest
+        out = tmp_path / "OG0004.html"
+        with pytest.raises(ValueError, match="same length"):
+            render_alignment_page(
+                "OG0004",
+                [("Sp_a|G1", "ACDE"), ("Sp_b|G2", "AC")],
+                str(out),
+            )
+
+    def test_mean_identity_none_shows_na(self, tmp_path):
+        out = tmp_path / "OG0005.html"
+        render_alignment_page("OG0005", self._records(), str(out), mean_identity=None)
+        content = out.read_text()
+        assert "N/A" in content
+
+    def test_legend_present(self, tmp_path):
+        out = tmp_path / "OG0006.html"
+        render_alignment_page("OG0006", self._records(), str(out))
+        content = out.read_text()
+        assert "Aliphatic" in content
+        assert "Aromatic" in content
+
+    def test_out_path_accepts_str(self, tmp_path):
+        """Confirms the function works with plain str paths (not just Path)."""
+        out_str = str(tmp_path / "OG0007.html")
+        render_alignment_page("OG0007", self._records(), out_str)
+        import os
+        assert os.path.isfile(out_str)
+
+class TestBuildAlignmentPages:
+
+    def _write_fasta(self, path, entries):
+        with open(path, "w") as fh:
+            for header, seq in entries:
+                fh.write(">%s\n%s\n" % (header, seq))
+
+    def _write_tsv(self, path, rows):
+        with open(path, "w") as fh:
+            for row in rows:
+                fh.write("\t".join(row) + "\n")
+
+    def _setup(self, tmp_path, groups: dict):
+        """groups = {group_id: {"entries": [(header, seq)], "mean": float,
+                                "anchor_gene": str | None}}"""
+        aln_dir = tmp_path / "alignment"
+        tables_dir = tmp_path / "tables"
+        aln_dir.mkdir()
+        tables_dir.mkdir()
+
+        mean_rows, anchor_rows = [], []
+        for gid, data in groups.items():
+            self._write_fasta(str(aln_dir / (gid + ".aln")), data["entries"])
+            mean_rows.append((gid, str(data["mean"])))
+            if data.get("anchor_gene"):
+                anchor_rows.append((gid, data["anchor_gene"]))
+
+        self._write_tsv(str(tables_dir / "group2mean.tsv"), mean_rows)
+        self._write_tsv(str(tables_dir / "group2anchor.tsv"), anchor_rows)
+        return str(aln_dir), str(tables_dir)
+
+    def test_default_group_ids_from_group2anchor(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACD"), ("Species_b|G2", "ACD")],
+                      "mean": 0.9, "anchor_gene": "G1"},
+            "OG0002": {"entries": [("Species_a|G3", "ACD"), ("Species_b|G4", "ACD")],
+                      "mean": 0.8, "anchor_gene": "G3"},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir)
+        assert set(pages.keys()) == {"OG0001", "OG0002"}
+        for path in pages.values():
+            assert os.path.isfile(path)
+            assert os.path.isabs(path)
+
+    def test_explicit_group_ids_restricts_rendering(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACD")], "mean": 0.9, "anchor_gene": "G1"},
+            "OG0002": {"entries": [("Species_a|G2", "ACD")], "mean": 0.8, "anchor_gene": "G2"},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir, group_ids=["OG0001"])
+        assert set(pages.keys()) == {"OG0001"}
+
+    def test_group_missing_from_group2anchor_renders_without_anchor_gene(self, tmp_path):
+        """Simulates a list2-style call: group_id explicitly requested but
+        absent from this list's own (mostly-empty) group2anchor.tsv."""
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACD")], "mean": 0.9, "anchor_gene": None},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir, group_ids=["OG0001"])
+        content = open(pages["OG0001"]).read()
+        assert "Anchor gene" not in content
+
+    def test_missing_alignment_file_skipped(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACD")], "mean": 0.9, "anchor_gene": "G1"},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(
+            aln_dir, tables_dir, outdir, group_ids=["OG0001", "OG9999"],
+        )
+        assert set(pages.keys()) == {"OG0001"}
+
+    def test_mean_identity_loaded_correctly(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACD")], "mean": 0.7321, "anchor_gene": "G1"},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir)
+        content = open(pages["OG0001"]).read()
+        assert "0.7321" in content
+
+    def test_colnumbering_applies_masking(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACDEF")], "mean": 0.9, "anchor_gene": "G1"},
+        })
+        colnum_dir = tmp_path / "colnumbering"
+        colnum_dir.mkdir()
+        with open(str(colnum_dir / "OG0001.aln.colnumbering"), "w") as fh:
+            fh.write("#ColumnsMap\t0, 1, 3, 4\n")   # column 2 trimmed
+
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(
+            aln_dir, tables_dir, outdir, colnumbering_dir=str(colnum_dir),
+        )
+        content = open(pages["OG0001"]).read()
+        assert 'class="aa trimmed"' in content
+
+    def test_no_colnumbering_dir_means_no_masking(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACDEF")], "mean": 0.9, "anchor_gene": "G1"},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir)
+        content = open(pages["OG0001"]).read()
+        assert 'class="aa trimmed"' not in content
+
+    def test_anchor_gene_lookup_overrides_tables_dir(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACD")], "mean": 0.9, "anchor_gene": None},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(
+            aln_dir, tables_dir, outdir,
+            group_ids=["OG0001"],
+            anchor_gene_lookup={"OG0001": "ENSG00000141510"},
+        )
+        content = open(pages["OG0001"]).read()
+        assert "ENSG00000141510" in content
+
+    def test_anchor_species_pinning_applied(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_b|G2", "ACD"), ("Species_a|G1", "ACD")],
+                      "mean": 0.9, "anchor_gene": "G1"},
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(
+            aln_dir, tables_dir, outdir, anchor_species="Species_a",
+        )
+        content = open(pages["OG0001"]).read()
+        assert content.index("Species_a|G1") < content.index("Species_b|G2")
+
+    def test_outdir_created_if_missing(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001": {"entries": [("Species_a|G1", "ACD")], "mean": 0.9, "anchor_gene": "G1"},
+        })
+        outdir = str(tmp_path / "does_not_exist_yet" / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir)
+        assert os.path.isdir(outdir)
+        assert os.path.isfile(pages["OG0001"])
+
+    def test_empty_group_ids_returns_empty_dict(self, tmp_path):
+        aln_dir, tables_dir = self._setup(tmp_path, {})
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir, group_ids=[])
+        assert pages == {}
+</file>
+
+<file path="enhydra/msa_viewer.py">
+from __future__ import annotations
+
+import os
+import re
+import html
+import math
+import logging
+from collections import Counter
+
+from Bio import SeqIO
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "parse_trimal_colnumbering",
+    "compute_column_stats",
+    "render_alignment_page",
+    "build_alignment_pages",
+    "load_group_anchor",
+]
+
+_GAP_CHARS = frozenset("-.")
+# Reference max entropy: a uniform distribution over the 20 standard amino
+# acids. Used as a fixed denominator so normalised entropy values stay
+# comparable across different columns and alignments, rather than being
+# rescaled relative to however many distinct residues happen to appear in
+# one particular column.
+_MAX_ENTROPY_BITS = math.log2(20)
+
+
+def parse_trimal_colnumbering(path: str) -> set[int]:
+    """Parse a trimAl -colnumbering sidecar file into retained column indices.
+
+    The sidecar file is expected to contain a single line as isolated by
+    alignment._extract_colnumbering_line(): trimAl's '#ColumnsMap' label
+    (if present) followed by a comma-separated list of 0-based column
+    indices from the *original* (pre-trimming) alignment that survive
+    trimming, e.g.:
+
+        #ColumnsMap\t0, 1, 2, 3, 4, 5, 6, 7, ...
+
+    Older or different trimAl builds may omit the '#ColumnsMap' label
+    entirely and just list the numbers, or use a different label —
+    parsing is therefore defensive: any '#ColumnsMap' prefix is stripped
+    if present, then every integer remaining in the line is extracted.
+    Because the sidecar is expected to contain only this one isolated
+    line (not the full alignment), there is no risk of this regex
+    picking up unrelated digits such as sequence header gene IDs.
+
+    Args:
+        path: Path to a sidecar file written by
+              alignment.run_trimal_columns() with colnumbering_dir set.
+
+    Returns:
+        Set of 0-based column indices (relative to the original,
+        untrimmed alignment) that were retained after trimming. A file
+        with no parseable integers (e.g. trimAl produced no output for a
+        degenerate alignment) returns an empty set.
+
+    Raises:
+        FileNotFoundError: If path does not exist.
+    """
+    with open(path) as fh:
+        content = fh.read()
+
+    match = re.search(r"#ColumnsMap\s*(.*)", content, re.DOTALL)
+    if match:
+        content = match.group(1)
+
+    return {int(tok) for tok in re.findall(r"\d+", content)}
+
+
+def compute_column_stats(seqs: list[str]) -> tuple[list[float], list[float]]:
+    """Compute per-column identity fraction and normalised Shannon entropy.
+
+    For each alignment column:
+      - Identity fraction: count of the most common non-gap residue,
+        divided by the total number of non-gap residues in that column.
+        A tie for most common still just uses that shared count (which
+        residue "wins" the tie doesn't affect the fraction).
+      - Normalised entropy: Shannon entropy (base 2) of the non-gap
+        residue frequency distribution in that column, divided by
+        log2(20) so values fall in [0, 1] and are comparable across
+        columns/alignments regardless of how many distinct residues
+        happen to appear in any single column. Clipped to 1.0 as a
+        defensive measure in the unusual case where more than 20
+        distinct symbols appear in one column (e.g. heavy use of
+        ambiguity codes), which would otherwise push the raw ratio
+        above 1.0.
+
+    Both '-' and '.' are treated as gap characters and excluded from
+    both calculations. All other characters (including ambiguity codes
+    such as 'X') are treated as ordinary residues — this is a
+    deliberate simplification, not an oversight. Residues are
+    case-normalised (uppercased) before counting.
+
+    A column with no non-gap residues at all (all sequences have a gap
+    there) has no conservation signal to measure. Rather than return
+    NaN or None — which would force every caller to special-case
+    missing values (e.g. when rendering a bounded color scale) — both
+    stats are defined as 0.0 for an all-gap column.
+
+    Args:
+        seqs: Aligned sequences (equal length, gap-padded). An empty
+              list returns ([], []).
+
+    Returns:
+        Tuple of (identity_fractions, entropies), each a list with one
+        entry per alignment column, in column order.
+
+    Raises:
+        ValueError: If the sequences are not all the same length (i.e.
+                    not a valid alignment).
+    """
+    if not seqs:
+        return [], []
+
+    width = len(seqs[0])
+    lengths = {len(s) for s in seqs}
+    if len(lengths) > 1:
+        raise ValueError(
+            "All sequences must be the same length to compute column "
+            "statistics (this must be an alignment, not raw unaligned "
+            "sequences). Got lengths: %s" % sorted(lengths)
+        )
+
+    identities: list[float] = []
+    entropies: list[float] = []
+
+    for col_idx in range(width):
+        residues = [
+            s[col_idx].upper() for s in seqs if s[col_idx] not in _GAP_CHARS
+        ]
+        if not residues:
+            identities.append(0.0)
+            entropies.append(0.0)
+            continue
+
+        counts = Counter(residues)
+        n = len(residues)
+
+        identities.append(max(counts.values()) / n)
+
+        entropy_bits = -sum(
+            (count / n) * math.log2(count / n) for count in counts.values()
+        )
+        entropies.append(min(entropy_bits / _MAX_ENTROPY_BITS, 1.0))
+
+    return identities, entropies
+
+
+# ---------------------------------------------------------------------------
+# Alignment page rendering
+# ---------------------------------------------------------------------------
+
+# Zappo colour scheme (as used in Jalview): amino acids grouped by
+# physicochemical property. A recognised standard rather than an invented
+# palette, so rendering stays cross-referenceable against other MSA viewers.
+_ZAPPO_GROUPS = [
+    ("Aliphatic / hydrophobic", "ILVAM", "#ffafaf"),
+    ("Aromatic",                "FWY",   "#ffc800"),
+    ("Positive",                "KRH",   "#6464ff"),
+    ("Negative",                "DE",    "#ff0000"),
+    ("Hydrophilic",             "STNQ",  "#00ff00"),
+    ("Conformationally special", "PG",   "#ff00ff"),
+    ("Cysteine",                 "C",    "#ffff00"),
+]
+_OTHER_RESIDUE_COLOR = "#e0e0e0"   # ambiguity codes (X, B, Z, ...), etc.
+_GAP_COLOR           = "#ffffff"
+
+# Dark end of the conservation-track gradient. Reuses the report's own
+# brand colour so alignment pages read as part of the same product.
+_CONSERVATION_DARK = (0x1a, 0x3a, 0x5c)
+_CONSERVATION_LIGHT = (0xff, 0xff, 0xff)
+
+_LABEL_TRUNCATE_LEN = 26
+
+
+def _build_aa_color_map() -> dict[str, tuple[str, str]]:
+    mapping: dict[str, tuple[str, str]] = {}
+    for group_name, residues, color in _ZAPPO_GROUPS:
+        for residue in residues:
+            mapping[residue] = (color, group_name)
+    return mapping
+
+
+_AA_COLOR_MAP = _build_aa_color_map()
+
+
+def _conservation_color(value: float) -> str:
+    """Map a conservation value in [0, 1] to a white -> dark-teal gradient.
+
+    1.0 (fully conserved) is darkest; 0.0 is white. Callers wanting the
+    entropy track to follow the same "darker = more conserved" direction
+    as the identity track should pass (1 - normalised_entropy), since raw
+    entropy increases with diversity, not conservation.
+    """
+    value = max(0.0, min(1.0, value))
+    r = round(_CONSERVATION_LIGHT[0] + value * (_CONSERVATION_DARK[0] - _CONSERVATION_LIGHT[0]))
+    g = round(_CONSERVATION_LIGHT[1] + value * (_CONSERVATION_DARK[1] - _CONSERVATION_LIGHT[1]))
+    b = round(_CONSERVATION_LIGHT[2] + value * (_CONSERVATION_DARK[2] - _CONSERVATION_LIGHT[2]))
+    return "rgb(%d,%d,%d)" % (r, g, b)
+
+
+def _truncate_label(label: str, max_len: int = _LABEL_TRUNCATE_LEN) -> str:
+    if len(label) <= max_len:
+        return label
+    return label[: max_len - 1] + "\u2026"
+
+
+def _residue_span(residue: str, masked: bool) -> str:
+    if residue in _GAP_CHARS:
+        color, text = _GAP_COLOR, ""
+    else:
+        upper = residue.upper()
+        color, _group = _AA_COLOR_MAP.get(upper, (_OTHER_RESIDUE_COLOR, "other"))
+        text = html.escape(upper)
+    cls   = "aa trimmed" if masked else "aa"
+    title = ' title="trimmed by trimAl"' if masked else ""
+    return '<span class="%s" style="background-color:%s"%s>%s</span>' % (
+        cls, color, title, text,
+    )
+
+
+def _track_cell(value: float, tooltip_label: str, masked: bool) -> str:
+    color = _conservation_color(value)
+    cls   = "track-cell trimmed" if masked else "track-cell"
+    return '<span class="%s" style="background-color:%s" title="%s"></span>' % (
+        cls, color, html.escape(tooltip_label),
+    )
+
+
+def _render_row(label: str, full_label: str, cells_html: str) -> str:
+    return (
+        '<div class="row"><span class="row-label" title="%s">%s</span>'
+        '<span class="row-body">%s</span></div>'
+    ) % (html.escape(full_label), html.escape(label), cells_html)
+
+
+def _render_block(
+    ordered_records: list[tuple[str, str]],
+    identities: list[float],
+    entropies: list[float],
+    retained_columns: set[int] | None,
+    start: int,
+    end: int,
+) -> str:
+    rows = []
+    for seq_id, seq in ordered_records:
+        cells = "".join(
+            _residue_span(
+                seq[i],
+                masked=(retained_columns is not None and i not in retained_columns),
+            )
+            for i in range(start, end)
+        )
+        rows.append(_render_row(_truncate_label(seq_id), seq_id, cells))
+
+    identity_cells = "".join(
+        _track_cell(
+            identities[i], "Identity: %.2f" % identities[i],
+            masked=(retained_columns is not None and i not in retained_columns),
+        )
+        for i in range(start, end)
+    )
+    rows.append(_render_row("Identity", "Identity (per-column)", identity_cells))
+
+    entropy_cells = "".join(
+        _track_cell(
+            1.0 - entropies[i], "Entropy: %.2f" % entropies[i],
+            masked=(retained_columns is not None and i not in retained_columns),
+        )
+        for i in range(start, end)
+    )
+    rows.append(_render_row("Entropy", "Entropy (per-column)", entropy_cells))
+
+    ruler = '<div class="block-ruler">Columns %d\u2013%d</div>' % (start + 1, end)
+    return '<div class="aln-block">%s%s</div>' % (ruler, "".join(rows))
+
+
+def _build_legend_html() -> str:
+    items = []
+    for group_name, residues, color in _ZAPPO_GROUPS:
+        items.append(
+            '<span class="legend-item">'
+            '<span class="legend-swatch" style="background-color:%s"></span>'
+            '%s (%s)</span>' % (color, html.escape(group_name), residues)
+        )
+    items.append(
+        '<span class="legend-item">'
+        '<span class="legend-swatch" style="background-color:#ffffff;'
+        'border:1px solid #ccc;"></span>Gap</span>'
+    )
+    items.append(
+        '<span class="legend-item">'
+        '<span class="legend-swatch trimmed" style="background-color:#999;">'
+        '</span>Trimmed by trimAl</span>'
+    )
+    cons_steps = [0.0, 0.25, 0.5, 0.75, 1.0]
+    cons_swatches = "".join(
+        '<span class="cons-swatch" style="background-color:%s"></span>'
+        % _conservation_color(v)
+        for v in cons_steps
+    )
+    items.append(
+        '<span class="legend-item">Conservation: %s Low \u2192 High '
+        '(applies to both tracks; entropy track is inverted so darker '
+        'always means more conserved)</span>' % cons_swatches
+    )
+    return '<div class="legend">%s</div>' % "".join(items)
+
+
+_LEGEND_HTML = _build_legend_html()
+
+
+_PAGE_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>{title}</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 0; padding: 0;
+        background: #f5f5f5; color: #222; }}
+header {{ background: #1a3a5c; color: white; padding: 16px 28px; }}
+header h1 {{ margin: 0; font-size: 1.3em; }}
+main {{ max-width: 100%; margin: 0 auto; padding: 20px 28px 40px; }}
+.meta {{ background: white; border-radius: 6px; padding: 14px 20px;
+         margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+         font-size: 13px; }}
+.meta dl {{ display: grid; grid-template-columns: max-content 1fr;
+            gap: 4px 14px; margin: 0; }}
+.meta dt {{ font-weight: bold; color: #1a3a5c; }}
+.meta dd {{ margin: 0; }}
+.warning {{ background: #fff4e5; border-left: 3px solid #d9822b;
+            padding: 8px 14px; margin-bottom: 16px; font-size: 13px; }}
+.legend {{ background: white; border-radius: 6px; padding: 10px 18px;
+           margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+           font-size: 12px; }}
+.legend-item {{ margin-right: 18px; white-space: nowrap; }}
+.legend-swatch, .cons-swatch {{ display: inline-block; width: 12px; height: 12px;
+                                border-radius: 2px; margin-right: 4px;
+                                vertical-align: middle; }}
+.cons-swatch {{ width: 14px; margin-right: 0; border-radius: 0; }}
+.aln-block {{ background: white; border-radius: 6px; padding: 10px 16px 14px;
+              margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+              overflow-x: auto; }}
+.block-ruler {{ font-family: 'Courier New', monospace; font-size: 11px;
+                color: #888; margin: 2px 0 4px 200px; }}
+.row {{ white-space: nowrap; font-size: 0; line-height: 0; border-bottom: 2px solid #ffffff; }}
+.row-label {{ display: inline-block; width: 195px; font-family: 'Courier New', monospace;
+              font-size: 12px; line-height: 18px; vertical-align: top;
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+              padding-right: 6px; box-sizing: border-box; }}
+.row-body {{ display: inline-block; vertical-align: top; }}
+.aa {{ display: inline-block; vertical-align: top; width: 14px; height: 18px;
+       line-height: 18px; text-align: center; font-family: 'Courier New', monospace;
+       font-size: 12px; box-sizing: border-box; color: #222; }}
+.track-cell {{ display: inline-block; vertical-align: top; width: 14px; height: 9px;
+               box-sizing: border-box; }}
+.trimmed {{ opacity: 0.35;
+            background-image: repeating-linear-gradient(
+                45deg, rgba(0,0,0,0.3) 0, rgba(0,0,0,0.3) 2px,
+                transparent 2px, transparent 4px); }}
+footer {{ text-align: center; padding: 16px; font-size: 0.85em; color: #888; }}
+</style>
+</head>
+<body>
+<header><h1>{title}</h1></header>
+<main>
+<div class="meta">
+  <dl>{meta_html}</dl>
+</div>
+{warning_html}
+{legend_html}
+{blocks_html}
+</main>
+<footer>Generated by ENHYDRA</footer>
+</body>
+</html>"""
+
+
+def render_alignment_page(
+    group_id: str,
+    records: list[tuple[str, str]],
+    out_path: str,
+    anchor_gene_id: str | None = None,
+    anchor_species: str | None = None,
+    mean_identity: float | None = None,
+    retained_columns: set[int] | None = None,
+    block_width: int = 60,
+) -> None:
+    """Render a static, self-contained HTML page for one alignment.
+
+    Sequences are colour-coded by amino acid property using the Zappo
+    scheme, wrapped into fixed-width blocks (block_width columns per
+    block — long alignments would otherwise be unreadable as a single
+    unwrapped line). Each block carries two per-column conservation
+    tracks beneath the sequences: identity fraction and normalised
+    Shannon entropy (see compute_column_stats()). Both tracks use the
+    same white -> dark-teal colour direction, with darker always meaning
+    more conserved (the entropy track is coloured by 1 - entropy so the
+    two tracks read the same visual direction despite being different
+    statistics); the actual entropy value is still shown in that cell's
+    hover tooltip.
+
+    If retained_columns is given, any column *not* in that set is
+    rendered with reduced opacity and a hatched overlay (both the
+    residue row and both conservation tracks for that column), to show
+    at a glance which columns trimAl removed before identity estimation,
+    without needing to render a second, fully separate alignment. Column
+    indices in retained_columns are 0-based and relative to *this*
+    alignment's own column positions (as produced by
+    alignment.run_trimal_columns() on this same file) — see
+    msa_viewer.parse_trimal_colnumbering().
+
+    If anchor_species is given, the first record whose ID's species
+    field (text before '|') matches it is moved to the top of the
+    alignment as a pinned reference row; this only applies to
+    single-list runs / list1 in two-list mode, since list2 alignments
+    have no anchor sequence to pin. If anchor_species is given but no
+    matching record is found, a visible warning banner is added to the
+    page (rather than failing silently) and the original record order
+    is preserved unchanged.
+
+    This function assumes the parent directory of out_path already
+    exists — it is not created here. Callers rendering many pages in a
+    batch (see build_alignment_pages()) are expected to create the
+    output directory once up front, rather than have every call
+    redundantly check for it.
+
+    Args:
+        group_id:         Orthogroup identifier, used in the page title
+                          and metadata panel.
+        records:          List of (sequence_id, aligned_sequence) tuples.
+                          sequence_id is expected in 'species|gene_id'
+                          form (ENHYDRA's convention) so the species
+                          field can be used for anchor pinning; the full
+                          ID is always shown in the row label's hover
+                          tooltip regardless of length.
+        out_path:         Destination HTML file path.
+        anchor_gene_id:   Anchor gene ID to display in the metadata
+                          panel (display only — does not affect pinning
+                          or row lookup).
+        anchor_species:   Species ID to pin to the top of the alignment,
+                          if present. None disables pinning entirely
+                          (e.g. for list2 pages).
+        mean_identity:    This group's mean alignment identity score
+                          (from group2mean.tsv), shown in the metadata
+                          panel. None displays as "N/A".
+        retained_columns: Set of 0-based column indices retained after
+                          trimAl column trimming, or None if trimming
+                          was not applied to this run (no masking).
+        block_width:      Number of alignment columns rendered per
+                          visual block (default: 60).
+
+    Raises:
+        ValueError: If records is empty, or if the sequences it
+                    contains are not all the same length (propagated
+                    from compute_column_stats()).
+    """
+    if not records:
+        raise ValueError(
+            "records must not be empty (group '%s' has no sequences to "
+            "render)." % group_id
+        )
+
+    seqs = [seq for _, seq in records]
+    identities, entropies = compute_column_stats(seqs)
+    width = len(seqs[0])
+
+    ordered = list(records)
+    warning_html = ""
+    if anchor_species is not None:
+        anchor_idx = next(
+            (i for i, (sid, _) in enumerate(ordered)
+             if sid.split("|", 1)[0] == anchor_species),
+            None,
+        )
+        if anchor_idx is not None:
+            ordered.insert(0, ordered.pop(anchor_idx))
+        else:
+            logger.warning(
+                "Anchor species '%s' not found in alignment for group "
+                "'%s' — rendering without pinning.", anchor_species, group_id,
+            )
+            warning_html = (
+                '<div class="warning">Anchor species \u2018%s\u2019 was not '
+                'found in this alignment \u2014 rows are shown in their '
+                'original order.</div>' % html.escape(anchor_species)
+            )
+
+    n_masked = None
+    if retained_columns is not None:
+        n_masked = width - len([i for i in range(width) if i in retained_columns])
+
+    meta_rows = [
+        ("Group ID", html.escape(group_id)),
+        ("Sequences", str(len(records))),
+        ("Alignment length", "%d columns" % width),
+    ]
+    if anchor_gene_id is not None:
+        meta_rows.append(("Anchor gene", html.escape(anchor_gene_id)))
+    if anchor_species is not None:
+        meta_rows.append(("Anchor species", html.escape(anchor_species)))
+    meta_rows.append((
+        "Mean identity",
+        "%.4f" % mean_identity if mean_identity is not None else "N/A",
+    ))
+    if n_masked is not None:
+        meta_rows.append((
+            "Trimmed columns",
+            "%d of %d removed by trimAl (shown masked below)" % (n_masked, width),
+        ))
+    meta_html = "".join(
+        "<dt>%s</dt><dd>%s</dd>" % (k, v) for k, v in meta_rows
+    )
+
+    blocks_html = "".join(
+        _render_block(ordered, identities, entropies, retained_columns,
+                      block_start, min(block_start + block_width, width))
+        for block_start in range(0, width, block_width)
+    )
+
+    html_content = _PAGE_TEMPLATE.format(
+        title="Alignment: %s" % html.escape(group_id),
+        meta_html=meta_html,
+        warning_html=warning_html,
+        legend_html=_LEGEND_HTML,
+        blocks_html=blocks_html,
+    )
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html_content)
+
+
+# ---------------------------------------------------------------------------
+# Batch generation
+# ---------------------------------------------------------------------------
+
+def _load_group_mean(tables_dir: str) -> dict[str, float]:
+    path = os.path.join(tables_dir, "group2mean.tsv")
+    result: dict[str, float] = {}
+    if not os.path.isfile(path):
+        return result
+    with open(path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                continue
+            try:
+                result[fields[0]] = float(fields[1])
+            except ValueError:
+                continue
+    return result
+
+
+def load_group_anchor(tables_dir: str) -> dict[str, str]:
+    """Load a list's group2anchor.tsv as a {group_id: anchor_gene_id} dict.
+
+    Public (unlike _load_group_mean) because cli.py needs this mapping
+    directly when building an anchor_gene_lookup override for list2's
+    alignment pages in two-list mode — list2's own group2anchor.tsv is
+    expected to be empty by design (list2 never contains the anchor
+    species), so list1's mapping is passed through instead.
+
+    Returns an empty dict if the file does not exist.
+    """
+    return _load_group_anchor(tables_dir)
+
+
+def _load_group_anchor(tables_dir: str) -> dict[str, str]:
+    path = os.path.join(tables_dir, "group2anchor.tsv")
+    result: dict[str, str] = {}
+    if not os.path.isfile(path):
+        return result
+    with open(path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                continue
+            result[fields[0]] = fields[1]
+    return result
+
+
+def build_alignment_pages(
+    alignment_dir: str,
+    tables_dir: str,
+    outdir: str,
+    group_ids: list[str] | None = None,
+    anchor_species: str | None = None,
+    anchor_gene_lookup: dict[str, str] | None = None,
+    colnumbering_dir: str | None = None,
+    block_width: int = 60,
+    show_progress: bool = False,
+) -> dict[str, str]:
+    """Render one alignment page per group, returning {group_id: page path}.
+
+    Alignment filenames are reconstructed as '<group_id>.aln', matching
+    how make_tables() itself derives group_id (everything before the
+    first '.' in a group's identity-report filename) — this holds for
+    every alignment produced by run_aligner(), since group filenames
+    never contain literal periods.
+
+    Args:
+        alignment_dir:      Directory of alignment files for this list
+                            (the raw aligner output — alignment_dir in
+                            cli.py's _run_single_list(), not the
+                            anchor-stripped or trimmed variant — since
+                            this is the version guaranteed to contain
+                            every group's full species set and, in the
+                            single-list/list1 case, the anchor sequence
+                            itself).
+        tables_dir:          This list's own tables/ directory, used to
+                            load group2mean.tsv (identity scores) and,
+                            unless anchor_gene_lookup overrides it,
+                            group2anchor.tsv (anchor gene IDs).
+        outdir:              Directory where rendered pages are written,
+                            one per group as '<group_id>.html'. Created
+                            if it does not already exist (unlike
+                            render_alignment_page(), which assumes its
+                            own parent directory is already present).
+        group_ids:           Explicit set of group IDs to render. If
+                            None, defaults to every group_id found in
+                            tables_dir/group2anchor.tsv — i.e. every
+                            group that reached anchor2mean.tsv in
+                            single-list mode. In two-list mode, callers
+                            should instead pass the group_id column of
+                            differential_scores.tsv, since that is the
+                            actual set of groups that fed GSEA for that
+                            run (see msa_viewer module docs / project
+                            notes on 'bucket 3').
+        anchor_species:      Species ID to pin at the top of every
+                            rendered alignment. None disables pinning
+                            (e.g. for list2 pages, which never contain
+                            the anchor species).
+        anchor_gene_lookup:  Optional {group_id: anchor_gene_id} mapping
+                            that takes priority over tables_dir's own
+                            group2anchor.tsv. Intended for rendering a
+                            list2 page while still showing the anchor
+                            gene ID that was resolved from list1 for
+                            that same group, since list2's own
+                            group2anchor.tsv is expected to be empty by
+                            design (list2 never contains the anchor
+                            species). Single-list callers should omit
+                            this and let it fall back to tables_dir.
+        colnumbering_dir:    Directory of trimAl -colnumbering sidecar
+                            files for this list (as produced by
+                            alignment.run_trimal_columns()), or None if
+                            column trimming was not used for this run.
+                            When given, a group without a matching
+                            sidecar file (e.g. trimAl produced no
+                            output for a degenerate alignment) is
+                            rendered without masking rather than being
+                            skipped.
+        block_width:         Passed through to render_alignment_page().
+        show_progress:       Show a tqdm progress bar.
+
+    Returns:
+        Dict mapping group_id to the absolute path of its rendered HTML
+        page. Only successfully rendered groups are included; groups
+        requested (explicitly or via group2anchor.tsv) but missing an
+        alignment file are logged as a warning and skipped, not raised
+        as an error, since a partially-resumed run or an upstream
+        filtering edge case can legitimately produce this.
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    if group_ids is None:
+        group_ids = sorted(_load_group_anchor(tables_dir).keys())
+    else:
+        group_ids = sorted(set(group_ids))
+
+    mean_lookup = _load_group_mean(tables_dir)
+    anchor_lookup = anchor_gene_lookup
+    if anchor_lookup is None:
+        anchor_lookup = _load_group_anchor(tables_dir)
+
+    pages: dict[str, str] = {}
+    n_missing_alignment = 0
+
+    for group_id in tqdm(group_ids, desc="  alignments", unit="group",
+                         leave=False, disable=not show_progress):
+        aln_path = os.path.join(alignment_dir, group_id + ".aln")
+        if not os.path.isfile(aln_path):
+            logger.warning(
+                "No alignment file found for group '%s' (expected: %s) — "
+                "skipping alignment page.", group_id, aln_path,
+            )
+            n_missing_alignment += 1
+            continue
+
+        records = [(r.id, str(r.seq)) for r in SeqIO.parse(aln_path, "fasta")]
+
+        retained_columns = None
+        if colnumbering_dir is not None:
+            colnum_path = os.path.join(
+                colnumbering_dir, group_id + ".aln.colnumbering"
+            )
+            if os.path.isfile(colnum_path):
+                retained_columns = parse_trimal_colnumbering(colnum_path)
+
+        out_path = os.path.abspath(os.path.join(outdir, group_id + ".html"))
+        render_alignment_page(
+            group_id=group_id,
+            records=records,
+            out_path=out_path,
+            anchor_gene_id=anchor_lookup.get(group_id),
+            anchor_species=anchor_species,
+            mean_identity=mean_lookup.get(group_id),
+            retained_columns=retained_columns,
+            block_width=block_width,
+        )
+        pages[group_id] = out_path
+
+    logger.info(
+        "Alignment pages written: %d. Groups skipped (no alignment found): %d. Path: %s",
+        len(pages), n_missing_alignment, outdir,
+    )
+    return pages
+</file>
+
 <file path="tests/test_tables.py">
 """Tests for enhydra.tables."""
 
@@ -4895,8 +6093,7 @@ class TestMakeTablesDropReasons:
         assert reasons["OG0003"] == "no_anchor_sequence"
         assert "OG0001" not in reasons
 
-
-def test_no_anchor_sequence_not_recorded_when_not_required(self, tmp_path):
+    def test_no_anchor_sequence_not_recorded_when_not_required(self, tmp_path):
         """When require_anchor=False (e.g. list2 in two-list mode), a missing
         anchor sequence is expected and must not appear in drop_reasons.tsv,
         even though the group still correctly contributes to group2mean.tsv."""
@@ -5797,6 +6994,244 @@ def parse_obo_names(obo_path: str) -> dict[str, str]:
     return names
 </file>
 
+<file path="enhydra/tables.py">
+import os
+import logging
+from Bio import SeqIO
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+_TABLE_FILES = ("group2mean.tsv", "anchor2mean.tsv", "group2anchor.tsv")
+
+
+def tables_complete(tables_dir: str) -> bool:
+    """Return True only if all three output tables exist and are non-empty."""
+    return all(
+        os.path.isfile(os.path.join(tables_dir, f)) and
+        os.path.getsize(os.path.join(tables_dir, f)) > 0
+        for f in _TABLE_FILES
+    )
+
+
+def make_tables(
+    alignment_dir: str,
+    ident_dir: str,
+    tables_dir: str,
+    anchor: str,
+    require_anchor: bool = True,
+    show_progress: bool = False,
+):
+    """Generate ranked output tables from alignments and identity reports.
+
+    Iterates identity files as the primary source and derives the corresponding
+    alignment filename for each by stripping the trailing '.ident' suffix.
+    A warning is emitted for any mismatch in either direction:
+
+    - Identity file present but alignment file absent → group skipped entirely.
+    - Alignment file present but identity file absent → warning only (trimAl
+      may have failed silently on that group).
+
+    This single-loop design prevents the silent row omissions that occurred
+    with the previous two-loop approach, where a group could appear in
+    group2mean without a matching entry in anchor2mean/group2anchor if the
+    two directory listings were not perfectly aligned.
+
+    In addition to the three ranked tables, this also writes
+    'tables_dir/drop_reasons.tsv', recording every group excluded (fully or
+    partially) at this step, with columns group_id, reason, detail. Nothing
+    downstream reads tables_dir wholesale (gsea.py, differential.py, etc. all
+    reference the three named table files directly by name), so this file can
+    sit alongside them safely — unlike group_filter_dir, there's no risk of
+    it being picked up by a later step that lists the directory contents.
+    'reason' is one of:
+      - 'missing_identity'    : alignment exists but no matching .ident file.
+      - 'missing_alignment'   : .ident file exists but no matching alignment.
+      - 'no_average_identity' : .ident file has no parseable AverageIdentity
+                                line (trimAl may have failed silently).
+      - 'no_anchor_sequence'  : group has valid alignment + identity and
+                                contributes to group2mean.tsv, but has no
+                                anchor-species sequence, so it is absent
+                                from anchor2mean.tsv / group2anchor.tsv.
+                                This is the reason group2mean.tsv and
+                                anchor2mean.tsv row counts can diverge.
+                                Only recorded here when require_anchor=True
+                                (see below) — when the anchor is not expected
+                                to be present, this is not an anomaly and
+                                would otherwise flood the file with noise.
+    This file is opened in write mode, so re-running make_tables() (e.g.
+    under --resume) produces clean output rather than appending duplicates.
+
+    Args:
+        alignment_dir:  Directory of alignment files (.aln).
+        ident_dir:      Directory of trimAl identity report files (.aln.ident).
+        tables_dir:     Directory where output tables are written.
+        anchor:         Anchor species ID used to map group → gene ID.
+        require_anchor: Whether the anchor species is expected to be present
+                        in this list's alignments. In two-list differential
+                        mode, list2 is not expected to contain the anchor
+                        (it belongs to list1) — a missing anchor there is
+                        expected behaviour, not a drop, since the group
+                        still contributes to group2mean.tsv either way and
+                        list2's anchor2mean.tsv/group2anchor.tsv are never
+                        read downstream. When False, missing anchors are
+                        logged at debug level only and are not recorded in
+                        drop_reasons.tsv. Defaults to True (matches previous
+                        behaviour for single-list mode and list1).
+        show_progress:  False is verbose, True shows progress bar only.
+    """
+    os.makedirs(tables_dir, exist_ok=True)
+
+    ident_files = os.listdir(ident_dir)
+    aln_files   = set(os.listdir(alignment_dir))
+
+    drop_reasons: list[tuple[str, str, str]] = []
+
+    # Pre-check: warn about alignment files that have no matching identity file.
+    # These indicate groups where trimAl may have failed silently.
+    ident_stems = {f[:-len(".ident")] for f in ident_files if f.endswith(".ident")}
+    for aln_file in sorted(aln_files):
+        if aln_file not in ident_stems:
+            logger.warning(
+                "No identity file found for alignment '%s' — "
+                "trimAl may have failed silently on this group.", aln_file,
+            )
+            drop_reasons.append((
+                aln_file.split(".")[0], "missing_identity",
+                "alignment=%s" % aln_file,
+            ))
+
+    with open(os.path.join(tables_dir, "group2mean.tsv"),   "w") as group2mean, \
+         open(os.path.join(tables_dir, "anchor2mean.tsv"),  "w") as anchor2mean, \
+         open(os.path.join(tables_dir, "group2anchor.tsv"), "w") as group2anchor:
+
+        for ident_file in tqdm(ident_files, desc="  tables",
+                               unit="group", leave=False, disable=not show_progress):
+            group_name = ident_file.split(".")[0]
+            ident_path = os.path.join(ident_dir, ident_file)
+
+            # Derive the alignment filename by stripping the trailing .ident suffix.
+            aln_file = (ident_file[:-len(".ident")]
+                        if ident_file.endswith(".ident")
+                        else ident_file)
+            aln_path = os.path.join(alignment_dir, aln_file)
+
+            if not os.path.isfile(aln_path):
+                logger.warning(
+                    "Alignment file not found for group '%s' (expected: %s) — "
+                    "skipping group.", group_name, aln_path,
+                )
+                drop_reasons.append((
+                    group_name, "missing_alignment",
+                    "identity=%s" % ident_file,
+                ))
+                continue
+
+            # Parse identity score from trimAl -sident output.
+            mean_percent = None
+            with open(ident_path) as fh:
+                for line in fh:
+                    line = line.rstrip()
+                    if line.startswith("## AverageIdentity"):
+                        mean_percent = line.split()[-1]
+                        break
+
+            if mean_percent is None:
+                logger.warning(
+                    "No AverageIdentity line found in '%s' — skipping group.",
+                    ident_path,
+                )
+                drop_reasons.append((
+                    group_name, "no_average_identity", "",
+                ))
+                continue
+
+            group2mean.write("%s\t%s\n" % (group_name, mean_percent))
+
+            # Map anchor gene ID(s) from the alignment file.
+            # In 'all' paralog mode there may be more than one anchor sequence;
+            # all are written to preserve the original behaviour.
+            anchor_found = False
+            for seq_record in SeqIO.parse(aln_path, "fasta"):
+                fields  = seq_record.id.split("|")
+                species = fields[0]
+                gene_id = fields[1]
+                if species == anchor:
+                    anchor2mean.write("%s\t%s\n" % (gene_id, mean_percent))
+                    group2anchor.write("%s\t%s\n" % (group_name, gene_id))
+                    anchor_found = True
+
+            if not anchor_found:
+                if require_anchor:
+                    logger.warning(
+                        "No anchor sequence found in alignment for group '%s' — "
+                        "group contributes to group2mean but not anchor2mean or "
+                        "group2anchor.", group_name,
+                    )
+                    drop_reasons.append((
+                        group_name, "no_anchor_sequence", "anchor=%s" % anchor,
+                    ))
+                else:
+                    # Expected: this list is not required to contain the
+                    # anchor species (e.g. list2 in two-list differential
+                    # mode). The group still contributes to group2mean.tsv
+                    # above; only anchor2mean/group2anchor are unaffected,
+                    # and neither of those is read from this list downstream.
+                    logger.debug(
+                        "No anchor sequence found in alignment for group '%s' "
+                        "(expected — anchor not required for this list).",
+                        group_name,
+                    )
+
+    drop_reasons_path = os.path.join(tables_dir, "drop_reasons.tsv")
+    with open(drop_reasons_path, "w") as fh:
+        fh.write("group_id\treason\tdetail\n")
+        for group_id, reason, detail in sorted(drop_reasons):
+            fh.write("%s\t%s\t%s\n" % (group_id, reason, detail))
+    logger.info(
+        "Tables step drop reasons written: %d entr%s. Path: %s",
+        len(drop_reasons), "y" if len(drop_reasons) == 1 else "ies",
+        drop_reasons_path,
+    )
+</file>
+
+<file path="pyproject.toml">
+[tool.setuptools.packages.find]
+include = ["enhydra*"]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enhydra"
+version = "0.1.0"
+description = "Gene Set Enrichment Analysis for evolutionary genomics"
+requires-python = ">=3.9"
+dependencies = [
+    "biopython>=1.81",
+    "numpy>=1.24",
+    "gseapy>=1.0",
+    "pandas>=2.0",
+    "gprofiler-official>=1.0",
+    "matplotlib>=3.7",
+    "tqdm>=4.0",
+]
+
+[project.optional-dependencies]
+plots = ["pdf2image>=1.16"]
+dev   = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: end-to-end pipeline tests; require GSEApy but no external tools",
+]
+
+[project.scripts]
+enhydra = "enhydra.cli:main"
+</file>
+
 <file path="enhydra/plotting.py">
 from __future__ import annotations
 
@@ -6340,207 +7775,6 @@ def make_differential_plots(
     )
 </file>
 
-<file path="enhydra/tables.py">
-import os
-import logging
-from Bio import SeqIO
-from tqdm import tqdm
-
-logger = logging.getLogger(__name__)
-
-_TABLE_FILES = ("group2mean.tsv", "anchor2mean.tsv", "group2anchor.tsv")
-
-
-def tables_complete(tables_dir: str) -> bool:
-    """Return True only if all three output tables exist and are non-empty."""
-    return all(
-        os.path.isfile(os.path.join(tables_dir, f)) and
-        os.path.getsize(os.path.join(tables_dir, f)) > 0
-        for f in _TABLE_FILES
-    )
-
-
-def make_tables(
-    alignment_dir: str,
-    ident_dir: str,
-    tables_dir: str,
-    anchor: str,
-    require_anchor: bool = True,
-    show_progress: bool = False,
-):
-    """Generate ranked output tables from alignments and identity reports.
-
-    Iterates identity files as the primary source and derives the corresponding
-    alignment filename for each by stripping the trailing '.ident' suffix.
-    A warning is emitted for any mismatch in either direction:
-
-    - Identity file present but alignment file absent → group skipped entirely.
-    - Alignment file present but identity file absent → warning only (trimAl
-      may have failed silently on that group).
-
-    This single-loop design prevents the silent row omissions that occurred
-    with the previous two-loop approach, where a group could appear in
-    group2mean without a matching entry in anchor2mean/group2anchor if the
-    two directory listings were not perfectly aligned.
-
-    In addition to the three ranked tables, this also writes
-    'tables_dir/drop_reasons.tsv', recording every group excluded (fully or
-    partially) at this step, with columns group_id, reason, detail. Nothing
-    downstream reads tables_dir wholesale (gsea.py, differential.py, etc. all
-    reference the three named table files directly by name), so this file can
-    sit alongside them safely — unlike group_filter_dir, there's no risk of
-    it being picked up by a later step that lists the directory contents.
-    'reason' is one of:
-      - 'missing_identity'    : alignment exists but no matching .ident file.
-      - 'missing_alignment'   : .ident file exists but no matching alignment.
-      - 'no_average_identity' : .ident file has no parseable AverageIdentity
-                                line (trimAl may have failed silently).
-      - 'no_anchor_sequence'  : group has valid alignment + identity and
-                                contributes to group2mean.tsv, but has no
-                                anchor-species sequence, so it is absent
-                                from anchor2mean.tsv / group2anchor.tsv.
-                                This is the reason group2mean.tsv and
-                                anchor2mean.tsv row counts can diverge.
-                                Only recorded here when require_anchor=True
-                                (see below) — when the anchor is not expected
-                                to be present, this is not an anomaly and
-                                would otherwise flood the file with noise.
-    This file is opened in write mode, so re-running make_tables() (e.g.
-    under --resume) produces clean output rather than appending duplicates.
-
-    Args:
-        alignment_dir:  Directory of alignment files (.aln).
-        ident_dir:      Directory of trimAl identity report files (.aln.ident).
-        tables_dir:     Directory where output tables are written.
-        anchor:         Anchor species ID used to map group → gene ID.
-        require_anchor: Whether the anchor species is expected to be present
-                        in this list's alignments. In two-list differential
-                        mode, list2 is not expected to contain the anchor
-                        (it belongs to list1) — a missing anchor there is
-                        expected behaviour, not a drop, since the group
-                        still contributes to group2mean.tsv either way and
-                        list2's anchor2mean.tsv/group2anchor.tsv are never
-                        read downstream. When False, missing anchors are
-                        logged at debug level only and are not recorded in
-                        drop_reasons.tsv. Defaults to True (matches previous
-                        behaviour for single-list mode and list1).
-        show_progress:  False is verbose, True shows progress bar only.
-    """
-    os.makedirs(tables_dir, exist_ok=True)
-
-    ident_files = os.listdir(ident_dir)
-    aln_files   = set(os.listdir(alignment_dir))
-
-    drop_reasons: list[tuple[str, str, str]] = []
-
-    # Pre-check: warn about alignment files that have no matching identity file.
-    # These indicate groups where trimAl may have failed silently.
-    ident_stems = {f[:-len(".ident")] for f in ident_files if f.endswith(".ident")}
-    for aln_file in sorted(aln_files):
-        if aln_file not in ident_stems:
-            logger.warning(
-                "No identity file found for alignment '%s' — "
-                "trimAl may have failed silently on this group.", aln_file,
-            )
-            drop_reasons.append((
-                aln_file.split(".")[0], "missing_identity",
-                "alignment=%s" % aln_file,
-            ))
-
-    with open(os.path.join(tables_dir, "group2mean.tsv"),   "w") as group2mean, \
-         open(os.path.join(tables_dir, "anchor2mean.tsv"),  "w") as anchor2mean, \
-         open(os.path.join(tables_dir, "group2anchor.tsv"), "w") as group2anchor:
-
-        for ident_file in tqdm(ident_files, desc="  tables",
-                               unit="group", leave=False, disable=not show_progress):
-            group_name = ident_file.split(".")[0]
-            ident_path = os.path.join(ident_dir, ident_file)
-
-            # Derive the alignment filename by stripping the trailing .ident suffix.
-            aln_file = (ident_file[:-len(".ident")]
-                        if ident_file.endswith(".ident")
-                        else ident_file)
-            aln_path = os.path.join(alignment_dir, aln_file)
-
-            if not os.path.isfile(aln_path):
-                logger.warning(
-                    "Alignment file not found for group '%s' (expected: %s) — "
-                    "skipping group.", group_name, aln_path,
-                )
-                drop_reasons.append((
-                    group_name, "missing_alignment",
-                    "identity=%s" % ident_file,
-                ))
-                continue
-
-            # Parse identity score from trimAl -sident output.
-            mean_percent = None
-            with open(ident_path) as fh:
-                for line in fh:
-                    line = line.rstrip()
-                    if line.startswith("## AverageIdentity"):
-                        mean_percent = line.split()[-1]
-                        break
-
-            if mean_percent is None:
-                logger.warning(
-                    "No AverageIdentity line found in '%s' — skipping group.",
-                    ident_path,
-                )
-                drop_reasons.append((
-                    group_name, "no_average_identity", "",
-                ))
-                continue
-
-            group2mean.write("%s\t%s\n" % (group_name, mean_percent))
-
-            # Map anchor gene ID(s) from the alignment file.
-            # In 'all' paralog mode there may be more than one anchor sequence;
-            # all are written to preserve the original behaviour.
-            anchor_found = False
-            for seq_record in SeqIO.parse(aln_path, "fasta"):
-                fields  = seq_record.id.split("|")
-                species = fields[0]
-                gene_id = fields[1]
-                if species == anchor:
-                    anchor2mean.write("%s\t%s\n" % (gene_id, mean_percent))
-                    group2anchor.write("%s\t%s\n" % (group_name, gene_id))
-                    anchor_found = True
-
-            if not anchor_found:
-                if require_anchor:
-                    logger.warning(
-                        "No anchor sequence found in alignment for group '%s' — "
-                        "group contributes to group2mean but not anchor2mean or "
-                        "group2anchor.", group_name,
-                    )
-                    drop_reasons.append((
-                        group_name, "no_anchor_sequence", "anchor=%s" % anchor,
-                    ))
-                else:
-                    # Expected: this list is not required to contain the
-                    # anchor species (e.g. list2 in two-list differential
-                    # mode). The group still contributes to group2mean.tsv
-                    # above; only anchor2mean/group2anchor are unaffected,
-                    # and neither of those is read from this list downstream.
-                    logger.debug(
-                        "No anchor sequence found in alignment for group '%s' "
-                        "(expected — anchor not required for this list).",
-                        group_name,
-                    )
-
-    drop_reasons_path = os.path.join(tables_dir, "drop_reasons.tsv")
-    with open(drop_reasons_path, "w") as fh:
-        fh.write("group_id\treason\tdetail\n")
-        for group_id, reason, detail in sorted(drop_reasons):
-            fh.write("%s\t%s\t%s\n" % (group_id, reason, detail))
-    logger.info(
-        "Tables step drop reasons written: %d entr%s. Path: %s",
-        len(drop_reasons), "y" if len(drop_reasons) == 1 else "ies",
-        drop_reasons_path,
-    )
-</file>
-
 <file path="enhydra/alignment.py">
 from __future__ import annotations
 
@@ -6622,17 +7856,43 @@ def _trimal_worker(args: tuple) -> None:
             "trimal failed on %s:\n%s" % (input_seq, e.stderr.decode())
         )
 
+def _extract_colnumbering_line(stdout_text: str) -> str:
+    """Return the '#ColumnsMap' line from trimAl -colnumbering stdout.
+
+    trimAl prints the '#ColumnsMap' line (retained original-column indices)
+    to stdout even when -out is also given and the trimmed alignment itself
+    is written to file. Isolating just this line for the sidecar file keeps
+    it to a single line instead of duplicating alignment data, and avoids
+    the column-index parser ever seeing unrelated digits.
+
+    Falls back to the last non-empty line if no '#ColumnsMap'-prefixed line
+    is found, in case a different trimAl version omits the label.
+    """
+    lines = [l for l in stdout_text.splitlines() if l.strip()]
+    for line in lines:
+        if line.startswith("#ColumnsMap"):
+            return line
+    return lines[-1] if lines else ""
+
 
 def _trimal_columns_worker(args: tuple) -> None:
-    input_seq, output_seq, trimal_path, trim_args = args
+    input_seq, output_seq, trimal_path, trim_args, colnumbering_path = args
     cmd = [trimal_path, "-in", input_seq, "-out", output_seq] + list(trim_args)
+    if colnumbering_path is not None:
+        cmd = cmd + ["-colnumbering"]
     try:
-        subprocess.run(cmd, stderr=subprocess.PIPE, check=True)
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+        )
     except subprocess.CalledProcessError as e:
         raise EnhydraToolError(
             "trimal column trimming failed on %s:\n%s"
             % (input_seq, e.stderr.decode())
         )
+    if colnumbering_path is not None:
+        colmap_line = _extract_colnumbering_line(result.stdout.decode())
+        with open(colnumbering_path, "w") as fh:
+            fh.write(colmap_line + "\n")
 
 
 def run_trimal_columns(
@@ -6642,25 +7902,42 @@ def run_trimal_columns(
     trim_args: list[str],
     n_proc: int = 1,
     show_progress: bool = False,
+    colnumbering_dir: str | None = None,
 ):
     """Trim alignment columns with trimAl before identity estimation.
 
     Args:
-        alignment_dir: Directory of (untrimmed) alignment files.
-        trimmed_dir:   Directory where column-trimmed alignments are written.
-        trimal_path:   Path to the trimAl executable.
-        trim_args:     trimAl CLI flags controlling the trimming mode, as
-                       returned by utils.resolve_trim_args() — e.g.
-                       ['-gt', '0.5'], ['-strict'], ['-strictplus'], or
-                       ['-automated1'].
-        n_proc:        Number of parallel worker processes.
-        show_progress: Show a tqdm progress bar.
+        alignment_dir:    Directory of (untrimmed) alignment files.
+        trimmed_dir:       Directory where column-trimmed alignments are written.
+        trimal_path:       Path to the trimAl executable.
+        trim_args:         trimAl CLI flags controlling the trimming mode, as
+                           returned by utils.resolve_trim_args() — e.g.
+                           ['-gt', '0.5'], ['-strict'], ['-strictplus'], or
+                           ['-automated1'].
+        n_proc:            Number of parallel worker processes.
+        show_progress:     Show a tqdm progress bar.
+        colnumbering_dir:  If given, also capture -colnumbering output per
+                           group as a sidecar file
+                           '<colnumbering_dir>/<file>.colnumbering', recording
+                           which original-alignment columns survived
+                           trimming (for later use masking trimmed columns
+                           when rendering an alignment). This runs alongside
+                           the existing -out trimming call rather than as a
+                           second trimAl invocation, since trimAl supports
+                           both flags together. Defaults to None (no
+                           colnumbering capture), preserving prior behaviour
+                           for callers that don't need it.
     """
     os.makedirs(trimmed_dir, exist_ok=True)
+    if colnumbering_dir is not None:
+        os.makedirs(colnumbering_dir, exist_ok=True)
+
     args_list = [
         (os.path.join(alignment_dir, f),
          os.path.join(trimmed_dir, f),
-         trimal_path, trim_args)
+         trimal_path, trim_args,
+         os.path.join(colnumbering_dir, f + ".colnumbering")
+         if colnumbering_dir is not None else None)
         for f in os.listdir(alignment_dir)
     ]
     _run_pool(_trimal_columns_worker, args_list, n_proc, show_progress)
@@ -6996,7 +8273,7 @@ def build_gmt_from_gprofiler(
     with open(gmt_path, "w") as fh:
         for _, row in results.iterrows():
             genes = row.get("intersections")
-            if not genes:
+            if not isinstance(genes, (list, tuple, set)) or len(genes) == 0:
                 continue
             fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], "\t".join(genes)))
             n_terms += 1
@@ -7112,6 +8389,7 @@ from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 from .stats import aggregate_pipeline_stats, compute_differential_stats
+from .msa_viewer import parse_trimal_colnumbering, compute_column_stats, render_alignment_page, build_alignment_pages, load_group_anchor
 </file>
 
 <file path="enhydra/report.py">
@@ -7120,6 +8398,7 @@ from .io import parse_obo_names as _parse_obo_names
 
 import json
 import os
+import html
 import base64
 import logging
 import urllib.request
@@ -7161,12 +8440,12 @@ _METRIC_DESCS = {
 # ---------------------------------------------------------------------------
 # Unified report template — one tab shell used for every report, regardless
 # of how many ranking metrics were run. A single-metric report simply has
-# one metric tab plus the Filtering summary tab; a multi-metric report has
-# three metric tabs plus Filtering summary. This replaces what used to be
-# two separate templates (a flat non-tabbed layout for single-metric
-# reports, and a tabbed layout for multi-metric reports) — they had been
-# drifting into near-duplicates anyway, and the Filtering summary tab needs
-# to appear in both cases.
+# one metric tab plus the Alignments and Filtering summary tabs; a
+# multi-metric report has three metric tabs plus the same two. This
+# replaces what used to be two separate templates (a flat non-tabbed layout
+# for single-metric reports, and a tabbed layout for multi-metric reports)
+# — they had been drifting into near-duplicates anyway, and the Filtering
+# summary / Alignments tabs need to appear in both cases.
 # ---------------------------------------------------------------------------
 
 _TEMPLATE = """\
@@ -7275,6 +8554,28 @@ table.reason-table th, table.reason-table td {{ border: 1px solid #e0e0e0;
     padding: 5px 10px; font-size: 12.5px; text-align: left; }}
 table.reason-table th {{ background: #eef2f6; }}
 p.no-drops {{ color: #2f7d3c; font-size: 0.88em; margin: 4px 0 16px; }}
+.aln-tree-controls {{ margin-bottom: 14px; }}
+.aln-tree-controls input {{ width: 100%; max-width: 480px; padding: 8px 12px;
+    font-size: 13px; border: 1px solid #ccc; border-radius: 4px;
+    box-sizing: border-box; }}
+details.aln-tree-term {{ background: #fafbfc; border: 1px solid #e0e0e0;
+    border-radius: 6px; margin-bottom: 8px; padding: 8px 14px; }}
+details.aln-tree-term > summary {{ cursor: pointer; font-weight: 600;
+    color: #1a3a5c; padding: 4px 0; }}
+.aln-tree-row {{ display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
+    padding: 6px 4px 6px 20px; border-top: 1px solid #eee; font-size: 13px; }}
+.aln-tree-group {{ font-weight: 600; min-width: 160px; }}
+.aln-tree-gene {{ color: #555; min-width: 200px; }}
+.aln-tree-identity {{ color: #555; min-width: 120px; }}
+.aln-tree-diff {{ color: #1a3a5c; font-weight: 600; min-width: 100px; }}
+.gene-chip-list {{ display: flex; flex-wrap: wrap; gap: 6px; text-align: left;
+    font-family: 'Courier New', monospace; font-size: 12px; }}
+.gene-chip {{ background: #eef2f6; border-radius: 4px; padding: 3px 8px;
+    display: inline-flex; align-items: center; gap: 5px; }}
+.gene-chip-badge {{ background: #1a3a5c; color: white; border-radius: 3px;
+    padding: 1px 5px; font-size: 10px; font-weight: 700; text-decoration: none; }}
+.gene-chip-badge:hover {{ background: #12293f; }}
+a.aln-link {{ color: #1a3a5c; text-decoration: underline dotted; margin-right: 10px; }}
 footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 </style>
 </head>
@@ -7309,6 +8610,8 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 var enrichmentPlotsMap = {enrichment_plots_map};
 var fullGeneSets       = {full_gene_sets_js};
 var leadingEdgeMap     = {leading_edge_map_js};
+var fullGeneSetsHtml   = {full_gene_sets_html_js};
+var leadingEdgeHtmlMap = {leading_edge_html_map_js};
 var numericColsMap     = {numeric_cols_map};
 var dtInstances        = {{}};
 var colFiltersMap      = {{}};
@@ -7404,6 +8707,12 @@ function showTextModal(title, text) {{
     $('#modal-text').text(text).show();
     $('#modal-overlay').addClass('active');
 }}
+function showHtmlModal(title, htmlContent) {{
+    $('#modal-title').text(title);
+    $('#modal-img').hide();
+    $('#modal-text').html(htmlContent).show();
+    $('#modal-overlay').addClass('active');
+}}
 function tableToXLSX(tableSelector, numericCols, fullGeneSetsMap, leadEdgeMap, filename, onlyFiltered) {{
     var $table = $(tableSelector);
     if ($table.length === 0) return;
@@ -7479,6 +8788,26 @@ $(document).ready(function() {{
             }}
         }});
     }});
+    var alignFilterInput = document.getElementById('aln-tree-filter');
+    if (alignFilterInput) {{
+        alignFilterInput.addEventListener('input', function() {{
+            var q = this.value.trim().toLowerCase();
+            document.querySelectorAll('#aln-tree .aln-tree-term').forEach(function(term) {{
+                var termMatch = (term.getAttribute('data-term-search') || '').indexOf(q) !== -1;
+                var rows = term.querySelectorAll('.aln-tree-row');
+                var anyRowMatch = false;
+                rows.forEach(function(row) {{
+                    var rowMatch = !q || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
+                    row.style.display = rowMatch ? '' : 'none';
+                    if (rowMatch) anyRowMatch = true;
+                }});
+                var show = !q || termMatch || anyRowMatch;
+                term.style.display = show ? '' : 'none';
+                if (q && show) {{ term.open = true; }}
+                if (!q) {{ term.open = false; }}
+            }});
+        }});
+    }}
     $(document).on('click', '.go-link', function(e) {{
         e.preventDefault();
         var goId   = $(this).data('goid');
@@ -7490,17 +8819,19 @@ $(document).ready(function() {{
     $(document).on('click', '.geneset-link', function(e) {{
         e.preventDefault();
         var goId = $(this).data('goid');
-        var text = fullGeneSets[goId];
-        if (text !== undefined) showTextModal(goId + ' \u2014 full gene set', text);
+        var htmlContent = fullGeneSetsHtml[goId];
+        if (htmlContent !== undefined) {{
+            showHtmlModal(goId + ' \u2014 full gene set', htmlContent);
+        }}
     }});
     $(document).on('click', '.leadedge-link', function(e) {{
         e.preventDefault();
         var goId   = $(this).data('goid');
         var metric = $(this).data('metric');
-        var map    = metric ? leadingEdgeMap[metric] : undefined;
-        var text   = map ? map[goId] : undefined;
-        if (text !== undefined) {{
-            showTextModal(goId + ' \u2014 leading edge genes (' + metric + ')', text);
+        var map    = metric ? leadingEdgeHtmlMap[metric] : undefined;
+        var htmlContent = map ? map[goId] : undefined;
+        if (htmlContent !== undefined) {{
+            showHtmlModal(goId + ' \u2014 leading edge genes (' + metric + ')', htmlContent);
         }}
     }});
     $(document).on('click', '.sig-toggle-btn', function() {{
@@ -7630,12 +8961,12 @@ def _tsv_to_details_html(tsv_path: str, html_path: str, title: str) -> bool:
         cells = "".join("<td>%s</td>" % c for c in row)
         row_lines.append('<tr data-reason="%s">%s</tr>' % (reason_val, cells))
 
-    html = _DETAILS_PAGE_TEMPLATE.format(
+    html_content = _DETAILS_PAGE_TEMPLATE.format(
         title=title, header_html=header_html,
         rows_html="\n".join(row_lines), n_rows=len(rows),
     )
     with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(html)
+        fh.write(html_content)
     return True
 
 
@@ -7913,6 +9244,349 @@ def _build_filtering_summary_tab_content(
         '<div class="filtering-cols">%s%s</div></div>'
         % (overlap_html, col1, col2)
     )
+
+
+# ---------------------------------------------------------------------------
+# Alignments tab (GO-term-nested alignment page browser)
+# ---------------------------------------------------------------------------
+
+def _load_group_to_genes(tables_dir: str) -> dict[str, list[str]]:
+    """Load group2anchor.tsv as {group_id: [anchor_gene_id, ...]}.
+
+    Unlike msa_viewer.load_group_anchor() (which keeps only the last
+    gene_id per group_id, sufficient for single-line page metadata), this
+    preserves every row for a group — a group can map to more than one
+    anchor gene under --paralogs all, and GO-term membership needs to be
+    checked against all of them, not just whichever row happened to be
+    read last.
+    """
+    path = os.path.join(tables_dir, "group2anchor.tsv")
+    result: dict[str, list[str]] = {}
+    if not os.path.isfile(path):
+        return result
+    with open(path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                continue
+            result.setdefault(fields[0], []).append(fields[1])
+    return result
+
+
+def _load_group_identity(tables_dir: str | None) -> dict[str, float]:
+    """Load group2mean.tsv as {group_id: mean_identity}."""
+    if not tables_dir:
+        return {}
+    path = os.path.join(tables_dir, "group2mean.tsv")
+    result: dict[str, float] = {}
+    if not os.path.isfile(path):
+        return result
+    with open(path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                continue
+            try:
+                result[fields[0]] = float(fields[1])
+            except ValueError:
+                continue
+    return result
+
+
+def _build_alignment_tree_html(
+    gmt_gene_sets: dict[str, list[str]],
+    tables_dir1: str | None,
+    obo_names: dict[str, str],
+    alignment_pages1: dict[str, str] | None,
+    alignment_pages2: dict[str, str] | None,
+    report_dir: str,
+    label1: str = "List 1",
+    label2: str = "List 2",
+    tables_dir2: str | None = None,
+) -> str:
+    """Build the Alignments tab body: a GO-term-nested tree of alignment pages.
+
+    Membership is determined by list1's (or the single list's)
+    group2anchor.tsv — the only source of anchor-gene -> GMT mapping that
+    exists — intersected with whichever groups actually received a
+    rendered page in alignment_pages1. In two-list mode, alignment_pages1
+    is already restricted by cli.py to the group_id column of
+    differential_scores.tsv (i.e. bucket 3: groups that actually fed
+    GSEA), so no separate intersection check against that file is needed
+    here.
+
+    A GO term is only listed if at least one of its genes maps to a group
+    with a rendered page; terms are sorted by matched-group count
+    descending. If a group has more than one anchor gene under
+    --paralogs all and more than one of those genes falls under the same
+    term, the group is still listed only once for that term (paired with
+    the first gene, in sorted order, that matched) — this is a documented
+    simplification to avoid confusing duplicate rows for one group under
+    a single term.
+
+    In two-list mode (tables_dir2 given), each row shows both lists'
+    mean identity for that group (from each list's own group2mean.tsv)
+    plus their signed difference (list1 - list2). Rows within a term are
+    sorted by that signed difference descending: groups where list1 is
+    more conserved / list2 is more variable (positive diff) appear
+    first, sliding down through zero to groups where list2 is more
+    conserved / list1 is more variable (negative diff) at the bottom.
+    Deliberately signed rather than by |diff| — the direction of the
+    difference is the point, not just its magnitude. Rows missing a
+    score in either list sort to the end regardless of sign. In
+    single-list mode, each row shows a single plain identity value, and
+    rows are sorted by group_id (there is nothing to diff against).
+
+    Args:
+        gmt_gene_sets:     {term_id: [gene_id, ...]}, as returned by
+                          _gmt_gene_sets().
+        tables_dir1:       list1's (or the single list's) tables/
+                          directory. None disables the tab content
+                          (returns an explanatory message) rather than
+                          raising.
+        obo_names:         {term_id: term_name}, for display alongside
+                          each GO ID.
+        alignment_pages1:  {group_id: absolute_path}, as returned by
+                          build_alignment_pages() for the single list /
+                          list1. None or empty disables the tab content.
+        alignment_pages2:  {group_id: absolute_path} for list2, or None
+                          in single-list mode. When given, each leaf
+                          shows a second link labelled with label2,
+                          shown only for groups that also have a list2
+                          page.
+        report_dir:        Directory report.html itself will be written
+                          into, used to convert the absolute paths in
+                          alignment_pages1/2 into report-relative links
+                          (same convention as enrichment plot linking).
+        label1:            Display label for the first link/score column
+                          (the list name in two-list mode). In
+                          single-list mode (alignment_pages2 is None)
+                          the link label falls back to plain "View
+                          alignment", since naming it after a list would
+                          be meaningless with only one list.
+        label2:            Display label for the second link/score
+                          column (two-list mode only).
+        tables_dir2:       list2's tables/ directory, used to load its
+                          own group2mean.tsv for the per-row identity
+                          comparison. None in single-list mode, or if
+                          two-list identity comparison should be skipped
+                          (falls back to the single plain-identity
+                          display even if alignment_pages2 is given).
+
+    Returns:
+        HTML string: a filter input plus the nested <details> tree, or a
+        placeholder message if no data is available to build it from.
+    """
+    if not tables_dir1 or not alignment_pages1:
+        return "<p>No alignment pages were generated for this run.</p>"
+
+    group_to_genes = _load_group_to_genes(tables_dir1)
+    identity1 = _load_group_identity(tables_dir1)
+    identity2 = _load_group_identity(tables_dir2) if tables_dir2 else {}
+
+    gene_to_groups: dict[str, list[str]] = {}
+    for gid, genes in group_to_genes.items():
+        for gene in genes:
+            gene_to_groups.setdefault(gene, []).append(gid)
+
+    rel_pages1 = {
+        gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+        for gid, p in alignment_pages1.items()
+    }
+    rel_pages2 = (
+        {gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+         for gid, p in alignment_pages2.items()}
+        if alignment_pages2 else {}
+    )
+    two_list = bool(alignment_pages2) and tables_dir2 is not None
+
+    term_entries: dict[str, list[dict]] = {}
+    for term_id, genes in gmt_gene_sets.items():
+        seen_groups: set[str] = set()
+        entries: list[dict] = []
+        for gene in sorted(genes):
+            for group_id in gene_to_groups.get(gene, []):
+                if group_id in seen_groups or group_id not in rel_pages1:
+                    continue
+                seen_groups.add(group_id)
+                id1 = identity1.get(group_id)
+                id2 = identity2.get(group_id) if two_list else None
+                diff = (id1 - id2) if (id1 is not None and id2 is not None) else None
+                entries.append({
+                    "group_id": group_id, "gene_id": gene,
+                    "id1": id1, "id2": id2, "diff": diff,
+                })
+        if entries:
+            if two_list:
+                entries.sort(key=lambda e: (e["diff"] is None,
+                                            -e["diff"] if e["diff"] is not None else 0))
+            else:
+                entries.sort(key=lambda e: e["group_id"])
+            term_entries[term_id] = entries
+
+    if not term_entries:
+        return "<p>No GO terms could be matched to rendered alignment pages.</p>"
+
+    sorted_terms = sorted(term_entries.items(), key=lambda kv: -len(kv[1]))
+
+    blocks = []
+    for term_id, entries in sorted_terms:
+        term_name = obo_names.get(term_id, "")
+        summary_label = "%s%s (%d group%s)" % (
+            html.escape(term_id),
+            " \u2014 %s" % html.escape(term_name) if term_name else "",
+            len(entries), "" if len(entries) == 1 else "s",
+        )
+        rows_html = []
+        for e in entries:
+            group_id, gene_id = e["group_id"], e["gene_id"]
+            link1_label = html.escape(label1) if two_list else "View alignment"
+            links = '<a href="%s" target="_blank" class="aln-link">%s</a>' % (
+                rel_pages1[group_id], link1_label,
+            )
+            if two_list and group_id in rel_pages2:
+                links += ' <a href="%s" target="_blank" class="aln-link">%s</a>' % (
+                    rel_pages2[group_id], html.escape(label2),
+                )
+
+            if two_list:
+                id1_str = "%.4f" % e["id1"] if e["id1"] is not None else "N/A"
+                id2_str = "%.4f" % e["id2"] if e["id2"] is not None else "N/A"
+                diff_str = "%+.4f" % e["diff"] if e["diff"] is not None else "N/A"
+                score_html = (
+                    '<span class="aln-tree-identity">%s: %s</span>'
+                    '<span class="aln-tree-identity">%s: %s</span>'
+                    '<span class="aln-tree-diff">\u0394: %s</span>'
+                    % (html.escape(label1), id1_str,
+                       html.escape(label2), id2_str, diff_str)
+                )
+            else:
+                id1_str = "%.4f" % e["id1"] if e["id1"] is not None else "N/A"
+                score_html = '<span class="aln-tree-identity">identity: %s</span>' % id1_str
+
+            search_key = html.escape(
+                ("%s %s %s %s" % (group_id, gene_id, term_id, term_name)).lower()
+            )
+            rows_html.append(
+                '<div class="aln-tree-row" data-search="%s">'
+                '<span class="aln-tree-group">%s</span>'
+                '<span class="aln-tree-gene">anchor: %s</span>'
+                '%s'
+                '<span class="aln-tree-links">%s</span>'
+                "</div>"
+                % (search_key, html.escape(group_id), html.escape(gene_id),
+                   score_html, links)
+            )
+        term_search_key = html.escape(("%s %s" % (term_id, term_name)).lower())
+        blocks.append(
+            '<details class="aln-tree-term" data-term-search="%s">'
+            "<summary>%s</summary>%s</details>"
+            % (term_search_key, summary_label, "".join(rows_html))
+        )
+
+    return (
+        '<div class="aln-tree-controls">'
+        '<input type="text" id="aln-tree-filter" '
+        'placeholder="Filter by GO ID, term name, group ID, or gene ID..."/>'
+        "</div>"
+        '<div id="aln-tree">%s</div>' % "".join(blocks)
+    )
+
+
+def _build_gene_to_page_links(
+    tables_dir1: str | None,
+    alignment_pages1: dict[str, str] | None,
+    alignment_pages2: dict[str, str] | None,
+    report_dir: str,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Build {gene_id: (list1_relpath_or_None, list2_relpath_or_None)}.
+
+    Used to turn plain gene IDs in the "Full gene set" / "Leading edge"
+    modals into links to their pre-rendered alignment page, alongside the
+    GO-term tree (Alignments tab) which serves the same underlying data
+    but organised by GO term rather than by gene.
+
+    If a gene's group (from list1's group2anchor.tsv) has no rendered
+    page in alignment_pages1, that gene is simply absent from the
+    returned dict — callers should render it as plain, non-linked text.
+    If a gene happens to map to more than one group (possible under
+    --paralogs all, though unusual), the first matching group encountered
+    is used — a documented simplification, consistent with the same
+    choice already made in _build_alignment_tree_html().
+
+    Args:
+        tables_dir1:       list1's (or the single list's) tables/
+                          directory. None returns an empty dict.
+        alignment_pages1:  {group_id: absolute_path} for the single list
+                          or list1. None or empty returns an empty dict.
+        alignment_pages2:  {group_id: absolute_path} for list2, or None
+                          in single-list mode.
+        report_dir:        Directory report.html will be written into,
+                          used to compute relative link paths.
+
+    Returns:
+        Dict mapping gene_id to a (list1_link, list2_link) tuple, where
+        each element is a report-relative path string or None if that
+        list has no page for this gene's group.
+    """
+    if not tables_dir1 or not alignment_pages1:
+        return {}
+
+    group_to_genes = _load_group_to_genes(tables_dir1)
+    rel_pages1 = {
+        gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+        for gid, p in alignment_pages1.items()
+    }
+    rel_pages2 = (
+        {gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
+         for gid, p in alignment_pages2.items()}
+        if alignment_pages2 else {}
+    )
+
+    gene_to_page: dict[str, tuple[str | None, str | None]] = {}
+    for group_id, genes in group_to_genes.items():
+        if group_id not in rel_pages1:
+            continue
+        link1 = rel_pages1[group_id]
+        link2 = rel_pages2.get(group_id)
+        for gene in genes:
+            if gene not in gene_to_page:
+                gene_to_page[gene] = (link1, link2)
+    return gene_to_page
+
+
+def _gene_chip_list_html(
+    gene_ids: list[str],
+    gene_to_page: dict[str, tuple[str | None, str | None]],
+) -> str:
+    """Render a list of gene IDs as chips, linked to alignment pages where
+    a mapping exists in gene_to_page, plain text otherwise.
+
+    Each linked gene shows small 'L1'/'L2' badge links (rather than full
+    list-name labels, which would be too cramped at chip scale) opening
+    that list's alignment page in a new tab. A gene with only a list1
+    link (single-list mode, or a two-list gene whose group has no list2
+    page) shows only the L1 badge.
+    """
+    chips = []
+    for gene in gene_ids:
+        link1, link2 = gene_to_page.get(gene, (None, None))
+        badges = ""
+        if link1:
+            badges += (
+                '<a href="%s" target="_blank" class="gene-chip-badge" '
+                'title="View alignment">L1</a>' % link1
+            )
+        if link2:
+            badges += (
+                '<a href="%s" target="_blank" class="gene-chip-badge" '
+                'title="View alignment">L2</a>' % link2
+            )
+        chips.append(
+            '<span class="gene-chip">%s%s</span>'
+            % (html.escape(gene), (" " + badges) if badges else "")
+        )
+    return '<div class="gene-chip-list">%s</div>' % "".join(chips)
 
 
 # ---------------------------------------------------------------------------
@@ -8206,11 +9880,25 @@ def _results_table_html(
     col1_label: str = "List 1",
     col2_label: str = "List 2",
     gene_sets: dict[str, list[str]] | None = None,
-) -> tuple[str, list[int], dict[str, str], dict[str, str]]:
+    gene_to_page: dict[str, tuple[str | None, str | None]] | None = None,
+) -> tuple[str, list[int], dict[str, str], dict[str, str], dict[str, str], dict[str, str]]:
+    """Build the enrichment results DataTable HTML for one metric.
+
+    Returns a 6-tuple:
+        (table_html, numeric_col_indices,
+         full_gene_sets_text, leading_edge_text,
+         full_gene_sets_html, leading_edge_html)
+
+    The *_text dicts are unchanged plain newline-joined gene lists, used
+    for the Excel export (tableToXLSX() splits these on newline — turning
+    them into HTML would corrupt the exported cells). The *_html dicts are
+    a parallel rendering of the same gene lists as clickable chips (via
+    _gene_chip_list_html()), used only for the on-screen modal display.
+    """
     df = df.copy()
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
-        return "<p>No results to display.</p>", [], {}, {}
+        return "<p>No results to display.</p>", [], {}, {}, {}, {}
 
     df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
 
@@ -8226,8 +9914,11 @@ def _results_table_html(
         lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
     )
 
+    gene_to_page = gene_to_page or {}
     full_sets_js: dict[str, str] = {}
     leadedge_js:  dict[str, str] = {}
+    full_sets_html_js: dict[str, str] = {}
+    leadedge_html_js:  dict[str, str] = {}
 
     if gene_sets:
         def _full_set_cell(term_id):
@@ -8235,6 +9926,7 @@ def _results_table_html(
             if not genes:
                 return ""
             full_sets_js[term_id] = "\n".join(genes)
+            full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
             return "View (%d)" % len(genes)
         df["Full gene set"] = df["Term"].apply(_full_set_cell)
 
@@ -8248,6 +9940,7 @@ def _results_table_html(
             if not genes:
                 return ""
             leadedge_js[row["Term"]] = "\n".join(genes)
+            leadedge_html_js[row["Term"]] = _gene_chip_list_html(genes, gene_to_page)
             return "View (%d)" % len(genes)
         df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
 
@@ -8331,36 +10024,38 @@ def _results_table_html(
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
 
-    html = (
+    html_content = (
         '<table id="%s" class="display compact" style="width:100%%">'
         '<thead><tr>%s</tr><tr class="filter-row">%s</tr></thead>'
         "<tbody>%s</tbody></table>"
     ) % (table_id, header_cells, filter_cells, rows)
 
-    return html, numeric_col_indices, full_sets_js, leadedge_js
+    return (html_content, numeric_col_indices,
+            full_sets_js, leadedge_js,
+            full_sets_html_js, leadedge_html_js)
 
 
 def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
-    html = ""
+    html_content = ""
     for stem, caption in names:
         svg_path = os.path.join(plots_dir, stem + ".svg")
         png_path = os.path.join(plots_dir, stem + ".png")
         if os.path.isfile(svg_path):
             with open(svg_path, encoding="utf-8") as fh:
                 svg_content = fh.read()
-            html += (
+            html_content += (
                 '<div class="plot-block">'
                 '<p class="plot-caption">%s (hover for details)</p>'
                 '%s</div>'
             ) % (caption, svg_content)
         elif os.path.isfile(png_path):
             uri = _img_to_base64(png_path)
-            html += (
+            html_content += (
                 '<div class="plot-block">'
                 '<p class="plot-caption">%s</p>'
                 '<img src="%s" alt="%s"/></div>'
             ) % (caption, uri, caption)
-    return html
+    return html_content
 
 
 # ---------------------------------------------------------------------------
@@ -8382,6 +10077,8 @@ def _build_report_impl(
     pipeline_stats_path1: str | None,
     pipeline_stats_path2: str | None,
     differential_stats_path: str | None,
+    alignment_pages1: dict[str, str] | None = None,
+    alignment_pages2: dict[str, str] | None = None,
 ):
     logger.info("Building HTML report (%d metric tab(s))...", len(metric_data))
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
@@ -8413,12 +10110,22 @@ def _build_report_impl(
 
     report_dir = os.path.dirname(os.path.abspath(report_path))
 
+    # Built once (not per metric) — feeds the "Full gene set" / "Leading
+    # edge" modal chip links below. Independent of which metric is being
+    # rendered, since it only depends on group2anchor.tsv + the rendered
+    # alignment page maps.
+    gene_to_page = _build_gene_to_page_links(
+        tables_dir1, alignment_pages1, alignment_pages2, report_dir,
+    )
+
     tab_buttons_parts    = []
     tab_panels_parts     = []
     enrichment_plots_map = {}
     numeric_cols_map      = {}
     full_gene_sets_accum  = {}
     leading_edge_map      = {}
+    full_gene_sets_html_accum = {}
+    leading_edge_html_map     = {}
     first = True
     for metric, paths in metric_data.items():
         label       = METRIC_LABELS.get(metric, metric.capitalize())
@@ -8437,18 +10144,22 @@ def _build_report_impl(
             df = _augment_with_per_term_scores(
                 df, effective_gmt, tables_dir1, tables_dir2, metric
             )
-            tbl_html, num_cols, full_sets_js, leadedge_js = _results_table_html(
+            (tbl_html, num_cols, full_sets_js, leadedge_js,
+             full_sets_html_js, leadedge_html_js) = _results_table_html(
                 df, term_names, plot_idx, fdr_threshold,
                 metric=metric, col1_label=label1, col2_label=label2,
-                gene_sets=gene_sets_all,
+                gene_sets=gene_sets_all, gene_to_page=gene_to_page,
             )
             numeric_cols_map[metric] = num_cols
             full_gene_sets_accum.update(full_sets_js)
             leading_edge_map[metric] = leadedge_js
+            full_gene_sets_html_accum.update(full_sets_html_js)
+            leading_edge_html_map[metric] = leadedge_html_js
         else:
             tbl_html = "<p>No GSEA results found for this metric.</p>"
             numeric_cols_map[metric] = []
             leading_edge_map[metric] = {}
+            leading_edge_html_map[metric] = {}
         plots_html = _plot_section(plots_dir, plot_names)
         desc       = "" if single_metric else _METRIC_DESCS.get(metric, "")
         desc_html  = ('<p class="metric-desc">%s</p>' % desc) if desc else ""
@@ -8461,7 +10172,7 @@ def _build_report_impl(
             '  <p>Significant gene sets (FDR&nbsp;&lt;&nbsp;{fdr}) highlighted '
             'in blue. Click a GO ID to view its enrichment plot, or "View" '
             'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the '
-            'gene lists as text.</p>\n'
+            'gene lists, with links to alignment pages where available.</p>\n'
             '  <p>'
             '<button class="sig-toggle-btn" data-metric="{m}">Show only significant</button> '
             '<button class="export-btn export-xlsx-btn" data-metric="{m}">'
@@ -8476,6 +10187,34 @@ def _build_report_impl(
             )
         )
         first = False
+
+    # Alignments tab — appended after the metric tabs, before Filtering
+    # summary. Built from list1's (or the single list's) group2anchor.tsv
+    # plus whichever groups actually received a rendered alignment page;
+    # see _build_alignment_tree_html() for the full membership rules.
+    tab_buttons_parts.append(
+        '    <button class="tab-btn" data-metric="alignments" '
+        'role="tab" aria-controls="tab-alignments">Alignments</button>'
+    )
+    alignment_tree_html = _build_alignment_tree_html(
+        gmt_gene_sets=gene_sets_all,
+        tables_dir1=tables_dir1,
+        obo_names=term_names,
+        alignment_pages1=alignment_pages1,
+        alignment_pages2=alignment_pages2,
+        report_dir=report_dir,
+        label1=label1,
+        label2=label2,
+        tables_dir2=tables_dir2,
+    )
+    tab_panels_parts.append(
+        '<div id="tab-alignments" class="tab-panel" role="tabpanel">\n'
+        '  <p class="metric-desc">Alignments for every orthogroup that fed '
+        'GSEA, nested by GO term. Columns shown hatched/dimmed, if any, '
+        'were removed by trimAl before identity estimation.</p>\n'
+        '  %s\n'
+        '</div>\n' % alignment_tree_html
+    )
 
     # Filtering summary tab — always appended last; never the default-active
     # tab (the JS default-click targets the first .tab-btn in DOM order,
@@ -8502,7 +10241,7 @@ def _build_report_impl(
         '</div>\n' % filtering_html
     )
 
-    html = _TEMPLATE.format(
+    html_content = _TEMPLATE.format(
         title=title, dt_css=dt_css,
         tab_buttons="\n".join(tab_buttons_parts),
         tab_panels="\n".join(tab_panels_parts),
@@ -8510,10 +10249,12 @@ def _build_report_impl(
         enrichment_plots_map=json.dumps(enrichment_plots_map),
         full_gene_sets_js=json.dumps(full_gene_sets_accum),
         leading_edge_map_js=json.dumps(leading_edge_map),
+        full_gene_sets_html_js=json.dumps(full_gene_sets_html_accum),
+        leading_edge_html_map_js=json.dumps(leading_edge_html_map),
         numeric_cols_map=json.dumps(numeric_cols_map),
     )
     with open(report_path, "w", encoding="utf-8") as fh:
-        fh.write(html)
+        fh.write(html_content)
     logger.info("HTML report written to: %s", report_path)
 
 
@@ -8538,8 +10279,11 @@ def build_report(
     pipeline_stats_path1: str | None = None,
     pipeline_stats_path2: str | None = None,
     differential_stats_path: str | None = None,
+    alignment_pages1: dict[str, str] | None = None,
+    alignment_pages2: dict[str, str] | None = None,
 ):
-    """Build a single-metric HTML report (one enrichment tab + Filtering summary).
+    """Build a single-metric HTML report (one enrichment tab + Alignments +
+    Filtering summary).
 
     Thin wrapper around _build_report_impl() with a one-entry metric_data
     dict, so single-metric and multi-metric reports share one implementation
@@ -8555,6 +10299,8 @@ def build_report(
         pipeline_stats_path1=pipeline_stats_path1,
         pipeline_stats_path2=pipeline_stats_path2,
         differential_stats_path=differential_stats_path,
+        alignment_pages1=alignment_pages1,
+        alignment_pages2=alignment_pages2,
     )
 
 
@@ -8573,9 +10319,12 @@ def build_multi_metric_report(
     pipeline_stats_path1: str | None = None,
     pipeline_stats_path2: str | None = None,
     differential_stats_path: str | None = None,
+    alignment_pages1: dict[str, str] | None = None,
+    alignment_pages2: dict[str, str] | None = None,
 ):
     """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
-    including the Filtering summary tab appended after the metric tabs.
+    including the Alignments and Filtering summary tabs appended after the
+    metric tabs.
     """
     _build_report_impl(
         metric_data=metric_data, report_path=report_path, obo_path=obo_path,
@@ -8586,6 +10335,8 @@ def build_multi_metric_report(
         pipeline_stats_path1=pipeline_stats_path1,
         pipeline_stats_path2=pipeline_stats_path2,
         differential_stats_path=differential_stats_path,
+        alignment_pages1=alignment_pages1,
+        alignment_pages2=alignment_pages2,
     )
 </file>
 
@@ -9083,6 +10834,7 @@ from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .stats import aggregate_pipeline_stats, compute_differential_stats
+from .msa_viewer import build_alignment_pages, load_group_anchor
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 ALL_METRICS = ("identity", "zscore", "rank")
@@ -9129,6 +10881,26 @@ def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bo
 
 def _filter_length_star(args):
     return filter_length(*args)
+
+
+def _reconstruct_alignment_pages(pages_dir: str) -> dict[str, str]:
+    """Rebuild a {group_id: page_path} map from an existing alignments/ dir.
+
+    Used when a --resume/--replot run skips regenerating alignment pages
+    because pages_dir already has content from a prior run. Downstream
+    steps (report building, in a later commit) still need this mapping
+    populated regardless of which branch ran, so it is reconstructed from
+    whatever HTML files are already on disk rather than left undefined —
+    the same "must stay populated either way" concern already handled for
+    tables_dir/stats elsewhere in this module.
+    """
+    if not os.path.isdir(pages_dir):
+        return {}
+    return {
+        os.path.splitext(f)[0]: os.path.abspath(os.path.join(pages_dir, f))
+        for f in os.listdir(pages_dir)
+        if f.endswith(".html")
+    }
 
 
 def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
@@ -9223,16 +10995,23 @@ def _run_single_list(
             return True
         return False
 
-    subset_dir        = os.path.join(listdir, "subset")
-    length_stats_dir  = os.path.join(listdir, "length_stats")
-    length_filter_dir = os.path.join(listdir, "length_filter")
-    group_filter_dir  = os.path.join(listdir, "group_filter")
-    group_stats_dir   = os.path.join(listdir, "group_filter_stats")
-    alignment_dir     = os.path.join(listdir, "alignment")
-    stripped_dir      = os.path.join(listdir, "alignment_stripped")
-    trimmed_dir       = os.path.join(listdir, "alignment_trimmed")
-    ident_dir         = os.path.join(listdir, "ident_alignment")
-    tables_dir        = os.path.join(listdir, "tables")
+    subset_dir           = os.path.join(listdir, "subset")
+    length_stats_dir      = os.path.join(listdir, "length_stats")
+    length_filter_dir     = os.path.join(listdir, "length_filter")
+    group_filter_dir      = os.path.join(listdir, "group_filter")
+    group_stats_dir       = os.path.join(listdir, "group_filter_stats")
+    alignment_dir         = os.path.join(listdir, "alignment")
+    stripped_dir          = os.path.join(listdir, "alignment_stripped")
+    trimmed_dir           = os.path.join(listdir, "alignment_trimmed")
+    # Sidecar directory for trimAl's -colnumbering output, capturing which
+    # original alignment columns survive trimming. Populated only when
+    # trim_args is set (see the trim_args block below). cli.py's main()
+    # recomputes this exact same path independently — using the same
+    # listdir-based naming convention — when building alignment pages, so
+    # the two must be kept in sync if this naming ever changes.
+    trim_colnumbering_dir = os.path.join(listdir, "alignment_trimmed_colnumbering")
+    ident_dir              = os.path.join(listdir, "ident_alignment")
+    tables_dir             = os.path.join(listdir, "tables")
 
     # These two flags answer genuinely different questions and must not be
     # conflated: 'require_anchor' controls whether filter_groups() *drops*
@@ -9356,7 +11135,22 @@ def _run_single_list(
                 "Step 3c: Trimming alignment columns with trimAl (%s)",
                 " ".join(trim_args),
             )
-            if not _skip(trimmed_dir, "column trimming"):
+            # Colnumbering capture rides along with the existing -out
+            # trimming call (trimAl supports both flags together — see
+            # msa_viewer module notes), so it is always captured whenever
+            # trimming is enabled at all; there is no separate opt-in flag.
+            #
+            # The skip-guard here deliberately checks *both* trimmed_dir
+            # and trim_colnumbering_dir rather than reusing the plain
+            # _skip(trimmed_dir, ...) helper: if trimmed_dir already has
+            # contents from a run predating this feature, a resumed run
+            # would otherwise skip the whole block forever and never
+            # produce colnumbering sidecar files at all. This mirrors the
+            # aggregate_length_filter_stats() lesson elsewhere in this
+            # function — a resume-guard checking only one of two outputs
+            # a step produces can silently strand the other output.
+            colnumbering_ready = _step_complete(trim_colnumbering_dir)
+            if not (resume and _step_complete(trimmed_dir) and colnumbering_ready):
                 run_trimal_columns(
                     alignment_dir=trimal_input_dir,
                     trimmed_dir=trimmed_dir,
@@ -9364,6 +11158,12 @@ def _run_single_list(
                     trim_args=trim_args,
                     n_proc=max_process,
                     show_progress=show_progress,
+                    colnumbering_dir=trim_colnumbering_dir,
+                )
+            else:
+                logger.info(
+                    "Skipping column trimming (output already exists: %s, %s)",
+                    trimmed_dir, trim_colnumbering_dir,
                 )
             trimal_input_dir = trimmed_dir
             sbar.update(1)
@@ -9606,6 +11406,36 @@ def main():
         )
         aggregate_pipeline_stats(outdir, n_input=stats["n_input"])
 
+        # Alignment pages (bucket 3 = every group in group2anchor.tsv).
+        # Rendered once here, not per metric — alignment pages don't
+        # depend on the ranking metric at all. Path naming mirrors the
+        # convention used inside _run_single_list() for trim_colnumbering_dir
+        # (listdir/alignment_trimmed_colnumbering); the two must stay in
+        # sync since this is recomputed independently rather than threaded
+        # through _run_single_list()'s return value.
+        alignment_dir_single   = os.path.join(outdir, "alignment")
+        alignment_pages_dir    = os.path.join(outdir, "alignments")
+        colnumbering_dir_single = (
+            os.path.join(outdir, "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+        if not (resume and _step_complete(alignment_pages_dir)):
+            logger.info("Rendering alignment pages for report...")
+            alignment_pages = build_alignment_pages(
+                alignment_dir=alignment_dir_single,
+                tables_dir=tables_dir,
+                outdir=alignment_pages_dir,
+                anchor_species=parameters['anchor'],
+                colnumbering_dir=colnumbering_dir_single,
+                show_progress=args.quiet,
+            )
+        else:
+            logger.info(
+                "Skipping alignment page generation (output already exists: %s)",
+                alignment_pages_dir,
+            )
+            alignment_pages = _reconstruct_alignment_pages(alignment_pages_dir)
+
         raw_anchor2mean = os.path.join(tables_dir, "anchor2mean.tsv")
         metric_outputs  = {}
 
@@ -9646,6 +11476,7 @@ def main():
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
+                alignment_pages1=alignment_pages,
             )
         else:
             build_report(
@@ -9658,6 +11489,7 @@ def main():
                 gmt_path=gene_sets,
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
+                alignment_pages1=alignment_pages,
             )
 
         for m in metrics_to_run:
@@ -9761,6 +11593,80 @@ def main():
             metric_outputs[m] = {"results_dir": results_dir_m,
                                   "plots_dir":   plots_dir_m}
 
+        # Alignment pages (bucket 3 in two-list mode = every group_id in
+        # differential_scores.tsv, i.e. the intersection compute_differential()
+        # already computed). Built once here using metrics_to_run[0]'s
+        # differential_scores.tsv, not per metric — the group_id set is
+        # expected to be identical across metrics (same intersection of
+        # tables_dir1/tables_dir2, just a different score column), a
+        # simplifying assumption confirmed acceptable rather than
+        # re-validated against every metric's own output.
+        first_metric   = metrics_to_run[0]
+        first_diff_dir = os.path.join(
+            outdir, "differential%s" % (("_%s" % first_metric) if all_metrics else ""),
+        )
+        diff_scores_path = os.path.join(first_diff_dir, "differential_scores.tsv")
+
+        import pandas as _pd
+        diff_group_ids = list(
+            _pd.read_csv(diff_scores_path, sep="\t")["group_id"].astype(str)
+        )
+
+        list1_alignment_dir = os.path.join(outdir, "list1", "alignment")
+        list1_pages_dir      = os.path.join(outdir, "list1", "alignments")
+        list1_colnum_dir     = (
+            os.path.join(outdir, "list1", "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+        list2_alignment_dir = os.path.join(outdir, "list2", "alignment")
+        list2_pages_dir      = os.path.join(outdir, "list2", "alignments")
+        list2_colnum_dir     = (
+            os.path.join(outdir, "list2", "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+
+        if not (resume and _step_complete(list1_pages_dir)):
+            logger.info("Rendering %s alignment pages for report...", list1_name)
+            alignment_pages1 = build_alignment_pages(
+                alignment_dir=list1_alignment_dir,
+                tables_dir=tables_dir1,
+                outdir=list1_pages_dir,
+                group_ids=diff_group_ids,
+                anchor_species=anchor,
+                colnumbering_dir=list1_colnum_dir,
+                show_progress=args.quiet,
+            )
+        else:
+            logger.info(
+                "Skipping %s alignment page generation (output already exists: %s)",
+                list1_name, list1_pages_dir,
+            )
+            alignment_pages1 = _reconstruct_alignment_pages(list1_pages_dir)
+
+        # list2 never contains the anchor species (anchor_species=None
+        # disables pinning), but list1's own anchor gene mapping is passed
+        # through as page context so list2 pages still show which anchor
+        # gene this group corresponds to.
+        list1_anchor_lookup = load_group_anchor(tables_dir1)
+        if not (resume and _step_complete(list2_pages_dir)):
+            logger.info("Rendering %s alignment pages for report...", list2_name)
+            alignment_pages2 = build_alignment_pages(
+                alignment_dir=list2_alignment_dir,
+                tables_dir=tables_dir2,
+                outdir=list2_pages_dir,
+                group_ids=diff_group_ids,
+                anchor_species=None,
+                anchor_gene_lookup=list1_anchor_lookup,
+                colnumbering_dir=list2_colnum_dir,
+                show_progress=args.quiet,
+            )
+        else:
+            logger.info(
+                "Skipping %s alignment page generation (output already exists: %s)",
+                list2_name, list2_pages_dir,
+            )
+            alignment_pages2 = _reconstruct_alignment_pages(list2_pages_dir)
+
         logger.info("Building HTML report")
         if all_metrics:
             build_multi_metric_report(
@@ -9777,6 +11683,8 @@ def main():
                 pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
                 pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
+                alignment_pages1=alignment_pages1,
+                alignment_pages2=alignment_pages2,
             )
         else:
             build_report(
@@ -9795,6 +11703,8 @@ def main():
                 pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
                 pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
+                alignment_pages1=alignment_pages1,
+                alignment_pages2=alignment_pages2,
             )
 
         for m in metrics_to_run:

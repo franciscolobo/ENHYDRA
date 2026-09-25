@@ -36,6 +36,7 @@ def read_config_file(fh_project, fh_code) -> dict:
         'paralogs':         project.get('paralogs', 'all'),
         'length_filter_sd': float(project.get('length_filter_sd', 2.0)),
         'trim':             project.get('trim', ''),
+        'divergence_filter_sd': project.get('divergence_filter_sd', ''),
         # Alignment
         'aligner':          project.get('aligner', 'mafft'),
         'mafft_mode':       project.get('mafft_mode', 'auto'),

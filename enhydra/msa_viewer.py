@@ -335,6 +335,7 @@ main {{ max-width: 100%; margin: 0 auto; padding: 20px 28px 40px; }}
 .meta dd {{ margin: 0; }}
 .warning {{ background: #fff4e5; border-left: 3px solid #d9822b;
             padding: 8px 14px; margin-bottom: 16px; font-size: 13px; }}
+.warning ul {{ margin: 6px 0 0; padding-left: 20px; }}
 .legend {{ background: white; border-radius: 6px; padding: 10px 18px;
            margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
            font-size: 12px; }}
@@ -389,6 +390,7 @@ def render_alignment_page(
     anchor_species: str | None = None,
     mean_identity: float | None = None,
     retained_columns: set[int] | None = None,
+    removed_divergent_sequences: list[tuple[str, float]] | None = None,
     block_width: int = 60,
 ) -> None:
     """Render a static, self-contained HTML page for one alignment.
@@ -415,6 +417,18 @@ def render_alignment_page(
     alignment.run_trimal_columns() on this same file) — see
     msa_viewer.parse_trimal_colnumbering().
 
+    Note this masking-overlay approach does NOT extend to the divergent-
+    sequence filter (see removed_divergent_sequences below): unlike
+    column trimming, removing a divergent sequence is followed by
+    realigning the survivors, which changes column positions for every
+    remaining sequence. There is no stable column correspondence between
+    the pre- and post-removal alignments to overlay a mask against, so
+    `records` here is expected to already be the *final*, post-removal
+    (and, if applicable, post-realignment) alignment — the same one
+    identity was actually computed from — with removed_divergent_sequences
+    only used to surface a textual notice of what was removed, not to
+    render the removed sequence's row.
+
     If anchor_species is given, the first record whose ID's species
     field (text before '|') matches it is moved to the top of the
     alignment as a pinned reference row; this only applies to
@@ -438,7 +452,9 @@ def render_alignment_page(
                           form (ENHYDRA's convention) so the species
                           field can be used for anchor pinning; the full
                           ID is always shown in the row label's hover
-                          tooltip regardless of length.
+                          tooltip regardless of length. Expected to be
+                          the final, post-divergence-filter alignment —
+                          see the note above.
         out_path:         Destination HTML file path.
         anchor_gene_id:   Anchor gene ID to display in the metadata
                           panel (display only — does not affect pinning
@@ -452,6 +468,18 @@ def render_alignment_page(
         retained_columns: Set of 0-based column indices retained after
                           trimAl column trimming, or None if trimming
                           was not applied to this run (no masking).
+        removed_divergent_sequences: List of (sequence_id,
+                          identity_to_closest_match) tuples for
+                          sequences that the divergent-sequence filter
+                          (filtering.filter_divergent_sequences())
+                          removed from this group before `records` was
+                          computed. When non-empty, a warning banner
+                          lists each removed sequence and its identity
+                          value, and a summary line is added to the
+                          metadata panel. None or an empty list omits
+                          the banner entirely (e.g. divergence filtering
+                          was not enabled for this run, or this
+                          particular group was unaffected).
         block_width:      Number of alignment columns rendered per
                           visual block (default: 60).
 
@@ -471,7 +499,7 @@ def render_alignment_page(
     width = len(seqs[0])
 
     ordered = list(records)
-    warning_html = ""
+    warnings: list[str] = []
     if anchor_species is not None:
         anchor_idx = next(
             (i for i, (sid, _) in enumerate(ordered)
@@ -485,11 +513,27 @@ def render_alignment_page(
                 "Anchor species '%s' not found in alignment for group "
                 "'%s' — rendering without pinning.", anchor_species, group_id,
             )
-            warning_html = (
+            warnings.append(
                 '<div class="warning">Anchor species \u2018%s\u2019 was not '
                 'found in this alignment \u2014 rows are shown in their '
                 'original order.</div>' % html.escape(anchor_species)
             )
+
+    if removed_divergent_sequences:
+        items = "".join(
+            "<li>%s (identity to closest match: %.4f)</li>"
+            % (html.escape(seq_id), identity_val)
+            for seq_id, identity_val in removed_divergent_sequences
+        )
+        warnings.append(
+            '<div class="warning">%d sequence(s) were removed from this '
+            'group by the divergence filter (identity to closest match '
+            'fell too far below the group mean), and the remaining '
+            'sequences shown below were realigned without them:'
+            '<ul>%s</ul></div>'
+            % (len(removed_divergent_sequences), items)
+        )
+    warning_html = "".join(warnings)
 
     n_masked = None
     if retained_columns is not None:
@@ -512,6 +556,12 @@ def render_alignment_page(
         meta_rows.append((
             "Trimmed columns",
             "%d of %d removed by trimAl (shown masked below)" % (n_masked, width),
+        ))
+    if removed_divergent_sequences:
+        meta_rows.append((
+            "Divergent sequences removed",
+            "%d (see notice above; alignment shown is post-removal, "
+            "realigned)" % len(removed_divergent_sequences),
         ))
     meta_html = "".join(
         "<dt>%s</dt><dd>%s</dd>" % (k, v) for k, v in meta_rows
@@ -583,6 +633,66 @@ def _load_group_anchor(tables_dir: str) -> dict[str, str]:
     return result
 
 
+def _load_divergence_removed(
+    path: str | None,
+) -> dict[str, list[tuple[str, float]]]:
+    """Load a divergence filter's drop_reasons.tsv into per-group removal lists.
+
+    Only rows with reason == 'removed_divergent_sequence' are included.
+    The file's other possible reason, 'below_min_species_after_
+    divergence_filter', describes a group dropped entirely — such a group
+    never has a rendered alignment page in the first place (it has no
+    surviving alignment file at all), so there is nothing for that reason
+    to annotate here.
+
+    Args:
+        path: Path to filtering.filter_divergent_sequences()'s
+             drop_reasons.tsv, or None if divergence filtering was not
+             enabled for this run.
+
+    Returns:
+        Dict mapping group_id to a list of (sequence_id,
+        identity_to_closest_match) tuples. Empty dict if path is None,
+        the file does not exist, or the file's header is missing any of
+        the expected columns (defensive against a mismatched or
+        corrupted stats file — silently rendering pages without the
+        notice is preferable to crashing report generation over it).
+    """
+    if not path or not os.path.isfile(path):
+        return {}
+
+    result: dict[str, list[tuple[str, float]]] = {}
+    with open(path) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        try:
+            reason_idx   = header.index("reason")
+            group_idx    = header.index("group_id")
+            seq_idx      = header.index("sequence_id")
+            identity_idx = header.index("identity_to_closest")
+        except ValueError:
+            logger.warning(
+                "Divergence drop-reasons file has an unexpected header — "
+                "skipping removal notices in alignment pages: %s", path,
+            )
+            return {}
+
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) <= max(reason_idx, group_idx, seq_idx, identity_idx):
+                continue
+            if fields[reason_idx] != "removed_divergent_sequence":
+                continue
+            try:
+                identity_val = float(fields[identity_idx])
+            except ValueError:
+                continue
+            result.setdefault(fields[group_idx], []).append(
+                (fields[seq_idx], identity_val)
+            )
+
+    return result
+
+
 def build_alignment_pages(
     alignment_dir: str,
     tables_dir: str,
@@ -591,6 +701,7 @@ def build_alignment_pages(
     anchor_species: str | None = None,
     anchor_gene_lookup: dict[str, str] | None = None,
     colnumbering_dir: str | None = None,
+    divergence_drop_reasons_path: str | None = None,
     block_width: int = 60,
     show_progress: bool = False,
 ) -> dict[str, str]:
@@ -600,17 +711,32 @@ def build_alignment_pages(
     how make_tables() itself derives group_id (everything before the
     first '.' in a group's identity-report filename) — this holds for
     every alignment produced by run_aligner(), since group filenames
-    never contain literal periods.
+    never contain literal periods. This also holds for groups realigned
+    by the divergent-sequence filter (filtering.filter_divergent_
+    sequences()): its realignment input files are named with the bare
+    group_id (no extension) precisely so that re-running them through
+    run_aligner() reproduces this same '<group_id>.aln' naming with no
+    separate rename step.
 
     Args:
-        alignment_dir:      Directory of alignment files for this list
-                            (the raw aligner output — alignment_dir in
-                            cli.py's _run_single_list(), not the
-                            anchor-stripped or trimmed variant — since
-                            this is the version guaranteed to contain
-                            every group's full species set and, in the
-                            single-list/list1 case, the anchor sequence
-                            itself).
+        alignment_dir:      Directory of alignment files for this list.
+                            Callers should point this at whichever
+                            directory holds the *final* alignment used
+                            for identity estimation — i.e. if the
+                            divergent-sequence filter was enabled for
+                            this run, this should be that filter's own
+                            output directory (filtering.
+                            filter_divergent_sequences()'s filtered_dir),
+                            not the raw pre-filter alignment_dir, since
+                            rendering the raw alignment would show a
+                            since-removed sequence with no indication it
+                            was excluded from the actual score, and (for
+                            groups that were realigned) would show
+                            entirely different column positions than the
+                            alignment identity was actually computed
+                            from. If divergence filtering was not
+                            enabled, this is simply the aligner's own
+                            output directory, as before.
         tables_dir:          This list's own tables/ directory, used to
                             load group2mean.tsv (identity scores) and,
                             unless anchor_gene_lookup overrides it,
@@ -652,7 +778,25 @@ def build_alignment_pages(
                             sidecar file (e.g. trimAl produced no
                             output for a degenerate alignment) is
                             rendered without masking rather than being
-                            skipped.
+                            skipped. Column indices are relative to
+                            whatever alignment_dir points at above —
+                            i.e. the post-divergence-filter alignment,
+                            if that filter ran, since column trimming
+                            in the pipeline always runs after it.
+        divergence_drop_reasons_path: Path to the divergent-sequence
+                            filter's drop_reasons.tsv for this list (see
+                            filtering.filter_divergent_sequences()), or
+                            None if that filter was not enabled for this
+                            run. When given, groups with one or more
+                            removed sequences get a visible notice on
+                            their rendered page (see
+                            render_alignment_page()'s
+                            removed_divergent_sequences parameter) rather
+                            than silently showing only the corrected
+                            alignment with no explanation of the
+                            discrepancy from what the person might expect
+                            to see (e.g. the original group_filter
+                            sequence count).
         block_width:         Passed through to render_alignment_page().
         show_progress:       Show a tqdm progress bar.
 
@@ -675,6 +819,7 @@ def build_alignment_pages(
     anchor_lookup = anchor_gene_lookup
     if anchor_lookup is None:
         anchor_lookup = _load_group_anchor(tables_dir)
+    divergence_removed = _load_divergence_removed(divergence_drop_reasons_path)
 
     pages: dict[str, str] = {}
     n_missing_alignment = 0
@@ -709,6 +854,7 @@ def build_alignment_pages(
             anchor_species=anchor_species,
             mean_identity=mean_lookup.get(group_id),
             retained_columns=retained_columns,
+            removed_divergent_sequences=divergence_removed.get(group_id),
             block_width=block_width,
         )
         pages[group_id] = out_path
