@@ -21,6 +21,7 @@ from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .stats import aggregate_pipeline_stats, compute_differential_stats
 from .msa_viewer import build_alignment_pages, load_group_anchor
+from .provenance import collect_run_parameters, write_run_parameters
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 ALL_METRICS = ("identity", "zscore", "rank")
@@ -608,6 +609,34 @@ def main():
     except EnhydraConfigError as e:
         sys.exit("Configuration error: %s" % e)
 
+    # Snapshot of every effective (post-resolution) parameter value, for the
+    # reproducibility record written via provenance.collect_run_parameters()
+    # below. Built once, right after all _resolve()/resolve_*() calls above
+    # have settled, so it reflects exactly what this run actually used —
+    # not the raw config file contents, which a CLI flag may have silently
+    # overridden. Keys match collect_run_parameters()'s resolved_params
+    # contract exactly.
+    resolved_params_for_provenance = {
+        "min_species":          min_species,
+        "min_sequences":        min_sequences,
+        "paralogs":             paralogs,
+        "length_filter_sd":     sd_multiplier,
+        "divergence_filter_sd": divergence_filter_sd,
+        "trim":                 trim,
+        "aligner":              aligner,
+        "mafft_mode":           mafft_mode,
+        "metric":               metric,
+        "permutations":         permutations,
+        "min_size":             min_size,
+        "max_size":             max_size,
+        "seed":                 seed,
+        "fdr_threshold":        fdr_threshold,
+        "top_n":                top_n,
+        "gene_sets":            gene_sets,
+        "organism":             organism,
+        "sources":              sources,
+    }
+
     if not gene_sets and not organism:
         parser.error(
             "A gene set source is required. Set 'gene_sets' or 'organism' in "
@@ -690,6 +719,22 @@ def main():
     # ------------------------------------------------------------------ #
     if not two_list_mode:
         logger.info("Running in single-list mode.")
+
+        run_params = collect_run_parameters(
+            outdir=outdir,
+            code_config_path=args.code_config,
+            project_config_path=args.project_config,
+            command_line=sys.argv,
+            inputdir=parameters['inputdir'],
+            anchor=parameters['anchor'],
+            resolved_params=resolved_params_for_provenance,
+            two_list_mode=False,
+            orthofinder_dir=args.orthofinder_dir,
+            all_metrics=all_metrics,
+            metrics_run=metrics_to_run,
+        )
+        write_run_parameters(run_params, outdir)
+
         tables_dir, stats = _run_single_list(
             listdir=outdir,
             anchor=parameters['anchor'],
@@ -796,6 +841,7 @@ def main():
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
+                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
             )
         else:
             build_report(
@@ -809,6 +855,7 @@ def main():
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
+                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
             )
 
         for m in metrics_to_run:
@@ -836,6 +883,28 @@ def main():
             "%s: %d species. %s: %d species. Anchor: %s",
             list1_name, len(species1), list2_name, len(species2), anchor,
         )
+
+        run_params = collect_run_parameters(
+            outdir=outdir,
+            code_config_path=args.code_config,
+            project_config_path=args.project_config,
+            command_line=sys.argv,
+            inputdir=parameters['inputdir'],
+            anchor=anchor,
+            resolved_params=resolved_params_for_provenance,
+            two_list_mode=True,
+            orthofinder_dir=args.orthofinder_dir,
+            list1_path=list1_path,
+            list2_path=list2_path,
+            list1_name=list1_name,
+            list2_name=list2_name,
+            species1=species1,
+            species2=species2,
+            anchor_injected=anchor_injected,
+            all_metrics=all_metrics,
+            metrics_run=metrics_to_run,
+        )
+        write_run_parameters(run_params, outdir)
 
         logger.info("--- Processing %s ---", list1_name)
         tables_dir1, stats1 = _run_single_list(
@@ -1028,6 +1097,7 @@ def main():
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
+                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
             )
         else:
             build_report(
@@ -1048,6 +1118,7 @@ def main():
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
+                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
             )
 
         for m in metrics_to_run:

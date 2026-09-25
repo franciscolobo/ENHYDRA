@@ -15,7 +15,7 @@ aligner     = mafft         # mafft | muscle | prank
 mafft_mode  = auto          # auto | linsi | ginsi | einsi | fftnsi | fftns | nwnsi | nwns
 
 # --- Gene set enrichment ---
-gene_sets     = test_data/gmt/Apis_mellifera_GO_BP.gmt
+gene_sets     = test_data/hymenoptera/GO_annotation/Apis_mellifera_GO_BP.gmt
 min_size      = 5
 max_size      = 1000
 permutations  = 1000
