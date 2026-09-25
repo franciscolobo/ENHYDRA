@@ -13,12 +13,14 @@ Functional annotations are mapped through an **anchor genome** — a reference s
 ### Pipeline steps
 
 1. **[Optional] OrthoFinder preprocessing** — converts OrthoFinder 3 output into ENHYDRA-compatible input.
-2. **Length filtering** — sequences deviating more than 2 standard deviations from the group mean length are removed.
+2. **Length filtering** — sequences deviating more than a configurable number of standard deviations from the group mean length are removed.
 3. **Group filtering** — groups lacking the anchor species, falling below the minimum species count, or failing paralog criteria are discarded.
 4. **Alignment** — surviving groups are aligned (MAFFT/MUSCLE/PRANK).
-5. **Identity estimation** — trimAl computes per-alignment average sequence identity.
-6. **Table generation** — outputs ranked group-to-identity and anchor gene-to-identity tables.
-7. **GSEA** — GSEApy prerank is run on the ranked gene list using a local GMT file.
+5. **[Optional] Divergent sequence filtering** — sequences that are highly divergent from the rest of their group are identified and removed, and the group is realigned without them. See [Divergent sequence filtering](#divergent-sequence-filtering).
+6. **[Optional] Column trimming** — alignment columns are trimmed with trimAl before identity estimation.
+7. **Identity estimation** — trimAl computes per-alignment average sequence identity.
+8. **Table generation** — outputs ranked group-to-identity and anchor gene-to-identity tables.
+9. **GSEA** — GSEApy prerank is run on the ranked gene list using a local GMT file.
 
 ---
 
@@ -35,7 +37,7 @@ Functional annotations are mapped through an **anchor genome** — a reference s
 | [MAFFT](https://mafft.cbrc.jp/alignment/software/) | Multiple sequence alignment |
 | [MUSCLE5](https://drive5.com/muscle/) | Multiple sequence alignment |
 | [PRANK](http://wasabiapp.org/software/prank/) | Multiple sequence alignment |
-| [trimAl](http://trimal.cgenomics.org/) | Alignment identity computation |
+| [trimAl](http://trimal.cgenomics.org/) | Alignment identity computation, column trimming, and divergent sequence detection |
 
 Install Python dependencies:
 
@@ -146,6 +148,8 @@ max_process = 8
 | `inputdir` | Directory containing input FASTA files (one per homolog group) |
 | `outdir` | Output directory (must not already exist unless `--resume` is used) |
 | `min_species` | Minimum number of distinct species required to retain a group |
+| `length_filter_sd` | Number of standard deviations from a group's mean sequence length beyond which a sequence is removed (default: 2.0) |
+| `divergence_filter_sd` | Number of standard deviations below a group's mean identity-to-closest-match (trimAl `-sident`) beyond which a sequence is removed as divergent. Empty by default (filter disabled). See [Divergent sequence filtering](#divergent-sequence-filtering) |
 | `aligner` | Alignment tool to use: `mafft` (default), `muscle`, or `prank` |
 | `anchor` | Species ID of the anchor genome used for annotation mapping |
 | `max_process` | Number of parallel processes for alignment and length filtering |
@@ -236,26 +240,17 @@ enhydra code_config project_config --gene-sets gmt/NC_004431_GO_BP.gmt \
     --paralogs longest
 ```
 
-### Two-list differential mode
+### Removing highly divergent sequences
 
 ```bash
-enhydra code_config project_config \
-    --gene-sets gmt/NC_004431_GO_BP.gmt \
-    --list1 pathogenic.txt \
-    --list2 non_pathogenic.txt \
-    --metric zscore
+enhydra code_config project_config --gene-sets gmt/NC_004431_GO_BP.gmt \
+    --divergence-filter-sd 2.0
 ```
 
-Combine with `--all-metrics` to run differential GSEA for all three metrics
-at once:
-
-```bash
-enhydra code_config project_config \
-    --gene-sets gmt/NC_004431_GO_BP.gmt \
-    --list1 pathogenic.txt \
-    --list2 non_pathogenic.txt \
-    --all-metrics
-```
+Removes sequences whose identity to their closest match falls more than
+2 standard deviations below their group's mean, then realigns the group
+without them. See [Divergent sequence filtering](#divergent-sequence-filtering)
+for details. Disabled by default.
 
 ### Full options
 
@@ -280,6 +275,23 @@ options:
                         enhydra.log.
   --paralogs {all,remove,longest}
                         How to handle paralogs (default: all).
+  --min-species         Minimum number of distinct species required to
+                        retain a group (default: 4, or the value of
+                        min_species in the project config).
+  --length-filter-sd    Number of standard deviations from a group's mean
+                        sequence length beyond which a sequence is removed
+                        (default: 2.0, or the value of length_filter_sd in
+                        the project config).
+  --divergence-filter-sd
+                        Remove sequences whose identity to their closest
+                        match (trimAl -sident) falls more than this many
+                        standard deviations below their group's mean, then
+                        realign the group without them. Disabled by default.
+                        See Divergent sequence filtering below.
+  --trim                Trim alignment columns with trimAl before identity
+                        estimation. Accepts a number between 0 and 1 (used
+                        as trimAl's -gt gap threshold), or one of: strict,
+                        strictplus, automated. Disabled by default.
   --gene-sets           Path to a local .gmt file.
   --organism            g:Profiler organism name (alternative to --gene-sets).
   --sources             g:Profiler data sources (default: GO:BP GO:MF GO:CC KEGG REAC).
@@ -316,6 +328,10 @@ outdir/
 ├── length_filter/
 ├── group_filter/
 ├── alignment/
+├── divergence_sident/                    (only if divergence_filter_sd is set)
+├── alignment_divergence_filtered/        (only if divergence_filter_sd is set)
+├── divergence_realign_input/             (only if divergence_filter_sd is set)
+├── divergence_filter_stats/              (only if divergence_filter_sd is set)
 ├── ident_alignment/
 ├── tables/
 │   ├── group2mean.tsv
@@ -326,6 +342,8 @@ outdir/
 ├── plots/
 │   ├── identity_distribution.png
 │   └── gsea_barplot.png/.svg
+├── alignments/
+│   └── <group_id>.html                   (per-group alignment viewer pages)
 └── report.html
 ```
 
@@ -342,6 +360,7 @@ outdir/
 ├── length_filter/
 ├── group_filter/
 ├── alignment/
+├── alignment_divergence_filtered/   (only if divergence_filter_sd is set)
 ├── ident_alignment/
 ├── tables/
 ├── enrichment_identity/   enrichment_zscore/   enrichment_rank/
@@ -362,6 +381,11 @@ outdir/
 │   └── report.html
 └── enhydra.log
 ```
+
+Each of `list1/` and `list2/` follows the same per-list layout shown above
+(`length_filter/`, `group_filter/`, `alignment/`, and — if
+`divergence_filter_sd` is set — `alignment_divergence_filtered/` and
+`divergence_filter_stats/`, etc.), independently for each list.
 
 With `--all-metrics` the `differential/` directory is replaced by
 `differential_identity/`, `differential_zscore/`, and `differential_rank/`,
@@ -404,6 +428,19 @@ filtering and clickable GO IDs that open individual enrichment plots. When
 generated with `--all-metrics`, the report presents results for all three
 metrics in separate tabs so they can be compared side by side.
 
+The report also includes:
+
+- An **Alignments** tab, showing a rendered, colour-coded alignment page for
+  every orthogroup that fed GSEA, nested by GO term. If a group had a
+  sequence removed by the divergence filter, its page shows the corrected
+  (realigned) alignment along with a notice identifying which sequence was
+  removed and its identity-to-closest-match value.
+- A **Filtering summary** tab, showing a funnel of how many groups survived
+  each pipeline stage and a breakdown of why groups or sequences were
+  dropped at each step, with links to the affected group/sequence IDs. If
+  `--divergence-filter-sd` was used, this includes the number of groups
+  affected and sequences removed by that step.
+
 ---
 
 ## Ranking metrics
@@ -420,6 +457,47 @@ together with `--all-metrics`:
 All three metrics rank genes such that the most conserved appear at the top
 of the GSEA input list, consistent with a positive NES indicating functional
 conservation.
+
+---
+
+## Divergent sequence filtering
+
+A single highly divergent sequence in an otherwise well-conserved homolog
+group can distort that group's mean identity score — the exact metric
+ENHYDRA ranks orthogroups by — even though the divergence may reflect a
+misannotation, a paralog mistakenly grouped with true orthologs, or one
+fast-evolving lineage dominating an otherwise conserved group's score.
+
+When `divergence_filter_sd` (or `--divergence-filter-sd`) is set, ENHYDRA
+runs trimAl's `-sident` analysis on each alignment and examines every
+sequence's identity to its single closest match in the group. A sequence is
+flagged and removed if this value falls more than `divergence_filter_sd`
+standard deviations below the group's own mean. Because removing a sequence
+invalidates the existing alignment for the survivors — the divergent
+sequence often forces spurious gap placement elsewhere — the remaining
+sequences are **realigned from scratch** rather than simply deleted from the
+existing alignment, and identity is then computed on the corrected
+alignment.
+
+Notes:
+
+- Groups with fewer sequences than `min_species` are exempt from this
+  check: with too few sequences, a single outlier can drag the group's own
+  mean and SD enough to escape detection (the same limitation that applies
+  to the length filter — see below).
+- If removing the flagged sequence(s) would leave a group below
+  `min_species` or `min_sequences`, the entire group is dropped rather than
+  kept with too few members.
+- This is a single-pass filter: each group is checked once, pruned at most
+  once, and realigned at most once. It does not iterate to re-check the
+  realigned result for further outliers.
+- The anchor species itself is eligible for removal if it is the divergent
+  outlier; in that case the group survives (with its identity recomputed
+  from the remaining species) but is excluded from `anchor2mean.tsv` for
+  that run.
+- Disabled by default. Recommended when input orthogroups may contain
+  misannotated, mis-clustered, or unusually fast-evolving sequences (e.g.
+  automatically generated OrthoFinder groups on divergent taxa).
 
 ---
 
