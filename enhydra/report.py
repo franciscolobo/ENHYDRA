@@ -1,5 +1,6 @@
 from __future__ import annotations
 from .io import parse_obo_names as _parse_obo_names
+from .filtering import display_group_id
 
 import json
 import os
@@ -46,11 +47,12 @@ _METRIC_DESCS = {
 # Unified report template — one tab shell used for every report, regardless
 # of how many ranking metrics were run. A single-metric report simply has
 # one metric tab plus the Alignments and Filtering summary tabs; a
-# multi-metric report has three metric tabs plus the same two. This
-# replaces what used to be two separate templates (a flat non-tabbed layout
-# for single-metric reports, and a tabbed layout for multi-metric reports)
-# — they had been drifting into near-duplicates anyway, and the Filtering
-# summary / Alignments tabs need to appear in both cases.
+# multi-metric report has three metric tabs, a Cross-metric consensus tab,
+# plus the same two. This replaces what used to be two separate templates
+# (a flat non-tabbed layout for single-metric reports, and a tabbed layout
+# for multi-metric reports) — they had been drifting into near-duplicates
+# anyway, and the Filtering summary / Alignments tabs need to appear in
+# both cases.
 # ---------------------------------------------------------------------------
 
 _TEMPLATE = """\
@@ -222,6 +224,13 @@ var dtInstances        = {{}};
 var colFiltersMap      = {{}};
 var sigOnlyMap         = {{}};
 var sigColIndexMap     = {{}};
+// Per-table default initial sort override. Tables not listed here keep the
+// historical default of sorting by column index 4 ascending (FDR, for the
+// per-metric enrichment tables' fixed column layout). The consensus table
+// has a different column shape and is already pre-sorted server-side (by
+// number of metrics in agreement, descending), so it opts out of any
+// client-side re-sort on load by specifying an empty order array.
+var defaultOrderMap    = {{ consensus: [] }};
 
 function getHeaderIndex(tableSelector, name) {{
     var headers = [];
@@ -265,8 +274,10 @@ function initTable(metric) {{
     colFiltersMap[metric] = {{}};
     sigOnlyMap[metric]    = false;
     var numericCols = numericColsMap[metric] || [];
+    var order = defaultOrderMap.hasOwnProperty(metric)
+        ? defaultOrderMap[metric] : [[4, 'asc']];
     var dt = $('#results-table-' + metric).DataTable({{
-        pageLength: 25, orderCellsTop: true, order: [[4, 'asc']],
+        pageLength: 25, orderCellsTop: true, order: order,
         columnDefs: [{{ targets: numericCols, type: 'num' }}],
     }});
     sigColIndexMap[metric] = getHeaderIndex('#results-table-' + metric, 'Sig.');
@@ -1147,8 +1158,8 @@ def _build_alignment_tree_html(
                 '%s'
                 '<span class="aln-tree-links">%s</span>'
                 "</div>"
-                % (search_key, html.escape(group_id), html.escape(gene_id),
-                   score_html, links)
+                % (search_key, html.escape(display_group_id(group_id)),
+                   html.escape(gene_id), score_html, links)
             )
         term_search_key = html.escape(("%s %s" % (term_id, term_name)).lower())
         blocks.append(
@@ -1263,7 +1274,7 @@ def _gene_chip_list_html(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers (GMT / GSEA results / enrichment table — unchanged)
+# Internal helpers (GMT / GSEA results / enrichment table)
 # ---------------------------------------------------------------------------
 
 def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
@@ -1708,6 +1719,166 @@ def _results_table_html(
             full_sets_html_js, leadedge_html_js)
 
 
+def _build_consensus_table_html(
+    metric_dfs: dict[str, pd.DataFrame],
+    obo_names: dict[str, str],
+    fdr_threshold: float,
+    enrichment_plots_map: dict[str, dict[str, str]],
+) -> tuple[str, list[int] | None]:
+    """Build the Cross-metric consensus table for --all-metrics reports.
+
+    A gene set qualifies for inclusion if it is significant
+    (FDR < fdr_threshold) in a *majority* of the ranking metrics given in
+    metric_dfs — for the standard 3-metric --all-metrics run this means 2
+    of 3, not requiring unanimous 3/3 agreement. This directly matches the
+    intent of a consensus view: surfacing results that hold up under more
+    than one arbitrary choice of ranking metric, without demanding
+    unrealistic universal agreement.
+
+    Beyond the raw significance count, each qualifying row's direction is
+    also checked: among the metrics where it is significant, do they agree
+    on the *sign* of NES (positive = more conserved, negative = faster
+    evolving)? A gene set significant in two metrics with opposite-signed
+    NES is not a genuine consensus finding — it is contradictory — so this
+    is surfaced explicitly as 'Mixed direction' rather than silently
+    lumped in with genuine agreement.
+
+    Deliberately excludes the "Full gene set" / "Leading edge" columns
+    present in the per-metric enrichment tables: this view is meant to be
+    a compact cross-check, and that level of per-gene detail remains one
+    click away in each qualifying gene set's own metric-specific tab.
+
+    Args:
+        metric_dfs:  {metric: DataFrame} with at least 'Term', 'NES', and
+                    'FDR q-val' columns (numeric dtypes, not yet
+                    stringified — this must be called with data captured
+                    before _results_table_html()'s own formatting pass).
+                    Only metrics with a non-None GSEA result are expected
+                    to be included; the caller is responsible for that
+                    filtering (see _build_report_impl()).
+        obo_names:   {term_id: term_name}, for display alongside each GO ID.
+        fdr_threshold: Significance cutoff applied per metric.
+        enrichment_plots_map: {metric: {go_id: plot_path}}, used to make a
+                    qualifying gene set's per-metric NES cell clickable
+                    (reusing the existing .go-link modal) when that
+                    metric's own enrichment plot exists for that term.
+
+    Returns:
+        Tuple of (html, numeric_col_indices). If no gene set reaches
+        majority significance, html is an explanatory <p> message and
+        numeric_col_indices is None — callers should treat a None second
+        element as "do not register this table with the DataTables JS",
+        since no <table> element is present in that case.
+    """
+    metrics   = list(metric_dfs.keys())
+    n_metrics = len(metrics)
+    majority  = n_metrics // 2 + 1
+
+    term_data: dict[str, dict[str, tuple[float, float]]] = {}
+    for metric, df in metric_dfs.items():
+        for _, row in df.iterrows():
+            term = row.get("Term")
+            nes, fdr = row.get("NES"), row.get("FDR q-val")
+            if term is None or pd.isna(nes) or pd.isna(fdr):
+                continue
+            term_data.setdefault(term, {})[metric] = (float(nes), float(fdr))
+
+    rows_data: list[tuple[str, dict, int, str]] = []
+    for term, per_metric in term_data.items():
+        sig_metrics = [
+            m for m in metrics
+            if m in per_metric and per_metric[m][1] < fdr_threshold
+        ]
+        n_sig = len(sig_metrics)
+        if n_sig < majority:
+            continue
+        signs = {(1 if per_metric[m][0] > 0 else -1) for m in sig_metrics}
+        if len(signs) == 1:
+            direction = "Conserved" if next(iter(signs)) > 0 else "Faster-evolving"
+        else:
+            direction = "Mixed direction"
+        rows_data.append((term, per_metric, n_sig, direction))
+
+    if not rows_data:
+        return (
+            "<p>No gene sets reached majority significance "
+            "(significant in \u2265 %d of %d ranking metrics at "
+            "FDR &lt; %.2f) for this run.</p>"
+            % (majority, n_metrics, fdr_threshold)
+        ), None
+
+    # Full agreement first, then by term ID for a stable secondary order.
+    rows_data.sort(key=lambda r: (-r[2], r[0]))
+
+    headers  = ["GO ID", "Term name"]
+    tooltips = [
+        "Gene Ontology term identifier.",
+        "Human-readable name of the GO term.",
+    ]
+    for m in metrics:
+        label = METRIC_LABELS.get(m, m.capitalize())
+        headers += ["%s NES" % label, "%s FDR" % label]
+        tooltips += [
+            "Normalised Enrichment Score under the %s ranking metric." % label,
+            "FDR q-value under the %s ranking metric (bold if significant, "
+            "FDR < %.2f)." % (label, fdr_threshold),
+        ]
+    headers += ["Significant in", "Direction"]
+    tooltips += [
+        "Number of ranking metrics (out of %d run) in which this gene set "
+        "was significant." % n_metrics,
+        "Whether the sign of enrichment (conserved vs. faster-evolving) "
+        "agrees across the metrics in which this gene set was significant.",
+    ]
+
+    numeric_col_indices = [
+        i for i, h in enumerate(headers)
+        if h.endswith("NES") or h.endswith("FDR")
+    ]
+
+    header_cells = "".join(
+        '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
+        % (h, t) for h, t in zip(headers, tooltips)
+    )
+    filter_cells = "<th></th>" * len(headers)
+
+    body_rows = []
+    for term, per_metric, n_sig, direction in rows_data:
+        term_name = obo_names.get(term, term)
+        row_cells = "<td>%s</td><td>%s</td>" % (
+            html.escape(term), html.escape(term_name),
+        )
+        for m in metrics:
+            if m in per_metric:
+                nes, fdr = per_metric[m]
+                is_sig  = fdr < fdr_threshold
+                nes_str = "%.4f" % nes
+                fdr_str = "%.4f" % fdr
+                if enrichment_plots_map.get(m, {}).get(term):
+                    nes_cell = (
+                        '<a href="#" class="go-link" data-goid="%s" '
+                        'data-metric="%s">%s</a>' % (term, m, nes_str)
+                    )
+                else:
+                    nes_cell = nes_str
+                fdr_cell = ("<strong>%s</strong>" % fdr_str) if is_sig else fdr_str
+                row_cells += "<td>%s</td><td>%s</td>" % (nes_cell, fdr_cell)
+            else:
+                row_cells += "<td>\u2014</td><td>\u2014</td>"
+        row_cells += "<td>%d / %d</td><td>%s</td>" % (n_sig, n_metrics, direction)
+        row_class = ' class="sig-row"' if n_sig == n_metrics else ""
+        body_rows.append("<tr%s>%s</tr>" % (row_class, row_cells))
+
+    table_html = (
+        '<table id="results-table-consensus" class="display compact" '
+        'style="width:100%%">'
+        '<thead><tr>%s</tr><tr class="filter-row">%s</tr></thead>'
+        "<tbody>%s</tbody></table>"
+    ) % (header_cells, filter_cells, "".join(body_rows))
+
+    return table_html, numeric_col_indices
+
+
 def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
     html_content = ""
     for stem, caption in names:
@@ -1799,6 +1970,13 @@ def _build_report_impl(
     leading_edge_map      = {}
     full_gene_sets_html_accum = {}
     leading_edge_html_map     = {}
+    # Raw (still-numeric) per-metric GSEA result frames, captured purely to
+    # feed the cross-metric consensus tab below — kept separate from the
+    # `df` variable inside the loop, which gets progressively mutated
+    # in-place-by-rebinding (augmented with per-term scores, then stringified
+    # inside _results_table_html()'s own internal copy) for that metric's
+    # own results table.
+    metric_raw_dfs: dict[str, pd.DataFrame] = {}
     first = True
     for metric, paths in metric_data.items():
         label       = METRIC_LABELS.get(metric, metric.capitalize())
@@ -1814,6 +1992,7 @@ def _build_report_impl(
         enrichment_plots_map[metric] = plot_idx
         df = _load_gsea_results(results_dir)
         if df is not None:
+            metric_raw_dfs[metric] = df[["Term", "NES", "FDR q-val"]].copy()
             df = _augment_with_per_term_scores(
                 df, effective_gmt, tables_dir1, tables_dir2, metric
             )
@@ -1861,10 +2040,53 @@ def _build_report_impl(
         )
         first = False
 
-    # Alignments tab — appended after the metric tabs, before Filtering
-    # summary. Built from list1's (or the single list's) group2anchor.tsv
-    # plus whichever groups actually received a rendered alignment page;
-    # see _build_alignment_tree_html() for the full membership rules.
+    # Cross-metric consensus tab — only meaningful with 2+ metrics that
+    # each produced usable GSEA results (i.e. an --all-metrics run; a
+    # single-metric report has nothing to be consensus about). Surfaces
+    # gene sets significant in a majority of the ranking metrics run, so a
+    # result can be trusted as more than an artifact of one particular
+    # ranking choice (identity vs. zscore vs. rank). See
+    # _build_consensus_table_html() for the full significance/direction
+    # rules.
+    if len(metric_raw_dfs) >= 2:
+        consensus_html, consensus_numeric_cols = _build_consensus_table_html(
+            metric_dfs=metric_raw_dfs,
+            obo_names=term_names,
+            fdr_threshold=fdr_threshold,
+            enrichment_plots_map=enrichment_plots_map,
+        )
+        tab_buttons_parts.append(
+            '    <button class="tab-btn" data-metric="consensus" '
+            'role="tab" aria-controls="tab-consensus">Cross-metric consensus</button>'
+        )
+        if consensus_numeric_cols is not None:
+            numeric_cols_map["consensus"] = consensus_numeric_cols
+        n_metrics_run = len(metric_raw_dfs)
+        majority_n    = n_metrics_run // 2 + 1
+        tab_panels_parts.append(
+            '<div id="tab-consensus" class="tab-panel" role="tabpanel">\n'
+            '  <p class="metric-desc">Gene sets reaching significance '
+            '(FDR&nbsp;&lt;&nbsp;{fdr}) in at least {maj} of the {n} ranking '
+            'metrics run. Rows highlighted in blue are significant across '
+            'all {n} metrics. "Direction" reports whether the sign of '
+            'enrichment (conserved vs. faster-evolving) agrees across the '
+            'metrics in which the gene set was significant \u2014 "Mixed '
+            'direction" means the metrics disagree and the result should be '
+            'treated with caution rather than as consensus support. Full '
+            'per-gene detail for any of these gene sets remains available '
+            'in that metric\u2019s own tab.</p>\n'
+            '  {tbl}\n'
+            '</div>\n'.format(
+                fdr=fdr_threshold, maj=majority_n, n=n_metrics_run,
+                tbl=consensus_html,
+            )
+        )
+
+    # Alignments tab — appended after the metric tabs (and the consensus
+    # tab, if present), before Filtering summary. Built from list1's (or
+    # the single list's) group2anchor.tsv plus whichever groups actually
+    # received a rendered alignment page; see _build_alignment_tree_html()
+    # for the full membership rules.
     tab_buttons_parts.append(
         '    <button class="tab-btn" data-metric="alignments" '
         'role="tab" aria-controls="tab-alignments">Alignments</button>'
@@ -1960,7 +2182,9 @@ def build_report(
 
     Thin wrapper around _build_report_impl() with a one-entry metric_data
     dict, so single-metric and multi-metric reports share one implementation
-    and one visual shell.
+    and one visual shell. With only one metric, _build_report_impl() never
+    builds a Cross-metric consensus tab (that requires 2+ metrics), so
+    single-metric reports are unaffected by that feature.
     """
     metric_data = {metric: {"results_dir": results_dir, "plots_dir": plots_dir}}
     _build_report_impl(
@@ -1996,8 +2220,8 @@ def build_multi_metric_report(
     alignment_pages2: dict[str, str] | None = None,
 ):
     """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
-    including the Alignments and Filtering summary tabs appended after the
-    metric tabs.
+    including the Cross-metric consensus, Alignments, and Filtering summary
+    tabs appended after the per-metric tabs.
     """
     _build_report_impl(
         metric_data=metric_data, report_path=report_path, obo_path=obo_path,

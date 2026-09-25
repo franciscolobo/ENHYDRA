@@ -10,6 +10,8 @@ from collections import Counter
 from Bio import SeqIO
 from tqdm import tqdm
 
+from .filtering import display_group_id
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -391,6 +393,7 @@ def render_alignment_page(
     mean_identity: float | None = None,
     retained_columns: set[int] | None = None,
     removed_divergent_sequences: list[tuple[str, float]] | None = None,
+    removed_length_filtered_sequences: list[tuple[str, int, float, str]] | None = None,
     block_width: int = 60,
 ) -> None:
     """Render a static, self-contained HTML page for one alignment.
@@ -429,6 +432,12 @@ def render_alignment_page(
     only used to surface a textual notice of what was removed, not to
     render the removed sequence's row.
 
+    removed_length_filtered_sequences is handled the same textual-notice
+    way, for a different reason: length filtering runs before alignment
+    even happens, so a sequence removed there was never part of any
+    alignment in the first place — there is no row to mask or overlay,
+    only a fact to disclose.
+
     If anchor_species is given, the first record whose ID's species
     field (text before '|') matches it is moved to the top of the
     alignment as a pinned reference row; this only applies to
@@ -445,8 +454,16 @@ def render_alignment_page(
     redundantly check for it.
 
     Args:
-        group_id:         Orthogroup identifier, used in the page title
-                          and metadata panel.
+        group_id:         Orthogroup identifier as used internally by the
+                          pipeline, and as the key build_alignment_pages()
+                          uses to look up this group's alignment, table,
+                          and colnumbering files. This may carry a
+                          pipeline-stage suffix such as '_lengthfilter'
+                          (see filtering.display_group_id()) that is not
+                          part of the group's real, user-facing name. The
+                          page's title and 'Group ID' metadata row show
+                          the stripped display form instead — the raw
+                          value passed here is never shown directly.
         records:          List of (sequence_id, aligned_sequence) tuples.
                           sequence_id is expected in 'species|gene_id'
                           form (ENHYDRA's convention) so the species
@@ -480,6 +497,19 @@ def render_alignment_page(
                           the banner entirely (e.g. divergence filtering
                           was not enabled for this run, or this
                           particular group was unaffected).
+        removed_length_filtered_sequences: List of (sequence_id, length,
+                          pct_diff_from_avg, reason) tuples for sequences
+                          removed from this group by the length filter
+                          (filtering.filter_length()) before alignment
+                          — reason is 'removed_below_min' or
+                          'removed_above_max'. When non-empty, a separate
+                          warning banner lists each removed sequence,
+                          its length, and how it compared to the group's
+                          mean length at that stage. Unlike the
+                          divergent-sequence notice, this never implies
+                          realignment — these sequences were excluded
+                          before any alignment was attempted. None or an
+                          empty list omits the banner entirely.
         block_width:      Number of alignment columns rendered per
                           visual block (default: 60).
 
@@ -493,6 +523,12 @@ def render_alignment_page(
             "records must not be empty (group '%s' has no sequences to "
             "render)." % group_id
         )
+
+    # group_id is the internal, file-correlation form (see the Args note
+    # above) — disp_id is what actually gets shown to a person reading
+    # this page. Computed once here rather than at each of the two call
+    # sites below so both stay in sync automatically if either changes.
+    disp_id = display_group_id(group_id)
 
     seqs = [seq for _, seq in records]
     identities, entropies = compute_column_stats(seqs)
@@ -519,6 +555,27 @@ def render_alignment_page(
                 'original order.</div>' % html.escape(anchor_species)
             )
 
+    if removed_length_filtered_sequences:
+        _reason_labels = {
+            "removed_below_min": "too short",
+            "removed_above_max": "too long",
+        }
+        items = "".join(
+            "<li>%s \u2014 length %d (%s; %.2f\u00d7 the group's mean "
+            "length at that step)</li>"
+            % (html.escape(seq_id), length, _reason_labels.get(reason, reason),
+               pct_diff)
+            for seq_id, length, pct_diff, reason in removed_length_filtered_sequences
+        )
+        warnings.append(
+            '<div class="warning">%d sequence(s) were removed from this '
+            'group by the length filter before alignment (their length '
+            'deviated too far from the group mean at that stage), and '
+            'never appear in the alignment shown below:'
+            '<ul>%s</ul></div>'
+            % (len(removed_length_filtered_sequences), items)
+        )
+
     if removed_divergent_sequences:
         items = "".join(
             "<li>%s (identity to closest match: %.4f)</li>"
@@ -540,7 +597,7 @@ def render_alignment_page(
         n_masked = width - len([i for i in range(width) if i in retained_columns])
 
     meta_rows = [
-        ("Group ID", html.escape(group_id)),
+        ("Group ID", html.escape(disp_id)),
         ("Sequences", str(len(records))),
         ("Alignment length", "%d columns" % width),
     ]
@@ -556,6 +613,12 @@ def render_alignment_page(
         meta_rows.append((
             "Trimmed columns",
             "%d of %d removed by trimAl (shown masked below)" % (n_masked, width),
+        ))
+    if removed_length_filtered_sequences:
+        meta_rows.append((
+            "Length-filtered sequences",
+            "%d (see notice above; excluded before alignment)"
+            % len(removed_length_filtered_sequences),
         ))
     if removed_divergent_sequences:
         meta_rows.append((
@@ -574,7 +637,7 @@ def render_alignment_page(
     )
 
     html_content = _PAGE_TEMPLATE.format(
-        title="Alignment: %s" % html.escape(group_id),
+        title="Alignment: %s" % html.escape(disp_id),
         meta_html=meta_html,
         warning_html=warning_html,
         legend_html=_LEGEND_HTML,
@@ -693,6 +756,84 @@ def _load_divergence_removed(
     return result
 
 
+_LENGTH_FILTER_REMOVAL_REASONS = frozenset({
+    "removed_below_min", "removed_above_max",
+})
+
+
+def _load_length_filter_removed(
+    path: str | None,
+) -> dict[str, list[tuple[str, int, float, str]]]:
+    """Load the length filter's drop_reasons.tsv into per-group removal lists.
+
+    Unlike the divergence filter, length filtering is not optional — it
+    always runs, and aggregate_length_filter_stats() always writes this
+    file unconditionally (even if empty of rows) — so, unlike
+    _load_divergence_removed(), callers do not need to treat a missing
+    path as "step didn't run"; it is simply "nothing to report" either
+    way. path is still accepted as None/missing defensively (e.g. a
+    directory layout from an older run), in which case this returns an
+    empty dict exactly as it would for a file with zero drop rows.
+
+    Only rows whose reason is one of 'removed_below_min' or
+    'removed_above_max' are included (filtering.filter_length()'s other
+    possible reasons — 'empty_file', 'single_sequence' — describe a group
+    skipped entirely before any alignment was attempted, and are recorded
+    in a separate skipped_groups.tsv, not this file; such a group has no
+    alignment page to annotate in the first place).
+
+    Args:
+        path: Path to length_filter_stats/drop_reasons.tsv (as written by
+             filtering.aggregate_length_filter_stats()), or None.
+
+    Returns:
+        Dict mapping group_id to a list of (sequence_id, length,
+        pct_diff_from_avg, reason) tuples, where pct_diff_from_avg
+        follows the same value/mean ratio convention used throughout
+        this codebase's other drop-reasons files (e.g. the divergence
+        filter's own pct_diff_from_avg column) — a ratio around 1.0, not
+        a percentage. Empty dict if path is None, the file does not
+        exist, or its header is missing any expected column.
+    """
+    if not path or not os.path.isfile(path):
+        return {}
+
+    result: dict[str, list[tuple[str, int, float, str]]] = {}
+    with open(path) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        try:
+            group_idx    = header.index("group_id")
+            seq_idx      = header.index("sequence_id")
+            length_idx   = header.index("length")
+            pct_diff_idx = header.index("pct_diff_from_avg")
+            reason_idx   = header.index("reason")
+        except ValueError:
+            logger.warning(
+                "Length filter drop-reasons file has an unexpected header "
+                "— skipping removal notices in alignment pages: %s", path,
+            )
+            return {}
+
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) <= max(group_idx, seq_idx, length_idx,
+                                  pct_diff_idx, reason_idx):
+                continue
+            reason = fields[reason_idx]
+            if reason not in _LENGTH_FILTER_REMOVAL_REASONS:
+                continue
+            try:
+                length   = int(float(fields[length_idx]))
+                pct_diff = float(fields[pct_diff_idx])
+            except ValueError:
+                continue
+            result.setdefault(fields[group_idx], []).append(
+                (fields[seq_idx], length, pct_diff, reason)
+            )
+
+    return result
+
+
 def build_alignment_pages(
     alignment_dir: str,
     tables_dir: str,
@@ -702,6 +843,7 @@ def build_alignment_pages(
     anchor_gene_lookup: dict[str, str] | None = None,
     colnumbering_dir: str | None = None,
     divergence_drop_reasons_path: str | None = None,
+    length_filter_drop_reasons_path: str | None = None,
     block_width: int = 60,
     show_progress: bool = False,
 ) -> dict[str, str]:
@@ -797,6 +939,24 @@ def build_alignment_pages(
                             discrepancy from what the person might expect
                             to see (e.g. the original group_filter
                             sequence count).
+        length_filter_drop_reasons_path: Path to the length filter's own
+                            aggregated drop_reasons.tsv (see filtering.
+                            aggregate_length_filter_stats()) for this
+                            list. Unlike divergence_drop_reasons_path,
+                            this step always runs, so this path is
+                            expected to be given on every call in
+                            practice — passed as None only degrades
+                            gracefully (no notice shown), it does not
+                            indicate anything about whether length
+                            filtering itself ran. When given, groups with
+                            one or more sequences removed at that stage
+                            get a separate visible notice (see
+                            render_alignment_page()'s
+                            removed_length_filtered_sequences parameter)
+                            distinct from the divergence-filter notice,
+                            since these sequences were excluded before
+                            alignment even began and never implied any
+                            realignment.
         block_width:         Passed through to render_alignment_page().
         show_progress:       Show a tqdm progress bar.
 
@@ -820,6 +980,9 @@ def build_alignment_pages(
     if anchor_lookup is None:
         anchor_lookup = _load_group_anchor(tables_dir)
     divergence_removed = _load_divergence_removed(divergence_drop_reasons_path)
+    length_filter_removed = _load_length_filter_removed(
+        length_filter_drop_reasons_path
+    )
 
     pages: dict[str, str] = {}
     n_missing_alignment = 0
@@ -855,6 +1018,7 @@ def build_alignment_pages(
             mean_identity=mean_lookup.get(group_id),
             retained_columns=retained_columns,
             removed_divergent_sequences=divergence_removed.get(group_id),
+            removed_length_filtered_sequences=length_filter_removed.get(group_id),
             block_width=block_width,
         )
         pages[group_id] = out_path

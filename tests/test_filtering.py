@@ -13,6 +13,7 @@ from enhydra.filtering import (
     parse_sident_most_similar,
     detect_divergent_sequences,
     filter_divergent_sequences,
+    display_group_id,
 )
 
 
@@ -377,9 +378,54 @@ class TestFilterLengthStats:
 
         _, drop_rows = self._read_tsv(agg_dir / "drop_reasons.tsv")
         assert len(drop_rows) == 1
-        assert drop_rows[0][0] == "OG0003"
+        # group_id must carry the '_lengthfilter' suffix — this is the
+        # exact filename filter_length() wrote to length_filter_dir for
+        # this group, which every downstream stage (group_filter,
+        # alignment, tables, and therefore alignment page IDs) derives
+        # its own group_id from. See
+        # test_drop_reasons_group_id_matches_length_filter_dir_filename
+        # below for the stronger, filename-derived version of this check.
+        assert drop_rows[0][0] == "OG0003_lengthfilter"
         assert drop_rows[0][1] == "sp99|g99"
         assert drop_rows[0][4] == "removed_above_max"
+
+    def test_drop_reasons_group_id_matches_length_filter_dir_filename(self, tmp_path):
+        """The group_id recorded in drop_reasons.tsv must exactly match the
+        actual filename filter_length() wrote to length_filter_dir for that
+        group — the filename every downstream pipeline stage (group_filter,
+        alignment, make_tables, and therefore the alignment-page IDs used
+        by msa_viewer.build_alignment_pages()) derives its own group_id
+        from. A prior version of aggregate_length_filter_stats() stripped
+        this suffix back off, silently breaking that correlation (see
+        commit notes): a length-filter removal notice on an alignment page
+        would never appear, since the group_id used to look it up never
+        matched the group_id used to store it.
+
+        This test derives its expectation directly from the real on-disk
+        filename rather than hardcoding the '_lengthfilter' suffix, so it
+        stays correct even if that naming convention ever changes, as long
+        as it changes consistently across the pipeline.
+        """
+        input_dir  = tmp_path / "input"
+        stats_dir  = tmp_path / "stats"
+        filter_dir = tmp_path / "filter"
+        agg_dir    = tmp_path / "length_filter_stats"
+        input_dir.mkdir(); stats_dir.mkdir(); filter_dir.mkdir()
+
+        entries = [("sp%d|g%d" % (i, i), "A" * 100) for i in range(10)]
+        entries.append(("sp99|g99", "A" * 400))
+        _write_fasta(str(input_dir / "OG0003"), entries)
+
+        filter_length(str(input_dir / "OG0003"), str(stats_dir), str(filter_dir))
+        aggregate_length_filter_stats(str(stats_dir), str(agg_dir))
+
+        filter_dir_files = os.listdir(str(filter_dir))
+        assert len(filter_dir_files) == 1
+        actual_downstream_group_id = filter_dir_files[0]
+
+        _, drop_rows = self._read_tsv(agg_dir / "drop_reasons.tsv")
+        assert len(drop_rows) == 1
+        assert drop_rows[0][0] == actual_downstream_group_id
 
     def test_aggregate_with_no_stats_files_writes_empty_tables(self, tmp_path):
         stats_dir = tmp_path / "stats"
@@ -856,3 +902,49 @@ class TestFilterDivergentSequences:
         )
         assert isinstance(dropped, set)
         assert dropped == {"OG0001"}
+
+
+# ---------------------------------------------------------------------------
+# display_group_id
+# ---------------------------------------------------------------------------
+
+class TestDisplayGroupId:
+
+    def test_strips_lengthfilter_suffix(self):
+        assert display_group_id("OG0001_lengthfilter") == "OG0001"
+
+    def test_no_suffix_returned_unchanged(self):
+        """A group_id that never carried the suffix (e.g. one recorded in
+        skipped_groups.tsv, which never reaches length_filter_dir) must be
+        returned exactly as given."""
+        assert display_group_id("OG0001") == "OG0001"
+
+    def test_only_strips_trailing_suffix_not_mid_string_occurrence(self):
+        """The literal substring '_lengthfilter' appearing somewhere other
+        than as the trailing suffix must not be stripped — only an exact
+        trailing match counts."""
+        assert display_group_id("OG_lengthfilter_extra") == "OG_lengthfilter_extra"
+
+    def test_idempotent(self):
+        """Applying twice must not strip anything further (there is only
+        ever one suffix to strip)."""
+        once  = display_group_id("OG0001_lengthfilter")
+        twice = display_group_id(once)
+        assert once == twice == "OG0001"
+
+    def test_matches_actual_length_filter_dir_filename(self, tmp_path):
+        """End-to-end: applying display_group_id() to the real filename
+        filter_length() writes to length_filter_dir must recover the
+        original input group name."""
+        src = tmp_path / "input" / "OG0007"
+        src.parent.mkdir()
+        _write_fasta(str(src), [("sp1|g1", "A" * 100), ("sp2|g2", "A" * 100)])
+        stats_dir  = tmp_path / "stats"
+        filter_dir = tmp_path / "filter"
+        stats_dir.mkdir(); filter_dir.mkdir()
+
+        filter_length(str(src), str(stats_dir), str(filter_dir))
+
+        written_files = os.listdir(str(filter_dir))
+        assert len(written_files) == 1
+        assert display_group_id(written_files[0]) == "OG0007"

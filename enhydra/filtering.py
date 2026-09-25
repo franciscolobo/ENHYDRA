@@ -14,6 +14,57 @@ logger = logging.getLogger(__name__)
 
 PARALOG_MODES = ("all", "remove", "longest")
 
+# ---------------------------------------------------------------------------
+# Pipeline-stage group ID suffixes
+# ---------------------------------------------------------------------------
+#
+# filter_length() appends this suffix when writing a group's surviving
+# sequences to length_filter_dir (see its own outfile_f_path in
+# filter_length() below). Every later pipeline stage — filter_groups(),
+# the aligner, the divergent-sequence filter, make_tables() — reads that
+# filename as-is and never strips the suffix back off, so it becomes a
+# permanent part of the group_id used for cross-stage file correlation:
+# it appears in group2anchor.tsv, group2mean.tsv, alignment filenames, and
+# therefore in every alignment page's own file-lookup key. That internal
+# ID must not be changed — it is what ties a group's records together
+# across every output file — but it is not the group's real, user-facing
+# name from the original input directory, and should not be shown
+# verbatim to someone reading a report. See display_group_id() below.
+_LENGTH_FILTER_SUFFIX = "_lengthfilter"
+
+
+def display_group_id(internal_group_id: str) -> str:
+    """Strip ENHYDRA's internal pipeline-stage suffix from a group ID.
+
+    Every stage after length filtering identifies a group using the exact
+    filename filter_length() wrote to length_filter_dir, which carries a
+    '_lengthfilter' suffix appended to the group's original name (see the
+    module-level note above _LENGTH_FILTER_SUFFIX). That internal ID is
+    required for correlating a group across pipeline stages and output
+    files — callers must keep using it for lookups, dict keys, and file
+    paths — but it is not the group's real name, and reports should
+    display this stripped form instead wherever a group_id is shown as
+    plain text to a person (e.g. an alignment page's title, or a report
+    tab listing groups), as opposed to used as a lookup key.
+
+    This is intentionally a single, non-iterative suffix strip:
+    '_lengthfilter' is the only suffix ever appended anywhere in the
+    pipeline (no later stage strips or re-suffixes a group_id), so there
+    is nothing to loop over.
+
+    Args:
+        internal_group_id: The group_id as used internally for file
+                           correlation (e.g. as read from group2anchor.tsv,
+                           an alignment filename, or any drop_reasons.tsv).
+
+    Returns:
+        The group ID with a trailing '_lengthfilter' suffix removed, if
+        present; otherwise the input unchanged (e.g. a group skipped
+        before length filtering ever wrote a file, or any ID that never
+        carried the suffix to begin with).
+    """
+    return internal_group_id.removesuffix(_LENGTH_FILTER_SUFFIX)
+
 
 def subset_groups(inputdir: str, subset_dir: str, species: list[str],
                   show_progress: bool = False):
@@ -81,7 +132,7 @@ def filter_length(
     """
     file           = os.path.basename(input_path)
     outfile_s_path = os.path.join(length_stats_dir, file + "_lengthstats")
-    outfile_f_path = os.path.join(length_filter_dir, file + "_lengthfilter")
+    outfile_f_path = os.path.join(length_filter_dir, file + _LENGTH_FILTER_SUFFIX)
 
     if os.stat(input_path).st_size == 0:
         with open(outfile_s_path, "w") as outstats:
@@ -186,15 +237,21 @@ def aggregate_length_filter_stats(
     for filename in os.listdir(length_stats_dir):
         if not filename.endswith(suffix):
             continue
-        # Match the same group-id convention used elsewhere (e.g.
-        # filter_groups()'s drop_reasons.tsv) so IDs line up across stages.
-        group_name = filename[:-len(suffix)].split(".")[0]
-        path       = os.path.join(length_stats_dir, filename)
+        base_name = filename[:-len(suffix)]
+        path      = os.path.join(length_stats_dir, filename)
 
         with open(path) as fh:
             lines = [l.rstrip("\n") for l in fh]
 
         if lines and lines[0] == "##GroupSkipped":
+            # Skipped groups (empty_file / single_sequence) never produce a
+            # corresponding file in length_filter_dir — filter_length()
+            # returns before writing one — so there is no downstream
+            # '_lengthfilter'-suffixed group_id to match here, and nothing
+            # later in the pipeline will ever look this ID up under a
+            # different name (a skipped group has no alignment, or any
+            # later stage, to cross-reference against). The bare
+            # input-stage name is recorded as-is.
             reason = ""
             detail = ""
             for line in lines[1:]:
@@ -202,11 +259,24 @@ def aggregate_length_filter_stats(
                     reason = line.split("\t", 1)[1]
                 elif line.startswith("n_sequences\t"):
                     detail = "n_sequences=%s" % line.split("\t", 1)[1]
-            skipped_groups.append((group_name, reason, detail))
+            skipped_groups.append((base_name, reason, detail))
             continue
 
-        # Otherwise: a processed group. Scan the per-sequence table for any
-        # rows whose Status is not 'kept'.
+        # Otherwise: a processed group. filter_length() always writes this
+        # group's survivors to length_filter_dir under
+        # '<base_name>_lengthfilter' (see filter_length()'s own
+        # outfile_f_path) — the exact filename every later stage
+        # (filter_groups(), the divergent-sequence filter, make_tables(),
+        # and therefore alignment page IDs) derives its own group_id from.
+        # Recording the bare base_name here instead (as a previous version
+        # of this function did) silently broke that cross-stage
+        # correlation: any caller keying off this function's group_id to
+        # look something up in a later stage (e.g. msa_viewer.py's
+        # per-group length-filter removal notice on alignment pages) would
+        # never find a match, since every later stage's own group_id
+        # carries the '_lengthfilter' suffix and this one didn't.
+        group_name = base_name + _LENGTH_FILTER_SUFFIX
+
         in_table = False
         for line in lines:
             if line.startswith("#SequenceID"):

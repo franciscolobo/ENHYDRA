@@ -193,6 +193,37 @@ class TestRenderAlignmentPage:
         assert "Species_a" in content
         assert "0.8500" in content
 
+    def test_group_id_suffix_stripped_from_title_and_metadata(self, tmp_path):
+        """The pipeline-internal '_lengthfilter' suffix (see
+        filtering.display_group_id()) is a file-correlation artifact, not
+        part of the group's real name — it must never appear in the
+        rendered page's title or 'Group ID' metadata row.
+
+        Callers (build_alignment_pages()) are still expected to pass the
+        raw, suffixed group_id here — that's the correct value for this
+        function's own log messages and for correlating with whatever
+        file this alignment came from — but the page's own human-facing
+        text must show the stripped form. This is handled internally by
+        render_alignment_page() itself, not by callers stripping the
+        suffix beforehand.
+        """
+        out = tmp_path / "OG0001_lengthfilter.html"
+        render_alignment_page("OG0001_lengthfilter", self._records(), str(out))
+        content = out.read_text()
+        assert "OG0001_lengthfilter" not in content
+        assert "<title>Alignment: OG0001</title>" in content
+        assert "<dt>Group ID</dt><dd>OG0001</dd>" in content
+
+    def test_group_id_without_suffix_unaffected(self, tmp_path):
+        """A group_id that never carried the pipeline suffix (e.g. any ID
+        not derived from a length-filtered group) must render unchanged —
+        display_group_id() is a documented no-op in that case."""
+        out = tmp_path / "OG0002.html"
+        render_alignment_page("OG0002", self._records(), str(out))
+        content = out.read_text()
+        assert "<title>Alignment: OG0002</title>" in content
+        assert "<dt>Group ID</dt><dd>OG0002</dd>" in content
+
     def test_no_anchor_species_no_warning(self, tmp_path):
         out = tmp_path / "OG0001.html"
         render_alignment_page("OG0001", self._records(), str(out))
@@ -446,3 +477,26 @@ class TestBuildAlignmentPages:
         outdir = str(tmp_path / "pages")
         pages = build_alignment_pages(aln_dir, tables_dir, outdir, group_ids=[])
         assert pages == {}
+
+    def test_group_id_with_suffix_displays_stripped_on_page(self, tmp_path):
+        """End-to-end through the batch API: a group_id carrying the
+        '_lengthfilter' suffix (as it would in a real pipeline run) must
+        still be used correctly as the file-lookup/dict key (the returned
+        pages dict, and the alignment/table file lookups), while the
+        rendered page content itself shows only the stripped display name.
+        """
+        aln_dir, tables_dir = self._setup(tmp_path, {
+            "OG0001_lengthfilter": {
+                "entries": [("Species_a|G1", "ACD"), ("Species_b|G2", "ACD")],
+                "mean": 0.9, "anchor_gene": "G1",
+            },
+        })
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(aln_dir, tables_dir, outdir)
+
+        # Lookup key / returned dict must remain the raw internal ID.
+        assert set(pages.keys()) == {"OG0001_lengthfilter"}
+
+        content = open(pages["OG0001_lengthfilter"]).read()
+        assert "OG0001_lengthfilter" not in content
+        assert "<dt>Group ID</dt><dd>OG0001</dd>" in content

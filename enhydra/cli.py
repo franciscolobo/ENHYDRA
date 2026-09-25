@@ -499,6 +499,12 @@ def _build_arg_parser():
                              "bars instead.")
     parser.add_argument("--paralogs", choices=["all", "remove", "longest"], default=None)
     parser.add_argument("--min-species", type=int, default=None)
+    parser.add_argument("--length-filter-sd", type=float, default=None,
+                        help="Number of standard deviations from a group's "
+                             "mean sequence length beyond which a sequence "
+                             "is removed by the length filter (default: "
+                             "2.0, or the value of 'length_filter_sd' in "
+                             "the project config).")
     parser.add_argument("--trim", default=None,
                         help="Trim alignment columns with trimAl before "
                              "identity estimation. Accepts a number between "
@@ -584,7 +590,7 @@ def main():
                              'GO:BP GO:MF GO:CC KEGG REAC')
     sources       = sources_raw if isinstance(sources_raw, list) \
                     else sources_raw.split()
-    sd_multiplier = parameters['length_filter_sd']
+    sd_multiplier = _resolve(args.length_filter_sd, parameters['length_filter_sd'], 2.0)
     aligner       = parameters['aligner']
     mafft_mode    = parameters['mafft_mode']
     obo_cache     = _resolve(args.obo_cache, parameters['obo_cache'], None)
@@ -723,6 +729,13 @@ def main():
             os.path.join(outdir, "divergence_filter_stats", "drop_reasons.tsv")
             if divergence_filter_sd else None
         )
+        # Length filtering always runs (unlike the divergence filter), so
+        # this path is always populated — no conditional needed. The
+        # underlying file is written unconditionally by
+        # aggregate_length_filter_stats(), even when nothing was dropped.
+        length_filter_drop_reasons_path_single = os.path.join(
+            outdir, "length_filter_stats", "drop_reasons.tsv"
+        )
         if not (resume and _step_complete(alignment_pages_dir)):
             logger.info("Rendering alignment pages for report...")
             alignment_pages = build_alignment_pages(
@@ -732,6 +745,7 @@ def main():
                 anchor_species=parameters['anchor'],
                 colnumbering_dir=colnumbering_dir_single,
                 divergence_drop_reasons_path=divergence_drop_reasons_path_single,
+                length_filter_drop_reasons_path=length_filter_drop_reasons_path_single,
                 show_progress=args.quiet,
             )
         else:
@@ -930,6 +944,9 @@ def main():
             os.path.join(outdir, "list1", "divergence_filter_stats", "drop_reasons.tsv")
             if divergence_filter_sd else None
         )
+        list1_length_filter_drop_reasons_path = os.path.join(
+            outdir, "list1", "length_filter_stats", "drop_reasons.tsv"
+        )
         list2_alignment_dir = os.path.join(
             outdir, "list2",
             "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
@@ -943,6 +960,9 @@ def main():
             os.path.join(outdir, "list2", "divergence_filter_stats", "drop_reasons.tsv")
             if divergence_filter_sd else None
         )
+        list2_length_filter_drop_reasons_path = os.path.join(
+            outdir, "list2", "length_filter_stats", "drop_reasons.tsv"
+        )
 
         if not (resume and _step_complete(list1_pages_dir)):
             logger.info("Rendering %s alignment pages for report...", list1_name)
@@ -954,6 +974,7 @@ def main():
                 anchor_species=anchor,
                 colnumbering_dir=list1_colnum_dir,
                 divergence_drop_reasons_path=list1_divergence_drop_reasons_path,
+                length_filter_drop_reasons_path=list1_length_filter_drop_reasons_path,
                 show_progress=args.quiet,
             )
         else:
@@ -979,6 +1000,7 @@ def main():
                 anchor_gene_lookup=list1_anchor_lookup,
                 colnumbering_dir=list2_colnum_dir,
                 divergence_drop_reasons_path=list2_divergence_drop_reasons_path,
+                length_filter_drop_reasons_path=list2_length_filter_drop_reasons_path,
                 show_progress=args.quiet,
             )
         else:
