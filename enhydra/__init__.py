@@ -13,7 +13,7 @@ from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
 from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
-from .report import build_report, build_multi_metric_report
+from .report import build_report, build_multi_metric_report, build_significance_agreement_table_html
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 from .stats import aggregate_pipeline_stats, compute_differential_stats
 from .msa_viewer import parse_trimal_colnumbering, compute_column_stats, render_alignment_page, build_alignment_pages, load_group_anchor

@@ -6,8 +6,8 @@ anchor      = Apis_mellifera
 max_process = 8
 
 # --- Filtering ---
-min_species     = 15        # minimum number of species per orthogroup
-min_sequences   = 15        # minimum sequences per group after length filtering
+min_species     = 10        # minimum number of species per orthogroup
+min_sequences   = 10        # minimum sequences per group after length filtering
 paralogs        = remove       # all | remove | longest
 length_filter_sd = 1      # sequences beyond mean ± (sd * length_filter_sd) are removed
 

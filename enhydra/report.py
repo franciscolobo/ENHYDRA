@@ -1003,7 +1003,44 @@ _GENE_SETS_FIELDS = [
 ]
 
 
-def _format_provenance_value(value) -> str:
+def get_run_parameter_field_specs() -> dict[str, list[tuple[str, str]]]:
+    """Return the (key, label) field specs for each run_parameters.json
+    section, grouped by section name.
+
+    Single source of truth for field ordering/labelling, shared by this
+    module's own Run parameters tab (_build_run_parameters_tab_content())
+    and by compare_runs.py's cross-run parameter diff table, so the two
+    presentations of the same underlying provenance record never drift
+    out of sync with each other.
+
+    Returns:
+        Dict mapping section name to its ordered list of (key, label)
+        pairs. 'run_info' fields live at the top level of a
+        run_parameters.json record; 'list' fields are nested under
+        input.list1 / input.list2 (two-list mode only) rather than under
+        a top-level 'list' key — callers extract the relevant sub-dict
+        themselves. All other section names match a top-level key in the
+        record directly (e.g. record['filtering']).
+    """
+    return {
+        "run_info":  _RUN_INFO_FIELDS,
+        "input":     _INPUT_FIELDS,
+        "list":      _LIST_FIELDS,
+        "filtering": _FILTERING_FIELDS,
+        "alignment": _ALIGNMENT_FIELDS,
+        "ranking":   _RANKING_FIELDS,
+        "gsea":      _GSEA_FIELDS,
+        "gene_sets": _GENE_SETS_FIELDS,
+    }
+
+
+def format_provenance_value(value) -> str:
+    """Format a single run_parameters.json value for HTML display.
+
+    Public (not module-private) since it is reused outside this module by
+    compare_runs.py's cross-run parameter diff table, in addition to this
+    module's own _fields_table_html().
+    """
     if value is None:
         return '<span style="color:#999;">not set</span>'
     if isinstance(value, bool):
@@ -1018,7 +1055,7 @@ def _format_provenance_value(value) -> str:
 def _fields_table_html(d: dict, fields: list[tuple[str, str]]) -> str:
     rows = "".join(
         "<tr><td>%s</td><td>%s</td></tr>"
-        % (html.escape(label), _format_provenance_value(d.get(key)))
+        % (html.escape(label), format_provenance_value(d.get(key)))
         for key, label in fields
     )
     return '<table class="reason-table"><tbody>%s</tbody></table>' % rows
@@ -1906,49 +1943,91 @@ def _results_table_html(
             full_sets_html_js, leadedge_html_js)
 
 
-def _build_consensus_table_html(
-    metric_dfs: dict[str, pd.DataFrame],
+def build_significance_agreement_table_html(
+    column_dfs: dict[str, pd.DataFrame],
+    column_labels: dict[str, str],
     obo_names: dict[str, str],
     fdr_threshold: float,
-    enrichment_plots_map: dict[str, dict[str, str]],
+    enrichment_plots_map: dict[str, dict[str, str]] | None = None,
+    table_id: str = "results-table-consensus",
+    direction_labels: dict[int, str] | None = None,
 ) -> tuple[str, list[int] | None]:
-    """Build the Cross-metric consensus table for --all-metrics reports.
+    """Build a cross-column significance agreement table.
+
+    Originally written specifically for this module's own Cross-metric
+    consensus tab (comparing identity/zscore/rank rankings within one
+    run), this is now a general-purpose utility: a "column" is any axis
+    of comparison whose GSEA output can be expressed as a
+    {Term, NES, FDR q-val} DataFrame. That covers both the original use
+    (columns = ranking metrics within one run) and a new one
+    (columns = different runs, for the same metric — see
+    compare_runs.py's cross-run comparison report), without either caller
+    needing its own copy of this logic.
 
     A gene set qualifies for inclusion if it is significant
-    (FDR < fdr_threshold) in a *majority* of the ranking metrics given in
-    metric_dfs — for the standard 3-metric --all-metrics run this means 2
-    of 3, not requiring unanimous 3/3 agreement. This directly matches the
-    intent of a consensus view: surfacing results that hold up under more
-    than one arbitrary choice of ranking metric, without demanding
-    unrealistic universal agreement.
+    (FDR < fdr_threshold) in a *majority* of the columns given — for 3
+    columns this means 2 of 3, not requiring unanimous agreement. This
+    directly matches the intent of a consensus view: surfacing results
+    that hold up under more than one arbitrary choice of comparison axis,
+    without demanding unrealistic universal agreement.
 
     Beyond the raw significance count, each qualifying row's direction is
-    also checked: among the metrics where it is significant, do they agree
-    on the *sign* of NES (positive = more conserved, negative = faster
-    evolving)? A gene set significant in two metrics with opposite-signed
-    NES is not a genuine consensus finding — it is contradictory — so this
-    is surfaced explicitly as 'Mixed direction' rather than silently
-    lumped in with genuine agreement.
+    also checked: among the columns where it is significant, do they
+    agree on the *sign* of NES (positive = more conserved, negative =
+    faster evolving)? A gene set significant in two columns with
+    opposite-signed NES is not a genuine consensus finding — it is
+    contradictory — so this is surfaced explicitly as 'Mixed direction'
+    rather than silently lumped in with genuine agreement.
 
     Deliberately excludes the "Full gene set" / "Leading edge" columns
     present in the per-metric enrichment tables: this view is meant to be
-    a compact cross-check, and that level of per-gene detail remains one
-    click away in each qualifying gene set's own metric-specific tab.
+    a compact cross-check, and that level of per-gene detail remains
+    available in whichever original per-column report produced each
+    column's own data.
 
     Args:
-        metric_dfs:  {metric: DataFrame} with at least 'Term', 'NES', and
-                    'FDR q-val' columns (numeric dtypes, not yet
-                    stringified — this must be called with data captured
-                    before _results_table_html()'s own formatting pass).
-                    Only metrics with a non-None GSEA result are expected
-                    to be included; the caller is responsible for that
-                    filtering (see _build_report_impl()).
+        column_dfs:  {column_key: DataFrame} with at least 'Term', 'NES',
+                    and 'FDR q-val' columns (numeric dtypes, not yet
+                    stringified for display). Only columns with usable
+                    data are expected to be included; callers are
+                    responsible for that filtering.
+        column_labels: {column_key: display_label} — e.g. metric display
+                    names (METRIC_LABELS) or run display names.
         obo_names:   {term_id: term_name}, for display alongside each GO ID.
-        fdr_threshold: Significance cutoff applied per metric.
-        enrichment_plots_map: {metric: {go_id: plot_path}}, used to make a
-                    qualifying gene set's per-metric NES cell clickable
-                    (reusing the existing .go-link modal) when that
-                    metric's own enrichment plot exists for that term.
+        fdr_threshold: Significance cutoff applied per column.
+        enrichment_plots_map: {column_key: {go_id: plot_path}}, used to make
+                    a qualifying gene set's per-column NES cell clickable
+                    (emits a '.go-link' anchor with data-goid and
+                    data-metric="<column_key>" attributes; the consuming
+                    page's own JS is responsible for wiring that click to
+                    an actual plot viewer — see this module's own
+                    _TEMPLATE JS for one such wiring, keyed by metric, and
+                    compare_runs.py for a second, independent wiring keyed
+                    by (table_id, run_name)). None or an empty dict
+                    disables clickable NES cells entirely (plain text
+                    values only).
+        table_id:    HTML id for the rendered <table>, so more than one
+                    such table can appear on the same page without id
+                    collisions (e.g. one table per metric in
+                    compare_runs.py's Significance agreement tab).
+        direction_labels: Optional {1: label_for_positive_sign,
+                    -1: label_for_negative_sign} overriding the default
+                    'Conserved' / 'Faster-evolving' wording, which is
+                    only correct when NES sign means "more/less conserved
+                    than the genome-wide average" (single-list mode).
+                    Two-list/differential callers must override this — a
+                    positive NES there means genes are more conserved in
+                    one specific list relative to the other (see
+                    differential.compute_differential()'s own docstring),
+                    not conserved relative to a shared baseline, so both
+                    label values need to name a *list*, not describe an
+                    absolute rate of evolution — e.g.
+                    {1: "Faster-evolving in <list2>",
+                     -1: "Faster-evolving in <list1>"}. Values are
+                    inserted as-is (not escaped by this function), the
+                    same convention already used for column_labels above.
+                    Defaults to {1: "Conserved", -1: "Faster-evolving"}
+                    if not given.
 
     Returns:
         Tuple of (html, numeric_col_indices). If no gene set reaches
@@ -1957,41 +2036,43 @@ def _build_consensus_table_html(
         element as "do not register this table with the DataTables JS",
         since no <table> element is present in that case.
     """
-    metrics   = list(metric_dfs.keys())
-    n_metrics = len(metrics)
-    majority  = n_metrics // 2 + 1
+    columns   = list(column_dfs.keys())
+    n_columns = len(columns)
+    majority  = n_columns // 2 + 1
+    enrichment_plots_map = enrichment_plots_map or {}
+    _direction_labels = direction_labels or {1: "Conserved", -1: "Faster-evolving"}
 
     term_data: dict[str, dict[str, tuple[float, float]]] = {}
-    for metric, df in metric_dfs.items():
+    for col, df in column_dfs.items():
         for _, row in df.iterrows():
             term = row.get("Term")
             nes, fdr = row.get("NES"), row.get("FDR q-val")
             if term is None or pd.isna(nes) or pd.isna(fdr):
                 continue
-            term_data.setdefault(term, {})[metric] = (float(nes), float(fdr))
+            term_data.setdefault(term, {})[col] = (float(nes), float(fdr))
 
     rows_data: list[tuple[str, dict, int, str]] = []
-    for term, per_metric in term_data.items():
-        sig_metrics = [
-            m for m in metrics
-            if m in per_metric and per_metric[m][1] < fdr_threshold
+    for term, per_col in term_data.items():
+        sig_cols = [
+            c for c in columns
+            if c in per_col and per_col[c][1] < fdr_threshold
         ]
-        n_sig = len(sig_metrics)
+        n_sig = len(sig_cols)
         if n_sig < majority:
             continue
-        signs = {(1 if per_metric[m][0] > 0 else -1) for m in sig_metrics}
+        signs = {(1 if per_col[c][0] > 0 else -1) for c in sig_cols}
         if len(signs) == 1:
-            direction = "Conserved" if next(iter(signs)) > 0 else "Faster-evolving"
+            direction = _direction_labels[next(iter(signs))]
         else:
             direction = "Mixed direction"
-        rows_data.append((term, per_metric, n_sig, direction))
+        rows_data.append((term, per_col, n_sig, direction))
 
     if not rows_data:
         return (
             "<p>No gene sets reached majority significance "
-            "(significant in \u2265 %d of %d ranking metrics at "
-            "FDR &lt; %.2f) for this run.</p>"
-            % (majority, n_metrics, fdr_threshold)
+            "(significant in \u2265 %d of %d columns at "
+            "FDR &lt; %.2f).</p>"
+            % (majority, n_columns, fdr_threshold)
         ), None
 
     # Full agreement first, then by term ID for a stable secondary order.
@@ -2002,20 +2083,21 @@ def _build_consensus_table_html(
         "Gene Ontology term identifier.",
         "Human-readable name of the GO term.",
     ]
-    for m in metrics:
-        label = METRIC_LABELS.get(m, m.capitalize())
+    for c in columns:
+        label = column_labels.get(c, str(c))
         headers += ["%s NES" % label, "%s FDR" % label]
         tooltips += [
-            "Normalised Enrichment Score under the %s ranking metric." % label,
-            "FDR q-value under the %s ranking metric (bold if significant, "
-            "FDR < %.2f)." % (label, fdr_threshold),
+            "Normalised Enrichment Score for %s." % label,
+            "FDR q-value for %s (bold if significant, FDR < %.2f)."
+            % (label, fdr_threshold),
         ]
     headers += ["Significant in", "Direction"]
     tooltips += [
-        "Number of ranking metrics (out of %d run) in which this gene set "
-        "was significant." % n_metrics,
-        "Whether the sign of enrichment (conserved vs. faster-evolving) "
-        "agrees across the metrics in which this gene set was significant.",
+        "Number of columns (out of %d) in which this gene set was "
+        "significant." % n_columns,
+        "Whether the direction of enrichment (%s vs. %s) agrees across "
+        "the columns in which this gene set was significant."
+        % (_direction_labels[1], _direction_labels[-1]),
     ]
 
     numeric_col_indices = [
@@ -2030,21 +2112,21 @@ def _build_consensus_table_html(
     filter_cells = "<th></th>" * len(headers)
 
     body_rows = []
-    for term, per_metric, n_sig, direction in rows_data:
+    for term, per_col, n_sig, direction in rows_data:
         term_name = obo_names.get(term, term)
         row_cells = "<td>%s</td><td>%s</td>" % (
             html.escape(term), html.escape(term_name),
         )
-        for m in metrics:
-            if m in per_metric:
-                nes, fdr = per_metric[m]
+        for c in columns:
+            if c in per_col:
+                nes, fdr = per_col[c]
                 is_sig  = fdr < fdr_threshold
                 nes_str = "%.4f" % nes
                 fdr_str = "%.4f" % fdr
-                if enrichment_plots_map.get(m, {}).get(term):
+                if enrichment_plots_map.get(c, {}).get(term):
                     nes_cell = (
                         '<a href="#" class="go-link" data-goid="%s" '
-                        'data-metric="%s">%s</a>' % (term, m, nes_str)
+                        'data-metric="%s">%s</a>' % (term, c, nes_str)
                     )
                 else:
                     nes_cell = nes_str
@@ -2052,16 +2134,15 @@ def _build_consensus_table_html(
                 row_cells += "<td>%s</td><td>%s</td>" % (nes_cell, fdr_cell)
             else:
                 row_cells += "<td>\u2014</td><td>\u2014</td>"
-        row_cells += "<td>%d / %d</td><td>%s</td>" % (n_sig, n_metrics, direction)
-        row_class = ' class="sig-row"' if n_sig == n_metrics else ""
+        row_cells += "<td>%d / %d</td><td>%s</td>" % (n_sig, n_columns, direction)
+        row_class = ' class="sig-row"' if n_sig == n_columns else ""
         body_rows.append("<tr%s>%s</tr>" % (row_class, row_cells))
 
     table_html = (
-        '<table id="results-table-consensus" class="display compact" '
-        'style="width:100%%">'
+        '<table id="%s" class="display compact" style="width:100%%">'
         '<thead><tr>%s</tr><tr class="filter-row">%s</tr></thead>'
         "<tbody>%s</tbody></table>"
-    ) % (header_cells, filter_cells, "".join(body_rows))
+    ) % (table_id, header_cells, filter_cells, "".join(body_rows))
 
     return table_html, numeric_col_indices
 
@@ -2237,11 +2318,56 @@ def _build_report_impl(
     # _build_consensus_table_html() for the full significance/direction
     # rules.
     if len(metric_raw_dfs) >= 2:
-        consensus_html, consensus_numeric_cols = _build_consensus_table_html(
-            metric_dfs=metric_raw_dfs,
+        column_labels = {
+            m: METRIC_LABELS.get(m, m.capitalize()) for m in metric_raw_dfs
+        }
+        # In two-list/differential mode, NES sign reflects which list a
+        # gene set is relatively more conserved in (see
+        # differential.compute_differential()'s own docstring: a positive
+        # differential score means higher conservation in list 1), not
+        # "more/less conserved than the genome-wide average" the way
+        # single-list mode's NES sign does. Reusing single-list mode's
+        # "Conserved" / "Faster-evolving" wording here would misrepresent
+        # what a positive or negative NES actually means for a
+        # differential run — both direction values need to name a
+        # *list*, not describe an absolute rate of evolution. Sign
+        # convention matches plotting.plot_differential_distribution()'s
+        # own histogram, which labels scores >= 0 as "More variable in
+        # <list2>".
+        if mode == "differential":
+            esc_label1, esc_label2 = html.escape(label1), html.escape(label2)
+            direction_labels = {
+                1:  "Faster-evolving in %s" % esc_label2,
+                -1: "Faster-evolving in %s" % esc_label1,
+            }
+            direction_desc = (
+                "\u201cDirection\u201d reports, for gene sets significant "
+                "under a majority of metrics, whether %s or %s appears "
+                "faster-evolving for that gene set (i.e. which list shows "
+                "lower relative conservation) \u2014 \u201cMixed "
+                "direction\u201d means the metrics disagree on which "
+                "list, and the result should be treated with caution "
+                "rather than as consensus support."
+                % (esc_label1, esc_label2)
+            )
+        else:
+            direction_labels = None
+            direction_desc = (
+                "\u201cDirection\u201d reports whether the sign of "
+                "enrichment (conserved vs. faster-evolving) agrees "
+                "across the metrics in which the gene set was "
+                "significant \u2014 \u201cMixed direction\u201d means "
+                "the metrics disagree and the result should be treated "
+                "with caution rather than as consensus support."
+            )
+        consensus_html, consensus_numeric_cols = build_significance_agreement_table_html(
+            column_dfs=metric_raw_dfs,
+            column_labels=column_labels,
             obo_names=term_names,
             fdr_threshold=fdr_threshold,
             enrichment_plots_map=enrichment_plots_map,
+            table_id="results-table-consensus",
+            direction_labels=direction_labels,
         )
         tab_buttons_parts.append(
             '    <button class="tab-btn" data-metric="consensus" '
@@ -2256,17 +2382,13 @@ def _build_report_impl(
             '  <p class="metric-desc">Gene sets reaching significance '
             '(FDR&nbsp;&lt;&nbsp;{fdr}) in at least {maj} of the {n} ranking '
             'metrics run. Rows highlighted in blue are significant across '
-            'all {n} metrics. "Direction" reports whether the sign of '
-            'enrichment (conserved vs. faster-evolving) agrees across the '
-            'metrics in which the gene set was significant \u2014 "Mixed '
-            'direction" means the metrics disagree and the result should be '
-            'treated with caution rather than as consensus support. Full '
-            'per-gene detail for any of these gene sets remains available '
-            'in that metric\u2019s own tab.</p>\n'
+            'all {n} metrics. {ddesc} Full per-gene detail for any of '
+            'these gene sets remains available in that metric\u2019s own '
+            'tab.</p>\n'
             '  {tbl}\n'
             '</div>\n'.format(
                 fdr=fdr_threshold, maj=majority_n, n=n_metrics_run,
-                tbl=consensus_html,
+                ddesc=direction_desc, tbl=consensus_html,
             )
         )
 
