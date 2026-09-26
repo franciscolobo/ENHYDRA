@@ -44,6 +44,14 @@ _METRIC_DESCS = {
     ),
 }
 
+# Overlap coefficient above which two significant gene sets are considered
+# redundant by build_significance_agreement... no — by
+# _cluster_redundant_terms() (see that function's own docstring for the
+# full rationale). Exposed here as a module-level default so
+# _results_table_html()/_build_report_impl()/build_report()/
+# build_multi_metric_report() all share one fallback value.
+DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD = 0.75
+
 # ---------------------------------------------------------------------------
 # Unified report template — one tab shell used for every report, regardless
 # of how many ranking metrics were run. A single-metric report simply has
@@ -97,7 +105,7 @@ h5 {{ color: #2c5282; margin: 14px 0 4px; font-size: 0.95em; }}
 .plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
 .plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
 tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
-a.go-link, a.geneset-link, a.leadedge-link, a.detail-link {{
+a.go-link, a.geneset-link, a.leadedge-link, a.detail-link, a.redundant-link {{
     color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
 .col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
             font-size: 10px; text-align: center; border-radius: 50%;
@@ -138,12 +146,13 @@ thead tr.filter-row th {{ padding: 4px 8px; }}
                font-weight: 600; cursor: pointer; margin-bottom: 14px;
                margin-right: 8px; }}
 .export-btn:hover {{ background: #12293f; }}
-.sig-toggle-btn {{ padding: 8px 18px; border: 2px solid #1a3a5c; border-radius: 4px;
-                    background: white; color: #1a3a5c; font-size: 13px;
-                    font-weight: 600; cursor: pointer; margin-bottom: 14px;
-                    margin-right: 8px; }}
-.sig-toggle-btn:hover {{ background: #f0f5fa; }}
-.sig-toggle-btn.active {{ background: #1a3a5c; color: white; }}
+.sig-toggle-btn, .nonredundant-toggle-btn {{
+    padding: 8px 18px; border: 2px solid #1a3a5c; border-radius: 4px;
+    background: white; color: #1a3a5c; font-size: 13px;
+    font-weight: 600; cursor: pointer; margin-bottom: 14px;
+    margin-right: 8px; }}
+.sig-toggle-btn:hover, .nonredundant-toggle-btn:hover {{ background: #f0f5fa; }}
+.sig-toggle-btn.active, .nonredundant-toggle-btn.active {{ background: #1a3a5c; color: white; }}
 .funnel-block {{ margin-bottom: 18px; }}
 .funnel-row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
                margin-top: 8px; }}
@@ -215,16 +224,19 @@ footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
 <script>{dt_js}</script>
 <script>{xlsx_js}</script>
 <script>
-var enrichmentPlotsMap = {enrichment_plots_map};
-var fullGeneSets       = {full_gene_sets_js};
-var leadingEdgeMap     = {leading_edge_map_js};
-var fullGeneSetsHtml   = {full_gene_sets_html_js};
-var leadingEdgeHtmlMap = {leading_edge_html_map_js};
-var numericColsMap     = {numeric_cols_map};
-var dtInstances        = {{}};
-var colFiltersMap      = {{}};
-var sigOnlyMap         = {{}};
-var sigColIndexMap     = {{}};
+var enrichmentPlotsMap    = {enrichment_plots_map};
+var fullGeneSets          = {full_gene_sets_js};
+var leadingEdgeMap        = {leading_edge_map_js};
+var fullGeneSetsHtml      = {full_gene_sets_html_js};
+var leadingEdgeHtmlMap    = {leading_edge_html_map_js};
+var redundantClustersHtml = {redundant_clusters_html_js};
+var numericColsMap        = {numeric_cols_map};
+var dtInstances           = {{}};
+var colFiltersMap         = {{}};
+var sigOnlyMap            = {{}};
+var sigColIndexMap        = {{}};
+var nonRedundantOnlyMap   = {{}};
+var redundantColIndexMap  = {{}};
 // Per-table default initial sort override. Tables not listed here keep the
 // historical default of sorting by column index 4 ascending (FDR, for the
 // per-metric enrichment tables' fixed column layout). The consensus table
@@ -247,8 +259,23 @@ $.fn.dataTable.ext.search.push(function(settings, data) {{
     var metric = settings.nTable.id.replace('results-table-', '');
     if (sigOnlyMap[metric]) {{
         var sigCol = sigColIndexMap[metric];
-        if (sigCol !== undefined && sigCol !== null &&
+        if (sigCol !== undefined && sigCol !== null && sigCol !== -1 &&
             data[sigCol] !== '\u2713') {{
+            return false;
+        }}
+    }}
+    if (nonRedundantOnlyMap[metric]) {{
+        var redCol = redundantColIndexMap[metric];
+        // A satellite row's "Redundant with" cell is always rendered as
+        // plain text beginning with the arrow character (see
+        // _cluster_redundant_terms()/_results_table_html()'s own
+        // "\u2192 <representative GO ID>" rendering) — representative
+        // rows ("View (N)" / "\u2014") and non-significant rows (blank,
+        // since redundancy is only computed among significant terms)
+        // never start with it, so this single prefix check is sufficient
+        // to hide only satellite rows under this toggle.
+        if (redCol !== undefined && redCol !== null && redCol !== -1 &&
+            data[redCol].indexOf('\u2192') === 0) {{
             return false;
         }}
     }}
@@ -272,8 +299,9 @@ $.fn.dataTable.ext.search.push(function(settings, data) {{
 }});
 function initTable(metric) {{
     if (dtInstances[metric]) return;
-    colFiltersMap[metric] = {{}};
-    sigOnlyMap[metric]    = false;
+    colFiltersMap[metric]      = {{}};
+    sigOnlyMap[metric]         = false;
+    nonRedundantOnlyMap[metric] = false;
     var numericCols = numericColsMap[metric] || [];
     var order = defaultOrderMap.hasOwnProperty(metric)
         ? defaultOrderMap[metric] : [[4, 'asc']];
@@ -281,7 +309,8 @@ function initTable(metric) {{
         pageLength: 25, orderCellsTop: true, order: order,
         columnDefs: [{{ targets: numericCols, type: 'num' }}],
     }});
-    sigColIndexMap[metric] = getHeaderIndex('#results-table-' + metric, 'Sig.');
+    sigColIndexMap[metric]       = getHeaderIndex('#results-table-' + metric, 'Sig.');
+    redundantColIndexMap[metric] = getHeaderIndex('#results-table-' + metric, 'Redundant with');
     $('#results-table-' + metric + ' thead tr.filter-row th').each(function(i) {{
         var isNum = numericCols.indexOf(i) !== -1;
         var inp   = $('<input type="text" placeholder="' +
@@ -451,11 +480,27 @@ $(document).ready(function() {{
             showHtmlModal(goId + ' \u2014 leading edge genes (' + metric + ')', htmlContent);
         }}
     }});
+    $(document).on('click', '.redundant-link', function(e) {{
+        e.preventDefault();
+        var goId = $(this).data('goid');
+        var htmlContent = redundantClustersHtml[goId];
+        if (htmlContent !== undefined) {{
+            showHtmlModal(goId + ' \u2014 redundant gene sets', htmlContent);
+        }}
+    }});
     $(document).on('click', '.sig-toggle-btn', function() {{
         var metric = $(this).data('metric');
         sigOnlyMap[metric] = !sigOnlyMap[metric];
         $(this).toggleClass('active', sigOnlyMap[metric]);
         $(this).text(sigOnlyMap[metric] ? 'Showing significant only \u2713' : 'Show only significant');
+        if (dtInstances[metric]) dtInstances[metric].draw();
+    }});
+    $(document).on('click', '.nonredundant-toggle-btn', function() {{
+        var metric = $(this).data('metric');
+        nonRedundantOnlyMap[metric] = !nonRedundantOnlyMap[metric];
+        $(this).toggleClass('active', nonRedundantOnlyMap[metric]);
+        $(this).text(nonRedundantOnlyMap[metric]
+            ? 'Showing non-redundant only \u2713' : 'Show non-redundant only');
         if (dtInstances[metric]) dtInstances[metric].draw();
     }});
     $(document).on('click', '.export-xlsx-btn', function() {{
@@ -1779,6 +1824,133 @@ def _find_lead_genes_col(df: pd.DataFrame) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# GO term redundancy clustering
+# ---------------------------------------------------------------------------
+#
+# Post-hoc redundancy reduction: GSEA itself is run unchanged against the
+# full GMT (no pipeline/CLI change), and clustering is applied purely as a
+# display-layer step over the (typically small) set of already-significant
+# terms in a rendered results table. See the "Redundant with" column and
+# "Show non-redundant only" toggle in _results_table_html()/_TEMPLATE.
+
+def _overlap_coefficient(a: set[str], b: set[str]) -> float:
+    """Overlap coefficient |A \u2229 B| / min(|A|, |B|).
+
+    Unlike Jaccard similarity (|A \u2229 B| / |A \u222a B|), this correctly
+    scores a small term fully contained within a much larger one (e.g. a
+    specific GO child term nested inside a broad parent term) as maximally
+    redundant (1.0) regardless of the size difference between the two —
+    exactly the containment relationship that makes GO terms redundant in
+    practice. Jaccard would score the same pair near 0 whenever the larger
+    set dwarfs the smaller one, systematically under-flagging this case.
+
+    Returns 0.0 if either set is empty (rather than raising a
+    division-by-zero error), so a term with no resolvable gene-set
+    membership simply never clusters with anything instead of crashing
+    the whole table build.
+    """
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _cluster_redundant_terms(
+    df: pd.DataFrame,
+    gene_sets: dict[str, list[str]],
+    fdr_threshold: float,
+    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+) -> dict[str, dict]:
+    """Greedily cluster significant, redundant gene sets by member overlap.
+
+    Only terms significant at fdr_threshold are considered. This keeps the
+    all-pairs overlap computation cheap — a full GO:BP GMT can have
+    thousands of terms, but after FDR filtering there are typically tens
+    to a few hundred, where an O(k^2) comparison is trivial — and matches
+    the intent of this feature: reducing redundancy in the *actionable*
+    result set, not in every term that merely happened to be tested.
+
+    Similarity is the overlap coefficient (see _overlap_coefficient()) on
+    each term's full GMT gene-set membership, not its leading-edge genes:
+    full membership is a fixed, always-available property of the GMT and
+    matches the intuitive notion of "these two terms are basically the
+    same gene set", whereas leading-edge overlap would only be defined for
+    already-significant terms (true here anyway, since only significant
+    terms are considered) but would measure a subtly different thing —
+    "these two terms are significant because of the same specific genes
+    in this particular ranking" — which is a legitimate alternative
+    definition of redundancy but not the one implemented here.
+
+    Terms are processed most-significant-first (ascending FDR). Each term
+    is greedily assigned to whichever already-chosen representative it has
+    the highest overlap coefficient with, provided that value meets or
+    exceeds overlap_threshold; otherwise the term becomes a new
+    representative itself. Processing in FDR order guarantees the most
+    significant member of any redundant cluster is always the one
+    reported as its representative — the intuitive choice for a reader
+    scanning down a table already sorted by significance.
+
+    A term absent from gene_sets (e.g. a GMT/results mismatch) is treated
+    as having an empty gene set: _overlap_coefficient() returns 0.0
+    against every other term, so it always becomes its own representative
+    with no satellites — a graceful degradation rather than an error.
+
+    Args:
+        df:                GSEA results with a 'Term' column and a
+                           *numeric* 'FDR q-val' column — this must be
+                           called before any stringifying/formatting pass
+                           over 'FDR q-val' (see _results_table_html(),
+                           which calls this before its own display
+                           formatting loop).
+        gene_sets:         {term_id: [gene_id, ...]}, the full GMT
+                           gene-set membership (as returned by
+                           _gmt_gene_sets()).
+        fdr_threshold:     Significance cutoff determining which terms are
+                           considered for clustering at all.
+        overlap_threshold: Overlap coefficient at or above which two terms
+                           are considered redundant.
+
+    Returns:
+        Dict keyed by term_id, present only for terms significant at
+        fdr_threshold. Each value is:
+            {"role": "representative" | "satellite",
+             "representative": the term_id of this term's cluster
+                               representative (equal to the key itself
+                               when role is "representative"),
+             "satellites": [term_id, ...] folded into this term — only
+                           ever populated when role is "representative";
+                           empty for satellite entries and for
+                           representatives with no cluster-mates.}
+    """
+    fdr_numeric = pd.to_numeric(df["FDR q-val"], errors="coerce")
+    sig_df = df.loc[fdr_numeric < fdr_threshold].copy()
+    sig_df["_fdr_numeric"] = fdr_numeric.loc[sig_df.index]
+    sig_terms = sig_df.sort_values("_fdr_numeric")["Term"].tolist()
+
+    term_sets = {t: set(gene_sets.get(t, [])) for t in sig_terms}
+    representatives: list[str] = []
+    result: dict[str, dict] = {}
+
+    for term in sig_terms:
+        best_rep, best_score = None, 0.0
+        for rep in representatives:
+            score = _overlap_coefficient(term_sets[term], term_sets[rep])
+            if score > best_score:
+                best_rep, best_score = rep, score
+        if best_rep is not None and best_score >= overlap_threshold:
+            result[term] = {
+                "role": "satellite", "representative": best_rep, "satellites": [],
+            }
+            result[best_rep]["satellites"].append(term)
+        else:
+            representatives.append(term)
+            result[term] = {
+                "role": "representative", "representative": term, "satellites": [],
+            }
+
+    return result
+
+
 def _results_table_html(
     df: pd.DataFrame,
     obo_names: dict[str, str],
@@ -1789,26 +1961,47 @@ def _results_table_html(
     col2_label: str = "List 2",
     gene_sets: dict[str, list[str]] | None = None,
     gene_to_page: dict[str, tuple[str | None, str | None]] | None = None,
-) -> tuple[str, list[int], dict[str, str], dict[str, str], dict[str, str], dict[str, str]]:
+    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+) -> tuple[str, list[int], dict[str, str], dict[str, str],
+          dict[str, str], dict[str, str], dict[str, str]]:
     """Build the enrichment results DataTable HTML for one metric.
 
-    Returns a 6-tuple:
+    Returns a 7-tuple:
         (table_html, numeric_col_indices,
          full_gene_sets_text, leading_edge_text,
-         full_gene_sets_html, leading_edge_html)
+         full_gene_sets_html, leading_edge_html,
+         redundant_clusters_html)
 
     The *_text dicts are unchanged plain newline-joined gene lists, used
     for the Excel export (tableToXLSX() splits these on newline — turning
     them into HTML would corrupt the exported cells). The *_html dicts are
     a parallel rendering of the same gene lists as clickable chips (via
     _gene_chip_list_html()), used only for the on-screen modal display.
+    redundant_clusters_html has no plain-text counterpart: the "Redundant
+    with" column is not given special handling in the Excel export, so
+    only the HTML-modal rendering is needed.
+
+    Args:
+        overlap_threshold: Passed through to _cluster_redundant_terms()
+                           for computing the "Redundant with" column. See
+                           that function's own docstring for the full
+                           rationale.
     """
     df = df.copy()
     if "Term" not in df.columns:
         logger.warning("'Term' column not found in GSEA results.")
-        return "<p>No results to display.</p>", [], {}, {}, {}, {}
+        return "<p>No results to display.</p>", [], {}, {}, {}, {}, {}
 
     df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
+
+    # Computed here, before the stringification loop just below, while
+    # 'FDR q-val' is still numeric — see _cluster_redundant_terms()'s own
+    # docstring note on this ordering requirement.
+    cluster_info: dict[str, dict] = {}
+    if gene_sets:
+        cluster_info = _cluster_redundant_terms(
+            df, gene_sets, fdr_threshold, overlap_threshold,
+        )
 
     for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val",
                 "Tag %", "Gene %", "Mean score",
@@ -1827,6 +2020,7 @@ def _results_table_html(
     leadedge_js:  dict[str, str] = {}
     full_sets_html_js: dict[str, str] = {}
     leadedge_html_js:  dict[str, str] = {}
+    redundant_html_js: dict[str, str] = {}
 
     if gene_sets:
         def _full_set_cell(term_id):
@@ -1851,6 +2045,30 @@ def _results_table_html(
             leadedge_html_js[row["Term"]] = _gene_chip_list_html(genes, gene_to_page)
             return "View (%d)" % len(genes)
         df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
+
+    if cluster_info:
+        def _redundant_cell(term_id):
+            info = cluster_info.get(term_id)
+            if info is None:
+                # Not significant at fdr_threshold — redundancy was never
+                # evaluated for this term.
+                return ""
+            if info["role"] == "satellite":
+                return "\u2192 %s" % html.escape(info["representative"])
+            satellites = info["satellites"]
+            if not satellites:
+                return "\u2014"
+            items = "".join(
+                "<li>%s%s</li>" % (
+                    html.escape(s),
+                    (" \u2014 %s" % html.escape(obo_names[s]))
+                    if obo_names.get(s) else "",
+                )
+                for s in satellites
+            )
+            redundant_html_js[term_id] = "<ul>%s</ul>" % items
+            return "View (%d)" % len(satellites)
+        df["Redundant with"] = df["Term"].apply(_redundant_cell)
 
     diff_label = "%s \u2212 %s" % (col1_label, col2_label)
     col_defs = [
@@ -1881,6 +2099,15 @@ def _results_table_html(
         ("Leading edge", "Leading edge",
          "Genes from this set found in the leading edge of the ranked list "
          "(i.e. driving the enrichment score). Click to view as a text list."),
+        ("Redundant with", "Redundant with",
+         "Among significant gene sets (FDR < %.2f), this gene set shares "
+         "an overlap coefficient of \u2265 %.2f with the listed gene "
+         "set(s) \u2014 click \u201cView\u201d to see them. \u201c\u2014\u201d "
+         "means no redundant gene set was found among the significant "
+         "results; \u201c\u2192 GO ID\u201d means this gene set was folded "
+         "into that (more significant) gene set instead; blank means this "
+         "gene set was not significant, so redundancy was not evaluated "
+         "for it." % (fdr_threshold, overlap_threshold)),
         ("Significant",  "Sig.",
          "Significant at FDR < %.2f." % fdr_threshold),
     ]
@@ -1928,6 +2155,11 @@ def _results_table_html(
                     '<td><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
                     % (go_id, metric_attr, val)
                 )
+            elif col == "Redundant with" and isinstance(val, str) and val.startswith("View ("):
+                cells += (
+                    '<td><a href="#" class="redundant-link" data-goid="%s">%s</a></td>'
+                    % (go_id, val)
+                )
             else:
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
@@ -1940,7 +2172,8 @@ def _results_table_html(
 
     return (html_content, numeric_col_indices,
             full_sets_js, leadedge_js,
-            full_sets_html_js, leadedge_html_js)
+            full_sets_html_js, leadedge_html_js,
+            redundant_html_js)
 
 
 def build_significance_agreement_table_html(
@@ -2192,6 +2425,7 @@ def _build_report_impl(
     alignment_pages1: dict[str, str] | None = None,
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
+    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
 ):
     logger.info("Building HTML report (%d metric tab(s))...", len(metric_data))
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
@@ -2239,6 +2473,7 @@ def _build_report_impl(
     leading_edge_map      = {}
     full_gene_sets_html_accum = {}
     leading_edge_html_map     = {}
+    redundant_clusters_html_accum = {}
     # Raw (still-numeric) per-metric GSEA result frames, captured purely to
     # feed the cross-metric consensus tab below — kept separate from the
     # `df` variable inside the loop, which gets progressively mutated
@@ -2266,16 +2501,19 @@ def _build_report_impl(
                 df, effective_gmt, tables_dir1, tables_dir2, metric
             )
             (tbl_html, num_cols, full_sets_js, leadedge_js,
-             full_sets_html_js, leadedge_html_js) = _results_table_html(
+             full_sets_html_js, leadedge_html_js,
+             redundant_html_js) = _results_table_html(
                 df, term_names, plot_idx, fdr_threshold,
                 metric=metric, col1_label=label1, col2_label=label2,
                 gene_sets=gene_sets_all, gene_to_page=gene_to_page,
+                overlap_threshold=overlap_threshold,
             )
             numeric_cols_map[metric] = num_cols
             full_gene_sets_accum.update(full_sets_js)
             leading_edge_map[metric] = leadedge_js
             full_gene_sets_html_accum.update(full_sets_html_js)
             leading_edge_html_map[metric] = leadedge_html_js
+            redundant_clusters_html_accum.update(redundant_html_js)
         else:
             tbl_html = "<p>No GSEA results found for this metric.</p>"
             numeric_cols_map[metric] = []
@@ -2292,10 +2530,12 @@ def _build_report_impl(
             '  <h3>Enrichment results</h3>\n'
             '  <p>Significant gene sets (FDR&nbsp;&lt;&nbsp;{fdr}) highlighted '
             'in blue. Click a GO ID to view its enrichment plot, or "View" '
-            'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge to see the '
-            'gene lists, with links to alignment pages where available.</p>\n'
+            'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge / '
+            'Redundant&nbsp;with to see the associated gene/gene-set '
+            'lists, with links to alignment pages where available.</p>\n'
             '  <p>'
             '<button class="sig-toggle-btn" data-metric="{m}">Show only significant</button> '
+            '<button class="nonredundant-toggle-btn" data-metric="{m}">Show non-redundant only</button> '
             '<button class="export-btn export-xlsx-btn" data-metric="{m}">'
             '&#8681; Export table to Excel (.xlsx)</button> '
             '<button class="export-btn export-xlsx-all-btn" data-metric="{m}">'
@@ -2315,8 +2555,8 @@ def _build_report_impl(
     # gene sets significant in a majority of the ranking metrics run, so a
     # result can be trusted as more than an artifact of one particular
     # ranking choice (identity vs. zscore vs. rank). See
-    # _build_consensus_table_html() for the full significance/direction
-    # rules.
+    # build_significance_agreement_table_html() for the full
+    # significance/direction rules.
     if len(metric_raw_dfs) >= 2:
         column_labels = {
             m: METRIC_LABELS.get(m, m.capitalize()) for m in metric_raw_dfs
@@ -2479,6 +2719,7 @@ def _build_report_impl(
         leading_edge_map_js=json.dumps(leading_edge_map),
         full_gene_sets_html_js=json.dumps(full_gene_sets_html_accum),
         leading_edge_html_map_js=json.dumps(leading_edge_html_map),
+        redundant_clusters_html_js=json.dumps(redundant_clusters_html_accum),
         numeric_cols_map=json.dumps(numeric_cols_map),
     )
     with open(report_path, "w", encoding="utf-8") as fh:
@@ -2510,6 +2751,7 @@ def build_report(
     alignment_pages1: dict[str, str] | None = None,
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
+    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
 ):
     """Build a single-metric HTML report (one enrichment tab + Alignments +
     Filtering summary + Run parameters).
@@ -2526,6 +2768,13 @@ def build_report(
                              populate the Run parameters tab. None omits
                              the record and shows a placeholder message
                              instead of raising.
+        overlap_threshold:   Overlap coefficient at or above which two
+                             significant gene sets are considered
+                             redundant for the "Redundant with" column /
+                             "Show non-redundant only" toggle in each
+                             metric's enrichment table. See
+                             _cluster_redundant_terms() for the full
+                             algorithm.
     """
     metric_data = {metric: {"results_dir": results_dir, "plots_dir": plots_dir}}
     _build_report_impl(
@@ -2540,6 +2789,7 @@ def build_report(
         alignment_pages1=alignment_pages1,
         alignment_pages2=alignment_pages2,
         run_parameters_path=run_parameters_path,
+        overlap_threshold=overlap_threshold,
     )
 
 
@@ -2561,6 +2811,7 @@ def build_multi_metric_report(
     alignment_pages1: dict[str, str] | None = None,
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
+    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
 ):
     """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
     including the Cross-metric consensus, Alignments, Filtering summary,
@@ -2572,6 +2823,13 @@ def build_multi_metric_report(
                              populate the Run parameters tab. None omits
                              the record and shows a placeholder message
                              instead of raising.
+        overlap_threshold:   Overlap coefficient at or above which two
+                             significant gene sets are considered
+                             redundant for the "Redundant with" column /
+                             "Show non-redundant only" toggle in each
+                             metric's enrichment table. See
+                             _cluster_redundant_terms() for the full
+                             algorithm.
     """
     _build_report_impl(
         metric_data=metric_data, report_path=report_path, obo_path=obo_path,
@@ -2585,4 +2843,5 @@ def build_multi_metric_report(
         alignment_pages1=alignment_pages1,
         alignment_pages2=alignment_pages2,
         run_parameters_path=run_parameters_path,
+        overlap_threshold=overlap_threshold,
     )
