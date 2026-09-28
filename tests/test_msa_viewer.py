@@ -6,6 +6,7 @@ from enhydra.msa_viewer import (
     compute_column_stats,
     render_alignment_page,
     build_alignment_pages,
+    _build_alignment_file_index,
 )
 
 def _write(path, content):
@@ -215,7 +216,7 @@ class TestRenderAlignmentPage:
         assert "<dt>Group ID</dt><dd>OG0001</dd>" in content
 
     def test_group_id_without_suffix_unaffected(self, tmp_path):
-        """A group_id that never carried the pipeline suffix (e.g. any ID
+        """A group_id that never carried the suffix (e.g. any ID
         not derived from a length-filtered group) must render unchanged —
         display_group_id() is a documented no-op in that case."""
         out = tmp_path / "OG0002.html"
@@ -328,6 +329,100 @@ class TestRenderAlignmentPage:
         render_alignment_page("OG0007", self._records(), out_str)
         import os
         assert os.path.isfile(out_str)
+
+
+# ---------------------------------------------------------------------------
+# _build_alignment_file_index
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for the bug where build_alignment_pages() assumed an
+# alignment file was always literally named '<group_id>.aln', which only
+# holds when the *original* input FASTA filename (in inputdir, upstream of
+# the whole pipeline) contained no '.' of its own. Any real-world input
+# named e.g. 'OG0001.fa' produces an alignment file named
+# 'OG0001.fa_lengthfilter.aln' (or similar), while make_tables() derives
+# the clean group_id 'OG0001' via a first-dot split on the identity-report
+# filename — a mismatch the old fixed-name assumption could never resolve.
+
+class TestBuildAlignmentFileIndex:
+
+    def test_extensionless_input_name_round_trips(self, tmp_path):
+        """Mirrors every existing test fixture in this repo: an
+        extension-less original input filename ('OG0001') means the
+        alignment file ends up named '<group_id>.aln' directly, since
+        group_id (as make_tables() would derive it) equals the *whole*
+        pre-'.aln' stem in this case."""
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        (aln_dir / "OG0001_lengthfilter.aln").write_text(">a|g1\nACD\n")
+        index = _build_alignment_file_index(str(aln_dir))
+        assert index == {"OG0001_lengthfilter": "OG0001_lengthfilter.aln"}
+
+    def test_extensioned_input_name_resolves_to_clean_group_id(self, tmp_path):
+        """The real bug scenario: original input file was 'OG0002802.fa',
+        so the alignment file on disk is 'OG0002802.fa_lengthfilter.aln',
+        but the group_id used everywhere else in the pipeline (as
+        make_tables() would derive it via the same first-dot-split rule)
+        is the clean 'OG0002802'. The index must map the clean group_id
+        to the messy real filename."""
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        (aln_dir / "OG0002802.fa_lengthfilter.aln").write_text(">a|g1\nACD\n")
+        index = _build_alignment_file_index(str(aln_dir))
+        assert index == {"OG0002802": "OG0002802.fa_lengthfilter.aln"}
+
+    def test_realigned_group_bare_name_also_resolves(self, tmp_path):
+        """After the divergent-sequence filter prunes and realigns a
+        group, its output filename is freshly generated as
+        '<group_id>.aln' (clean, no leftover extension cruft) regardless
+        of what the original input filename looked like — this must
+        resolve identically to the same clean group_id."""
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        (aln_dir / "OG0002802.aln").write_text(">a|g1\nACD\n")
+        index = _build_alignment_file_index(str(aln_dir))
+        assert index == {"OG0002802": "OG0002802.aln"}
+
+    def test_mixed_directory_both_naming_styles(self, tmp_path):
+        """A post-divergence-filter alignment_dir can legitimately contain
+        a mix: untouched groups keep their original (possibly messy)
+        filename, while pruned-and-realigned groups get a fresh clean
+        '<group_id>.aln' name. Both must resolve correctly side by side."""
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        (aln_dir / "OG0001.fa_lengthfilter.aln").write_text(">a|g1\nACD\n")
+        (aln_dir / "OG0002.aln").write_text(">a|g1\nACD\n")
+        index = _build_alignment_file_index(str(aln_dir))
+        assert index == {
+            "OG0001": "OG0001.fa_lengthfilter.aln",
+            "OG0002": "OG0002.aln",
+        }
+
+    def test_non_files_in_directory_ignored(self, tmp_path):
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        (aln_dir / "OG0001.aln").write_text(">a|g1\nACD\n")
+        (aln_dir / "subdir").mkdir()
+        index = _build_alignment_file_index(str(aln_dir))
+        assert index == {"OG0001": "OG0001.aln"}
+
+    def test_empty_directory_returns_empty_index(self, tmp_path):
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        assert _build_alignment_file_index(str(aln_dir)) == {}
+
+    def test_collision_logs_warning_and_picks_deterministic_winner(self, tmp_path, caplog):
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        (aln_dir / "OG0001.fa.aln").write_text(">a|g1\nACD\n")
+        (aln_dir / "OG0001.txt.aln").write_text(">a|g1\nACD\n")
+        with caplog.at_level("WARNING", logger="enhydra.msa_viewer"):
+            index = _build_alignment_file_index(str(aln_dir))
+        assert "OG0001" in index
+        # Alphabetically last of the two colliding names wins, deterministically.
+        assert index["OG0001"] == "OG0001.txt.aln"
+        assert any("resolve to the same group_id" in r.message for r in caplog.records)
+
 
 class TestBuildAlignmentPages:
 
@@ -500,3 +595,98 @@ class TestBuildAlignmentPages:
         content = open(pages["OG0001_lengthfilter"]).read()
         assert "OG0001_lengthfilter" not in content
         assert "<dt>Group ID</dt><dd>OG0001</dd>" in content
+
+    # -----------------------------------------------------------------
+    # Regression tests: real-world extensioned input filenames
+    # -----------------------------------------------------------------
+    # These bypass self._setup()'s helper (which always writes alignment
+    # files as literally '<group_id>.aln') to specifically reproduce the
+    # bug scenario: the alignment file's real on-disk name differs from
+    # '<group_id>.aln' because the original input FASTA filename (far
+    # upstream of alignment_dir) contained a '.', e.g. the standard '.fa'
+    # extension. See _build_alignment_file_index()'s own docstring for
+    # the full mechanism.
+
+    def test_extensioned_input_group_alignment_still_found(self, tmp_path):
+        aln_dir = tmp_path / "alignment"
+        tables_dir = tmp_path / "tables"
+        aln_dir.mkdir()
+        tables_dir.mkdir()
+
+        # Alignment filename as it would actually appear on disk for an
+        # original input file named 'OG0002802.fa': filter_length()
+        # appends '_lengthfilter', run_aligner() appends '.aln'.
+        self._write_fasta(
+            str(aln_dir / "OG0002802.fa_lengthfilter.aln"),
+            [("Species_a|G1", "ACD"), ("Species_b|G2", "ACD")],
+        )
+        # make_tables() would have derived the clean group_id 'OG0002802'
+        # (first-dot split on the identity-report filename), so that is
+        # what's recorded in the tables — NOT the messy alignment stem.
+        self._write_tsv(str(tables_dir / "group2mean.tsv"), [("OG0002802", "0.9")])
+        self._write_tsv(str(tables_dir / "group2anchor.tsv"), [("OG0002802", "G1")])
+
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(str(aln_dir), str(tables_dir), outdir)
+
+        assert set(pages.keys()) == {"OG0002802"}
+        content = open(pages["OG0002802"]).read()
+        assert "Species_a|G1" in content
+        assert "<dt>Group ID</dt><dd>OG0002802</dd>" in content
+
+    def test_extensioned_input_colnumbering_still_found(self, tmp_path):
+        """The colnumbering sidecar lookup has the identical bug pattern:
+        it must be looked up as '<real alignment filename>.colnumbering',
+        not '<group_id>.aln.colnumbering'."""
+        aln_dir = tmp_path / "alignment"
+        tables_dir = tmp_path / "tables"
+        colnum_dir = tmp_path / "colnumbering"
+        aln_dir.mkdir()
+        tables_dir.mkdir()
+        colnum_dir.mkdir()
+
+        self._write_fasta(
+            str(aln_dir / "OG0002802.fa_lengthfilter.aln"),
+            [("Species_a|G1", "ACDEF")],
+        )
+        self._write_tsv(str(tables_dir / "group2mean.tsv"), [("OG0002802", "0.9")])
+        self._write_tsv(str(tables_dir / "group2anchor.tsv"), [("OG0002802", "G1")])
+        # Sidecar named after the *real* alignment filename, matching
+        # exactly how alignment.run_trimal_columns() actually names it
+        # (f + '.colnumbering' for f in os.listdir(alignment_dir)).
+        with open(str(colnum_dir / "OG0002802.fa_lengthfilter.aln.colnumbering"), "w") as fh:
+            fh.write("#ColumnsMap\t0, 1, 3, 4\n")   # column 2 trimmed
+
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(
+            str(aln_dir), str(tables_dir), outdir, colnumbering_dir=str(colnum_dir),
+        )
+        content = open(pages["OG0002802"]).read()
+        assert 'class="aa trimmed"' in content
+
+    def test_mixed_extensioned_and_realigned_groups_both_found(self, tmp_path):
+        """A post-divergence-filter alignment_dir mixing an untouched
+        group (messy original filename preserved) and a realigned group
+        (fresh clean '<group_id>.aln' name) must resolve both correctly
+        in the same call."""
+        aln_dir = tmp_path / "alignment"
+        tables_dir = tmp_path / "tables"
+        aln_dir.mkdir()
+        tables_dir.mkdir()
+
+        self._write_fasta(
+            str(aln_dir / "OG0001.fa_lengthfilter.aln"),
+            [("Species_a|G1", "ACD")],
+        )
+        self._write_fasta(
+            str(aln_dir / "OG0002.aln"),
+            [("Species_a|G3", "ACD")],
+        )
+        self._write_tsv(str(tables_dir / "group2mean.tsv"),
+                        [("OG0001", "0.9"), ("OG0002", "0.8")])
+        self._write_tsv(str(tables_dir / "group2anchor.tsv"),
+                        [("OG0001", "G1"), ("OG0002", "G3")])
+
+        outdir = str(tmp_path / "pages")
+        pages = build_alignment_pages(str(aln_dir), str(tables_dir), outdir)
+        assert set(pages.keys()) == {"OG0001", "OG0002"}
