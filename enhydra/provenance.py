@@ -181,6 +181,49 @@ def write_run_parameters(
     return output_path
 
 
+def add_stage_summary(run_parameters_path: str, stages: dict) -> None:
+    """Fold a per-stage marker summary into an existing run_parameters.json.
+
+    Read-modify-write against the file write_run_parameters() already
+    wrote at the start of the run: adds (or replaces) a top-level
+    'stages' key with the given dict, leaving every other field
+    untouched. This is purely a human/report-tab-facing summary of the
+    per-stage resume markers (see stage_markers.aggregate_stage_markers())
+    — --resume itself never reads this copy back to make a skip/rerun
+    decision; it always consults the authoritative marker file directly
+    in each stage's own output directory.
+
+    Intended to be called once, near the end of a run, after every stage
+    that will run this invocation has finished — calling it mid-pipeline
+    would only capture whichever stages happened to be complete at that
+    point.
+
+    Args:
+        run_parameters_path: Path to an existing run_parameters.json, as
+                             written by write_run_parameters(). Must
+                             already exist.
+        stages:              The stage summary to store. In single-list
+                             mode, this is typically the direct output of
+                             aggregate_stage_markers(outdir). In two-list
+                             mode, callers are expected to nest the two
+                             lists' own summaries themselves, e.g.
+                             {'list1': aggregate_stage_markers(list1_dir),
+                              'list2': aggregate_stage_markers(list2_dir)},
+                             since each list's stages run independently.
+
+    Raises:
+        FileNotFoundError: If run_parameters_path does not exist.
+    """
+    with open(run_parameters_path) as fh:
+        record = json.load(fh)
+    record["stages"] = stages
+    with open(run_parameters_path, "w") as fh:
+        json.dump(record, fh, indent=2)
+    logger.info(
+        "Stage summary added to run parameters: %s", run_parameters_path,
+    )
+
+
 def _enhydra_version() -> str:
     """Best-effort lookup of the installed enhydra package version.
 

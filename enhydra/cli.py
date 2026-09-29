@@ -21,7 +21,9 @@ from .plotting import make_single_list_plots, make_differential_plots
 from .report import build_report, build_multi_metric_report
 from .stats import aggregate_pipeline_stats, compute_differential_stats
 from .msa_viewer import build_alignment_pages, load_group_anchor
-from .provenance import collect_run_parameters, write_run_parameters
+from .provenance import collect_run_parameters, write_run_parameters, \
+    add_stage_summary
+from .stage_markers import check_stage, write_stage_marker, aggregate_stage_markers
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 ALL_METRICS = ("identity", "zscore", "rank")
@@ -55,6 +57,17 @@ def _resolve(cli_val, config_val, default=None):
 
 
 def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bool:
+    """Legacy presence-only completion check.
+
+    Still used for the small number of downstream artefacts that sit
+    outside _run_single_list()'s own per-stage marker system (alignment
+    page rendering, GSEA results, differential scoring) — these are
+    single-shot outputs of one function call each, not a pipeline of
+    independently-parameterised stages, so the added bookkeeping of a
+    stage marker was judged not to carry its weight there. See
+    stage_markers.check_stage() for the parameter-aware version used
+    inside _run_single_list().
+    """
     if not os.path.isdir(step_dir):
         return False
     if sentinel_files:
@@ -204,12 +217,6 @@ def _run_single_list(
     def _desc(step):
         return ("%s: %s" % (label, step)) if label else step
 
-    def _skip(step_dir, step_name, sentinel_files=None):
-        if resume and _step_complete(step_dir, sentinel_files):
-            logger.info("Skipping %s (output already exists: %s)", step_name, step_dir)
-            return True
-        return False
-
     subset_dir           = os.path.join(listdir, "subset")
     length_stats_dir      = os.path.join(listdir, "length_stats")
     length_filter_dir     = os.path.join(listdir, "length_filter")
@@ -270,14 +277,67 @@ def _run_single_list(
     n_steps = (5 + (species is not None) + bool(exclude_from_identity)
                + bool(divergence_filter_sd) + bool(trim_args))
 
+    # ------------------------------------------------------------------ #
+    # Per-stage resume-safety: force_recompute cascades forward the       #
+    # instant any stage's existing output can't be verified as matching   #
+    # this invocation's parameters (stage_markers.check_stage() status    #
+    # 'mismatch' or 'missing_marker'), or the instant any stage simply    #
+    # has no output yet ('not_run'). Once set, every later stage in this  #
+    # list's pipeline runs unconditionally regardless of its own marker,  #
+    # since its input has now changed even if its own parameters have    #
+    # not. See stage_markers.py's module docstring for the full design.  #
+    # ------------------------------------------------------------------ #
+    force_recompute = False
+
+    def _must_run(dir_specs, marker_dir, stage_name, stage_params):
+        nonlocal force_recompute
+        if not resume:
+            return True
+        if force_recompute:
+            return True
+        result = check_stage(dir_specs, marker_dir, stage_params)
+        if result.status == "ok":
+            logger.info(
+                "Skipping %s (parameters unchanged, output exists: %s)",
+                _desc(stage_name), marker_dir,
+            )
+            return False
+        if result.status == "mismatch":
+            changes = "; ".join(
+                "%s: %r -> %r" % (k, old, new)
+                for k, (old, new) in result.changed_parameters.items()
+            )
+            logger.warning(
+                "%s: parameters changed since the run that produced its "
+                "existing output (%s) — recomputing this stage and every "
+                "stage downstream of it.", _desc(stage_name), changes,
+            )
+            force_recompute = True
+            return True
+        if result.status == "missing_marker":
+            logger.warning(
+                "%s: output exists but has no parameter marker (likely "
+                "produced by a run from before this feature, or a "
+                "corrupted marker file) — cannot verify its parameters "
+                "match this invocation; recomputing this stage and every "
+                "stage downstream of it to be safe.", _desc(stage_name),
+            )
+            force_recompute = True
+            return True
+        # 'not_run' — first time this stage has ever produced output here.
+        force_recompute = True
+        return True
+
     with tqdm(total=n_steps, desc=_desc("starting"),
               unit="step", disable=not show_progress, leave=True) as sbar:
 
         if species is not None:
             sbar.set_description(_desc("subsetting"))
-            if not _skip(subset_dir, "subsetting"):
+            subset_params = {"species": sorted(species)}
+            if _must_run([(subset_dir, None)], subset_dir, "subsetting", subset_params):
                 subset_groups(inputdir, subset_dir, species,
                               show_progress=show_progress)
+                write_stage_marker(subset_dir, "subset", subset_params)
             source_dir = subset_dir
             sbar.update(1)
         else:
@@ -285,7 +345,9 @@ def _run_single_list(
 
         sbar.set_description(_desc("length filter"))
         logger.info("Step 1: Length filtering")
-        if not _skip(length_filter_dir, "length filtering"):
+        length_filter_params = {"length_filter_sd": sd_multiplier}
+        if _must_run([(length_filter_dir, None)], length_filter_dir,
+                     "length filter", length_filter_params):
             os.makedirs(length_stats_dir, exist_ok=True)
             os.makedirs(length_filter_dir, exist_ok=True)
             args_list = [
@@ -305,12 +367,13 @@ def _run_single_list(
             finally:
                 pool.terminate()
                 pool.join()
+            write_stage_marker(length_filter_dir, "length_filter", length_filter_params)
         # Runs unconditionally, whether or not the filtering above was just
         # skipped via --resume. This is deliberate: aggregation is a cheap,
         # idempotent read of whatever per-group '_lengthstats' files already
         # exist in length_stats_dir — it is not tied to whether filtering
-        # happened in *this* invocation. Nesting it inside the `if not
-        # _skip(...)` block would silently produce empty/stale summary
+        # happened in *this* invocation. Nesting it inside the `if
+        # _must_run(...)` block would silently produce empty/stale summary
         # files on any run that resumes past an already-completed length
         # filter step, even though the underlying per-group stats files are
         # present and complete on disk.
@@ -322,7 +385,15 @@ def _run_single_list(
 
         sbar.set_description(_desc("group filter"))
         logger.info("Step 2: Group filtering")
-        if not _skip(group_filter_dir, "group filtering"):
+        group_filter_params = {
+            "min_species":    min_species,
+            "min_sequences":  min_sequences,
+            "paralog_mode":   paralog_mode,
+            "anchor":         anchor,
+            "require_anchor": require_anchor,
+        }
+        if _must_run([(group_filter_dir, None)], group_filter_dir,
+                     "group filter", group_filter_params):
             filter_groups(
                 length_filter_dir=length_filter_dir,
                 group_filter_dir=group_filter_dir,
@@ -334,11 +405,14 @@ def _run_single_list(
                 require_anchor=require_anchor,
                 show_progress=show_progress,
             )
+            write_stage_marker(group_filter_dir, "group_filter", group_filter_params)
         sbar.update(1)
 
         sbar.set_description(_desc("alignment"))
         logger.info("Step 3: Alignment with %s", aligner.upper())
-        if not _skip(alignment_dir, "alignment"):
+        alignment_params = {"aligner": aligner, "mafft_mode": mafft_mode}
+        if _must_run([(alignment_dir, None)], alignment_dir,
+                     "alignment", alignment_params):
             run_aligner(
                 group_filter_dir=group_filter_dir,
                 alignment_dir=alignment_dir,
@@ -346,6 +420,7 @@ def _run_single_list(
                 parameters=parameters,
                 show_progress=show_progress,
             )
+            write_stage_marker(alignment_dir, "alignment", alignment_params)
         sbar.update(1)
 
         trimal_input_dir = alignment_dir
@@ -354,13 +429,16 @@ def _run_single_list(
             sbar.set_description(_desc("stripping anchor"))
             logger.info("Step 3b: Stripping injected species from alignments: %s",
                         exclude_from_identity)
-            if not _skip(stripped_dir, "stripping anchor from alignments"):
+            strip_params = {"exclude_from_identity": sorted(exclude_from_identity)}
+            if _must_run([(stripped_dir, None)], stripped_dir,
+                         "anchor stripping", strip_params):
                 strip_species_from_alignments(
                     alignment_dir=alignment_dir,
                     stripped_dir=stripped_dir,
                     exclude=exclude_from_identity,
                     show_progress=show_progress,
                 )
+                write_stage_marker(stripped_dir, "anchor_stripping", strip_params)
             trimal_input_dir = stripped_dir
             sbar.update(1)
 
@@ -370,17 +448,17 @@ def _run_single_list(
                 "Step 3c: Filtering highly divergent sequences "
                 "(sd_multiplier=%s)", divergence_filter_sd,
             )
-            # Same two-output resume-guard lesson already applied to column
-            # trimming below: check every output this step produces
-            # (filtered alignments AND the stats log), not just one, or a
-            # resumed run whose divergence_filtered_dir predates this
-            # feature could skip the block forever and never produce
-            # drop_reasons.tsv at all.
-            divergence_ready = (
-                _step_complete(divergence_filtered_dir)
-                and _step_complete(divergence_stats_dir, ["drop_reasons.tsv"])
-            )
-            if not (resume and divergence_ready):
+            divergence_params = {
+                "divergence_filter_sd": divergence_filter_sd,
+                "min_species":          min_species,
+                "min_sequences":        min_sequences,
+            }
+            divergence_dir_specs = [
+                (divergence_filtered_dir, None),
+                (divergence_stats_dir, ["drop_reasons.tsv"]),
+            ]
+            if _must_run(divergence_dir_specs, divergence_filtered_dir,
+                        "divergence filter", divergence_params):
                 os.makedirs(divergence_sident_dir, exist_ok=True)
                 run_trimal(
                     alignment_dir=trimal_input_dir,
@@ -416,11 +494,8 @@ def _run_single_list(
                         parameters=parameters,
                         show_progress=show_progress,
                     )
-            else:
-                logger.info(
-                    "Skipping divergence filtering (output already exists: "
-                    "%s, %s)", divergence_filtered_dir, divergence_stats_dir,
-                )
+                write_stage_marker(divergence_filtered_dir, "divergence_filter",
+                                   divergence_params)
             trimal_input_dir = divergence_filtered_dir
             sbar.update(1)
 
@@ -434,18 +509,13 @@ def _run_single_list(
             # trimming call (trimAl supports both flags together — see
             # msa_viewer module notes), so it is always captured whenever
             # trimming is enabled at all; there is no separate opt-in flag.
-            #
-            # The skip-guard here deliberately checks *both* trimmed_dir
-            # and trim_colnumbering_dir rather than reusing the plain
-            # _skip(trimmed_dir, ...) helper: if trimmed_dir already has
-            # contents from a run predating this feature, a resumed run
-            # would otherwise skip the whole block forever and never
-            # produce colnumbering sidecar files at all. This mirrors the
-            # aggregate_length_filter_stats() lesson elsewhere in this
-            # function — a resume-guard checking only one of two outputs
-            # a step produces can silently strand the other output.
-            colnumbering_ready = _step_complete(trim_colnumbering_dir)
-            if not (resume and _step_complete(trimmed_dir) and colnumbering_ready):
+            trim_params = {"trim": trim_args}
+            trim_dir_specs = [
+                (trimmed_dir, None),
+                (trim_colnumbering_dir, None),
+            ]
+            if _must_run(trim_dir_specs, trimmed_dir,
+                        "column trimming", trim_params):
                 run_trimal_columns(
                     alignment_dir=trimal_input_dir,
                     trimmed_dir=trimmed_dir,
@@ -455,17 +525,21 @@ def _run_single_list(
                     show_progress=show_progress,
                     colnumbering_dir=trim_colnumbering_dir,
                 )
-            else:
-                logger.info(
-                    "Skipping column trimming (output already exists: %s, %s)",
-                    trimmed_dir, trim_colnumbering_dir,
-                )
+                write_stage_marker(trimmed_dir, "column_trimming", trim_params)
             trimal_input_dir = trimmed_dir
             sbar.update(1)
 
         sbar.set_description(_desc("identity"))
         logger.info("Step 4: Identity estimation with trimAl")
-        if not _skip(ident_dir, "identity estimation"):
+        # Identity estimation has no tunable parameters of its own — its
+        # correctness depends entirely on which alignment directory feeds
+        # it (trimal_input_dir, selected by the stages above). It is still
+        # tracked as its own marked stage purely so that force_recompute
+        # cascading from any upstream stage correctly forces this one to
+        # rerun too, even though its own parameter dict never changes.
+        identity_params: dict = {}
+        if _must_run([(ident_dir, None)], ident_dir,
+                     "identity estimation", identity_params):
             run_trimal(
                 alignment_dir=trimal_input_dir,
                 ident_dir=ident_dir,
@@ -473,13 +547,19 @@ def _run_single_list(
                 n_proc=max_process,
                 show_progress=show_progress,
             )
+            write_stage_marker(ident_dir, "identity", identity_params)
         sbar.update(1)
 
         sbar.set_description(_desc("tables"))
         logger.info("Step 5: Generating tables")
-        if not _skip(tables_dir, "table generation",
-                     sentinel_files=["group2mean.tsv", "anchor2mean.tsv",
-                                     "group2anchor.tsv"]):
+        tables_params = {
+            "anchor":                   anchor,
+            "require_anchor_in_tables": require_anchor_in_tables,
+        }
+        tables_dir_specs = [
+            (tables_dir, ["group2mean.tsv", "anchor2mean.tsv", "group2anchor.tsv"]),
+        ]
+        if _must_run(tables_dir_specs, tables_dir, "table generation", tables_params):
             make_tables(
                 alignment_dir=alignment_dir,
                 ident_dir=ident_dir,
@@ -488,6 +568,7 @@ def _run_single_list(
                 require_anchor=require_anchor_in_tables,
                 show_progress=show_progress,
             )
+            write_stage_marker(tables_dir, "tables", tables_params)
         sbar.update(1)
         sbar.set_description(_desc("done"))
 
@@ -518,7 +599,13 @@ def _build_arg_parser():
                              help="Path to an OrthoFinder 3 output directory.")
 
     parser.add_argument("--resume",  action="store_true", default=False,
-                        help="Resume a previously interrupted run.")
+                        help="Resume a previously interrupted run. Each "
+                             "pipeline stage's existing output is reused "
+                             "only if a per-stage marker confirms it was "
+                             "produced with the same parameters as this "
+                             "invocation; otherwise that stage and every "
+                             "stage downstream of it are recomputed, with "
+                             "a warning.")
     parser.add_argument("--replot",  action="store_true", default=False,
                         help="Re-run GSEA, plots, and the HTML report without "
                              "repeating alignment. Implies --resume.")
@@ -741,6 +828,8 @@ def main():
         seed=seed, fdr_threshold=fdr_threshold,
     )
 
+    run_parameters_path = os.path.join(outdir, "run_parameters.json")
+
     # ------------------------------------------------------------------ #
     #  Single-list mode                                                    #
     # ------------------------------------------------------------------ #
@@ -870,7 +959,7 @@ def main():
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
-                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
+                run_parameters_path=run_parameters_path,
             )
         else:
             build_report(
@@ -884,8 +973,16 @@ def main():
                 tables_dir1=tables_dir,
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
-                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
+                run_parameters_path=run_parameters_path,
             )
+
+        # Fold every stage marker produced under outdir into
+        # run_parameters.json's 'stages' section, for human/report-tab
+        # visibility only — see stage_markers.aggregate_stage_markers()
+        # and provenance.add_stage_summary() docstrings. This is purely
+        # additive bookkeeping and deliberately happens last, after every
+        # stage that could possibly run this invocation already has.
+        add_stage_summary(run_parameters_path, aggregate_stage_markers(outdir))
 
         for m in metrics_to_run:
             _log_summary(stats, metric_outputs[m]["results_dir"],
@@ -1127,7 +1224,7 @@ def main():
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
-                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
+                run_parameters_path=run_parameters_path,
             )
         else:
             build_report(
@@ -1148,8 +1245,17 @@ def main():
                 differential_stats_path=os.path.join(outdir, "differential_stats.json"),
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
-                run_parameters_path=os.path.join(outdir, "run_parameters.json"),
+                run_parameters_path=run_parameters_path,
             )
+
+        # See the single-list branch's identical call for the full
+        # rationale — folds both lists' stage markers into
+        # run_parameters.json's 'stages' section, nested per list since
+        # list1/list2 run their pipeline stages independently.
+        add_stage_summary(run_parameters_path, {
+            "list1": aggregate_stage_markers(os.path.join(outdir, "list1")),
+            "list2": aggregate_stage_markers(os.path.join(outdir, "list2")),
+        })
 
         for m in metrics_to_run:
             lbl1 = ("%s [%s]" % (list1_name, m)) if all_metrics else list1_name

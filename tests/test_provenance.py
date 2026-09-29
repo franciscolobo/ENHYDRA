@@ -5,7 +5,9 @@ import json
 
 import pytest
 
-from enhydra.provenance import collect_run_parameters, write_run_parameters
+from enhydra.provenance import (
+    collect_run_parameters, write_run_parameters, add_stage_summary,
+)
 
 
 def _minimal_resolved_params(**overrides) -> dict:
@@ -361,3 +363,56 @@ class TestEnhydraVersion:
         )
         assert isinstance(record["enhydra_version"], str)
         assert len(record["enhydra_version"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# add_stage_summary
+# ---------------------------------------------------------------------------
+
+class TestAddStageSummary:
+
+    def _write_initial(self, tmp_path):
+        path = str(tmp_path / "run_parameters.json")
+        with open(path, "w") as fh:
+            json.dump({"enhydra_version": "0.1.0", "filtering": {"min_species": 4}}, fh)
+        return path
+
+    def test_adds_stages_key(self, tmp_path):
+        path = self._write_initial(tmp_path)
+        add_stage_summary(path, {"length_filter": {"parameters": {"length_filter_sd": 2.0}}})
+        with open(path) as fh:
+            record = json.load(fh)
+        assert "stages" in record
+        assert record["stages"] == {
+            "length_filter": {"parameters": {"length_filter_sd": 2.0}},
+        }
+
+    def test_preserves_existing_fields(self, tmp_path):
+        path = self._write_initial(tmp_path)
+        add_stage_summary(path, {"tables": {}})
+        with open(path) as fh:
+            record = json.load(fh)
+        assert record["enhydra_version"] == "0.1.0"
+        assert record["filtering"] == {"min_species": 4}
+
+    def test_overwrites_previous_stages_value(self, tmp_path):
+        path = self._write_initial(tmp_path)
+        add_stage_summary(path, {"a": 1})
+        add_stage_summary(path, {"b": 2})
+        with open(path) as fh:
+            record = json.load(fh)
+        assert record["stages"] == {"b": 2}
+
+    def test_nested_two_list_stage_summary(self, tmp_path):
+        path = self._write_initial(tmp_path)
+        add_stage_summary(path, {
+            "list1": {"length_filter": {"parameters": {"length_filter_sd": 2.0}}},
+            "list2": {"length_filter": {"parameters": {"length_filter_sd": 2.0}}},
+        })
+        with open(path) as fh:
+            record = json.load(fh)
+        assert set(record["stages"].keys()) == {"list1", "list2"}
+
+    def test_raises_if_file_does_not_exist(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            add_stage_summary(str(tmp_path / "nonexistent.json"), {})
