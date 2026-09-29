@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 from tqdm import tqdm
 from .exceptions import EnhydraToolError
+from .stage_markers import list_data_files
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,7 @@ def run_trimal_columns(
          trimal_path, trim_args,
          os.path.join(colnumbering_dir, f + ".colnumbering")
          if colnumbering_dir is not None else None)
-        for f in os.listdir(alignment_dir)
+        for f in list_data_files(alignment_dir)
     ]
     _run_pool(_trimal_columns_worker, args_list, n_proc, show_progress)
 
@@ -215,7 +216,7 @@ def run_mafft(
         (os.path.join(group_filter_dir, f),
          os.path.join(alignment_dir, f + ".aln"),
          mafft_path, mode)
-        for f in os.listdir(group_filter_dir)
+        for f in list_data_files(group_filter_dir)
     ]
     _run_pool(_mafft_worker, args_list, n_proc, show_progress)
 
@@ -241,7 +242,7 @@ def run_muscle(
         (os.path.join(group_filter_dir, f),
          os.path.join(alignment_dir, f + ".aln"),
          muscle_path)
-        for f in os.listdir(group_filter_dir)
+        for f in list_data_files(group_filter_dir)
     ]
     _run_pool(_muscle_worker, args_list, n_proc, show_progress)
 
@@ -267,7 +268,7 @@ def run_prank(
         (os.path.join(group_filter_dir, f),
          os.path.join(alignment_dir, f),
          prank_path)
-        for f in os.listdir(group_filter_dir)
+        for f in list_data_files(group_filter_dir)
     ]
     _run_pool(_prank_worker, args_list, n_proc, show_progress)
 
@@ -293,7 +294,7 @@ def run_trimal(
         (os.path.join(alignment_dir, f),
          os.path.join(ident_dir, f + ".ident"),
          trimal_path)
-        for f in os.listdir(alignment_dir)
+        for f in list_data_files(alignment_dir)
     ]
     _run_pool(_trimal_worker, args_list, n_proc, show_progress)
 

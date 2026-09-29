@@ -4,7 +4,7 @@ import logging
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
-from .io import read_config_file, read_species_list, parse_obo_names
+from .io import read_config_file, read_species_list, parse_obo_names, parse_fasta_records
 from .utils import check_parameters, resolve_trim_args
 from .filtering import filter_length, filter_groups, subset_groups, strip_species_from_alignments, filter_divergent_sequences
 from .alignment import run_mafft, run_trimal, run_muscle, run_trimal_columns

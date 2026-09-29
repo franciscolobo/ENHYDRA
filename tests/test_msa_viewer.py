@@ -423,6 +423,26 @@ class TestBuildAlignmentFileIndex:
         assert index["OG0001"] == "OG0001.txt.aln"
         assert any("resolve to the same group_id" in r.message for r in caplog.records)
 
+    def test_stage_marker_file_excluded_from_index(self, tmp_path):
+        """Regression test: a '.stage_marker.json' file written into
+        alignment_dir by stage_markers.write_stage_marker() (see
+        cli.py's per-stage resume mechanism) must never be picked up as
+        if it were a real alignment file. Before this fix, splitting its
+        filename on the first '.' derived an empty-string group_id,
+        silently corrupting the index with a bogus entry."""
+        from enhydra.stage_markers import write_stage_marker, MARKER_FILENAME
+        aln_dir = tmp_path / "alignment"
+        aln_dir.mkdir()
+        (aln_dir / "OG0001.aln").write_text(">a|g1\nACD\n")
+        write_stage_marker(str(aln_dir), "alignment", {"aligner": "mafft"})
+
+        assert (aln_dir / MARKER_FILENAME).is_file()   # sanity check on setup
+
+        index = _build_alignment_file_index(str(aln_dir))
+
+        assert index == {"OG0001": "OG0001.aln"}
+        assert "" not in index
+
 
 class TestBuildAlignmentPages:
 

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import logging
-from Bio import SeqIO
 
 from .exceptions import EnhydraIOError
+from .io import parse_fasta_records
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ def preprocess_orthofinder(orthofinder_dir: str, inputdir: str) -> int:
         in_path = os.path.join(og_dir, filename)
         out_path = os.path.join(inputdir, og_id)
         with open(out_path, "w") as out_fh:
-            for seq_record in SeqIO.parse(in_path, "fasta"):
+            for seq_record in parse_fasta_records(in_path):
                 try:
                     species_id, gene_id = _reformat_header(seq_record.id)
                 except EnhydraIOError as e:

@@ -1,5 +1,7 @@
 import os
 import sys
+import json
+import shutil
 import logging
 import argparse
 import multiprocessing
@@ -101,6 +103,101 @@ def _reconstruct_alignment_pages(pages_dir: str) -> dict[str, str]:
         for f in os.listdir(pages_dir)
         if f.endswith(".html")
     }
+
+
+# Every subdirectory _run_single_list() itself creates directly under a
+# single list's root directory (i.e. 'outdir' in single-list mode, or
+# 'outdir/list1' / 'outdir/list2' in two-list mode). Kept as an explicit
+# list, cross-referenced against _run_single_list()'s own local directory
+# variables, rather than derived dynamically — --fork-from's seeding step
+# (see _seed_fork_source() below) needs to know exactly which
+# subdirectories are pipeline *stage* output (eligible for reuse across a
+# fork) as opposed to report-facing artefacts that always regenerate
+# fresh (alignments/, enrichment*/, plots*/, report.html,
+# run_parameters.json, pipeline_stats.json — none of which
+# _run_single_list() itself writes; see _seed_fork_source()'s own
+# docstring for why those are deliberately excluded).
+_FORK_SEEDABLE_STAGE_DIRS = (
+    "subset",
+    "length_stats", "length_filter", "length_filter_stats",
+    "group_filter", "group_filter_stats",
+    "alignment", "alignment_stripped",
+    "divergence_sident", "alignment_divergence_filtered",
+    "divergence_realign_input", "divergence_filter_stats",
+    "alignment_trimmed", "alignment_trimmed_colnumbering",
+    "ident_alignment", "tables",
+)
+
+
+def _seed_fork_source(fork_from_listdir: str, dest_listdir: str, label: str = "") -> None:
+    """Copy every known pipeline-stage subdirectory (with its resume marker)
+    from a prior completed run into a fresh destination list directory.
+
+    This is the mechanism behind --fork-from: rather than recomputing an
+    entire pipeline from scratch just to change one downstream parameter
+    (e.g. trim from 'strict' to 'strictplus'), every stage subdirectory
+    present in the fork source is copied wholesale into the new
+    (previously nonexistent) destination directory. _run_single_list()'s
+    own per-stage marker mechanism (stage_markers.check_stage(), via
+    _must_run()) then takes over exactly as it would for an ordinary
+    --resume: a copied stage whose marker still matches the current
+    invocation's parameters is reused as-is; the first stage whose marker
+    does not match is recomputed, which automatically cascades to every
+    stage after it regardless of whether *their* own parameters also
+    changed — a stage downstream of a changed one is stale via its input
+    even if its own configuration did not change.
+
+    Blindly copying every stage — even ones that will turn out to be
+    invalidated by the parameter change — is deliberate and safe: a
+    stage whose copied-over output later fails its marker check is simply
+    recomputed and overwritten in place, exactly as for a same-directory
+    --resume that detects a mid-pipeline parameter change. There is no
+    need to compute the fork point in advance; the existing cascade does
+    it implicitly.
+
+    Deliberately NOT copied here (always regenerated fresh by the normal
+    post-_run_single_list() pipeline in main(), regardless of
+    --fork-from): rendered alignment pages, GSEA results, plots, and the
+    HTML report, since these are report-facing artefacts derived from
+    whichever stage output ends up active after _run_single_list()
+    returns — potentially including output freshly recomputed because of
+    the very parameter change --fork-from exists to apply — rather than
+    independently-parameterised pipeline stages of their own.
+
+    Args:
+        fork_from_listdir: A single list's root directory from the prior
+                           completed run (the old --outdir in single-list
+                           mode, or its 'list1'/'list2' subdirectory in
+                           two-list mode).
+        dest_listdir:      The corresponding directory in the new run.
+                           Any individual stage subdirectory within it
+                           must not already exist — the caller (main())
+                           is responsible for having verified the overall
+                           destination outdir was freshly created for
+                           this invocation.
+        label:             Optional list name for log messages (two-list
+                           mode).
+
+    Raises:
+        EnhydraIOError: If fork_from_listdir does not exist.
+    """
+    logger = logging.getLogger(__name__)
+    prefix = ("%s: " % label) if label else ""
+    if not os.path.isdir(fork_from_listdir):
+        raise EnhydraIOError(
+            "%sFork source directory not found: %s" % (prefix, fork_from_listdir)
+        )
+    n_copied = 0
+    for stage_name in _FORK_SEEDABLE_STAGE_DIRS:
+        src = os.path.join(fork_from_listdir, stage_name)
+        dst = os.path.join(dest_listdir, stage_name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+            n_copied += 1
+    logger.info(
+        "%sSeeded %d stage director%s from fork source: %s",
+        prefix, n_copied, "y" if n_copied == 1 else "ies", fork_from_listdir,
+    )
 
 
 def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
@@ -606,6 +703,20 @@ def _build_arg_parser():
                              "invocation; otherwise that stage and every "
                              "stage downstream of it are recomputed, with "
                              "a warning.")
+    parser.add_argument(
+        "--fork-from", default=None, metavar="OUTDIR",
+        help="Seed a new output directory from a prior completed run's "
+             "pipeline-stage outputs, to change a parameter from some "
+             "stage onward without recomputing everything before it "
+             "(e.g. changing --trim from 'strict' to 'strictplus' reuses "
+             "length/group filtering and alignment, and only recomputes "
+             "trimming, identity estimation, and tables). Every stage "
+             "whose parameters are unchanged from the fork source is "
+             "reused as-is; the first stage whose parameters differ, and "
+             "every stage after it, is recomputed. The destination "
+             "'outdir' (in the project config) must not already exist. "
+             "Implies --resume."
+    )
     parser.add_argument("--replot",  action="store_true", default=False,
                         help="Re-run GSEA, plots, and the HTML report without "
                              "repeating alignment. Implies --resume.")
@@ -761,12 +872,51 @@ def main():
     if two_list_mode and not (list1_path and list2_path):
         parser.error("Two-list mode requires both list1 and list2.")
 
-    outdir = parameters['outdir']
-    if os.path.isdir(outdir) and not resume:
+    fork_from = args.fork_from
+    outdir    = parameters['outdir']
+
+    if fork_from:
+        if os.path.isdir(outdir):
+            sys.exit(
+                "--fork-from requires a new output directory: '%s' already "
+                "exists. Choose a fresh 'outdir' in your project config, or "
+                "omit --fork-from and use --resume instead if you intend to "
+                "continue this existing directory in place." % outdir
+            )
+        if not os.path.isdir(fork_from):
+            sys.exit("--fork-from directory not found: %s" % fork_from)
+        fork_run_params_path = os.path.join(fork_from, "run_parameters.json")
+        if os.path.isfile(fork_run_params_path):
+            with open(fork_run_params_path) as fh:
+                fork_run_params = json.load(fh)
+            fork_inputdir = (fork_run_params.get("input") or {}).get("inputdir")
+            this_inputdir = os.path.abspath(parameters['inputdir'])
+            if fork_inputdir and os.path.abspath(fork_inputdir) != this_inputdir:
+                sys.exit(
+                    "--fork-from source was run with a different inputdir "
+                    "('%s') than this invocation's ('%s'). Forking across "
+                    "different input data is not supported — the "
+                    "per-stage markers this feature relies on do not "
+                    "themselves track inputdir." % (fork_inputdir, this_inputdir)
+                )
+        else:
+            sys.stderr.write(
+                "Warning: --fork-from source has no run_parameters.json "
+                "(it predates that feature) — cannot verify it used the "
+                "same inputdir as this invocation.\n"
+            )
+        # The seeded stage directories are only useful if the normal
+        # pipeline actually consults their markers instead of blindly
+        # recomputing everything — i.e. this must behave as a resumed
+        # run regardless of whether the user also passed --resume.
+        resume = True
+    elif os.path.isdir(outdir) and not resume:
         sys.exit(
             "Output directory '%s' already exists. Use --resume to continue "
             "a previous run, --replot to re-run GSEA and regenerate plots, "
-            "or change 'outdir' in your project config." % outdir
+            "--fork-from <path> to seed a new outdir from that run's "
+            "outputs while changing selected parameters, or change "
+            "'outdir' in your project config." % outdir
         )
     os.makedirs(outdir, exist_ok=True)
 
@@ -788,6 +938,19 @@ def main():
             orthofinder_dir=args.orthofinder_dir,
             inputdir=parameters['inputdir'],
         )
+
+    if fork_from:
+        logger.info("Seeding pipeline-stage outputs from fork source: %s", fork_from)
+        try:
+            if two_list_mode:
+                _seed_fork_source(os.path.join(fork_from, "list1"),
+                                  os.path.join(outdir, "list1"), label=list1_name)
+                _seed_fork_source(os.path.join(fork_from, "list2"),
+                                  os.path.join(outdir, "list2"), label=list2_name)
+            else:
+                _seed_fork_source(fork_from, outdir)
+        except EnhydraIOError as e:
+            sys.exit("--fork-from error: %s" % e)
 
     obo_path  = os.path.join(obo_cache, "go-basic.obo") if obo_cache else None
     obo_names = parse_obo_names(obo_path) \

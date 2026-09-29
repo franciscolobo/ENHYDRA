@@ -10,6 +10,7 @@ from enhydra.stage_markers import (
     write_stage_marker,
     check_stage,
     aggregate_stage_markers,
+    list_data_files,
 )
 
 
@@ -298,3 +299,60 @@ class TestAggregateStageMarkers:
         summary = aggregate_stage_markers(str(root))
         assert "divergence_filter" in summary
         assert "alignment_divergence_filtered" not in summary
+
+
+# ---------------------------------------------------------------------------
+# list_data_files
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for a real crash: write_stage_marker() writes
+# MARKER_FILENAME directly into a stage's own output directory, and any
+# *later* stage that reads that same directory wholesale via plain
+# os.listdir() (to process "every file in it" as pipeline data, as
+# opposed to merely checking whether the directory has any output at all)
+# will pick up the marker file too and typically choke on it — e.g.
+# passing '.stage_marker.json' to trimAl as if it were an alignment file.
+# list_data_files() is the drop-in os.listdir() replacement every such
+# call site in the package now uses instead.
+
+class TestListDataFiles:
+
+    def test_excludes_marker_file(self, tmp_path):
+        d = tmp_path / "alignment"
+        d.mkdir()
+        _touch(d / "OG0001.aln")
+        _touch(d / "OG0002.aln")
+        write_stage_marker(str(d), "alignment", {"aligner": "mafft"})
+
+        files = list_data_files(str(d))
+
+        assert MARKER_FILENAME not in files
+        assert set(files) == {"OG0001.aln", "OG0002.aln"}
+
+    def test_no_marker_present_returns_everything(self, tmp_path):
+        d = tmp_path / "alignment"
+        d.mkdir()
+        _touch(d / "OG0001.aln")
+        assert list_data_files(str(d)) == ["OG0001.aln"]
+
+    def test_empty_directory_returns_empty_list(self, tmp_path):
+        d = tmp_path / "empty"
+        d.mkdir()
+        assert list_data_files(str(d)) == []
+
+    def test_directory_with_only_marker_returns_empty_list(self, tmp_path):
+        d = tmp_path / "alignment"
+        d.mkdir()
+        write_stage_marker(str(d), "alignment", {"aligner": "mafft"})
+        assert list_data_files(str(d)) == []
+
+    def test_does_not_filter_files_merely_containing_dots(self, tmp_path):
+        """Only the exact MARKER_FILENAME is excluded — a real data file
+        whose own name happens to contain dots (e.g. the '.fa' extension
+        bug fixed previously) must not be filtered out."""
+        d = tmp_path / "alignment"
+        d.mkdir()
+        _touch(d / "OG0001.fa_lengthfilter.aln")
+        write_stage_marker(str(d), "alignment", {"aligner": "mafft"})
+        files = list_data_files(str(d))
+        assert files == ["OG0001.fa_lengthfilter.aln"]

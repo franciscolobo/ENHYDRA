@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import re
+from io import StringIO
+
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 
 
 def _parse_config(fh) -> dict:
@@ -119,3 +123,70 @@ def parse_obo_names(obo_path: str) -> dict[str, str]:
     if current_id and not is_obsolete and current_name:
         names[current_id] = current_name
     return names
+
+
+def parse_fasta_records(path: str) -> list[SeqRecord]:
+    """Parse a FASTA file into a list of SeqRecord objects, tolerating any
+    junk/comment lines that precede the first '>' record header.
+
+    Equivalent to `list(Bio.SeqIO.parse(path, "fasta"))` for every
+    well-formed FASTA file, with one difference: newer versions of
+    Biopython's strict "fasta" parser (Biopython >= 1.85) raise
+    ValueError if a file contains any non-header lines before its first
+    '>' record — a pattern that occurs in practice with sequences
+    exported by some external databases/tools that prepend a metadata
+    banner, and that older Biopython versions silently tolerated. This
+    function makes ENHYDRA tolerant of that same input regardless of
+    which Biopython version is installed, by stripping everything before
+    the first '>' line itself — rather than depending on Biopython's own
+    newer 'fasta-pearson'/'fasta-blast' formats (mentioned in that
+    ValueError's own message), which are not available on Biopython
+    versions older than 1.85 and would make adopting them a version
+    compatibility risk for ENHYDRA's own users.
+
+    This deliberately targets only the specific failure mode above
+    (leading junk before the first sequence). It does not attempt to
+    interpret or strip comment-like lines (e.g. ';'-prefixed) that might
+    appear *within* the sequence portion of the file — that is a
+    materially different, more invasive change to how a file's actual
+    sequence content is interpreted, not merely how tolerantly its
+    (possible) leading preamble is skipped, and every ENHYDRA-internal
+    consumer of a FASTA file already writes clean, comment-free files of
+    its own, so this narrower scope covers every place ENHYDRA actually
+    encounters this problem: files originating from outside the pipeline
+    (a user's own input directory, or another tool's output).
+
+    A file containing no '>' line at all (including a completely empty
+    file, or one containing only comments) returns an empty list rather
+    than raising — callers throughout the pipeline already handle "zero
+    sequences found" as a normal, if usually degenerate, case (e.g.
+    filtering.filter_length()'s existing `len(lengths) < 2` check, which
+    already treats a group with too few sequences to filter as one to
+    skip rather than an error).
+
+    Args:
+        path: Path to a FASTA file.
+
+    Returns:
+        A list of Bio.SeqRecord.SeqRecord objects, in file order. Every
+        record's .id/.description/.seq have identical semantics to
+        Bio.SeqIO.parse(path, "fasta")'s own records, since parsing
+        itself (of the part of the file that follows the first '>') is
+        delegated to Biopython entirely unchanged.
+
+    Raises:
+        FileNotFoundError: If path does not exist (matching
+                           Bio.SeqIO.parse()'s own behaviour for a
+                           missing file).
+    """
+    with open(path) as fh:
+        lines = fh.readlines()
+
+    first_header_idx = next(
+        (i for i, line in enumerate(lines) if line.startswith(">")), None
+    )
+    if first_header_idx is None:
+        return []
+
+    cleaned = "".join(lines[first_header_idx:])
+    return list(SeqIO.parse(StringIO(cleaned), "fasta"))

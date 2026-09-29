@@ -1,7 +1,9 @@
 import os
 import logging
-from Bio import SeqIO
 from tqdm import tqdm
+
+from .io import parse_fasta_records
+from .stage_markers import list_data_files
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +87,8 @@ def make_tables(
     """
     os.makedirs(tables_dir, exist_ok=True)
 
-    ident_files = os.listdir(ident_dir)
-    aln_files   = set(os.listdir(alignment_dir))
+    ident_files = list_data_files(ident_dir)
+    aln_files   = set(list_data_files(alignment_dir))
 
     drop_reasons: list[tuple[str, str, str]] = []
 
@@ -155,7 +157,7 @@ def make_tables(
             # In 'all' paralog mode there may be more than one anchor sequence;
             # all are written to preserve the original behaviour.
             anchor_found = False
-            for seq_record in SeqIO.parse(aln_path, "fasta"):
+            for seq_record in parse_fasta_records(aln_path):
                 fields  = seq_record.id.split("|")
                 species = fields[0]
                 gene_id = fields[1]

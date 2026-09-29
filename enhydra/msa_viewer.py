@@ -7,10 +7,11 @@ import math
 import logging
 from collections import Counter
 
-from Bio import SeqIO
 from tqdm import tqdm
 
 from .filtering import display_group_id
+from .io import parse_fasta_records
+from .stage_markers import list_data_files
 
 logger = logging.getLogger(__name__)
 
@@ -764,7 +765,7 @@ def _build_alignment_file_index(alignment_dir: str) -> dict[str, str]:
         deterministically.
     """
     index: dict[str, str] = {}
-    for fname in sorted(os.listdir(alignment_dir)):
+    for fname in sorted(list_data_files(alignment_dir)):
         if not os.path.isfile(os.path.join(alignment_dir, fname)):
             continue
         derived_group_id = fname.split(".")[0]
@@ -1092,7 +1093,7 @@ def build_alignment_pages(
             continue
         aln_path = os.path.join(alignment_dir, aln_filename)
 
-        records = [(r.id, str(r.seq)) for r in SeqIO.parse(aln_path, "fasta")]
+        records = [(r.id, str(r.seq)) for r in parse_fasta_records(aln_path)]
 
         retained_columns = None
         if colnumbering_dir is not None:

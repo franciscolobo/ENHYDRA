@@ -7,8 +7,10 @@ import logging
 import statistics
 from collections import Counter
 import numpy as np
-from Bio import SeqIO
 from tqdm import tqdm
+
+from .io import parse_fasta_records
+from .stage_markers import list_data_files
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,7 @@ def subset_groups(inputdir: str, subset_dir: str, species: list[str],
         in_path  = os.path.join(inputdir, filename)
         out_path = os.path.join(subset_dir, filename)
         records  = [
-            r for r in SeqIO.parse(in_path, "fasta")
+            r for r in parse_fasta_records(in_path)
             if r.id.split("|")[0] in species_set
         ]
         if not records:
@@ -142,7 +144,7 @@ def filter_length(
 
     lengths     = []
     length_data = {}
-    for seq_record in SeqIO.parse(input_path, "fasta"):
+    for seq_record in parse_fasta_records(input_path):
         length = len(seq_record.seq)
         length_data[seq_record.id] = length
         lengths.append(length)
@@ -184,7 +186,7 @@ def filter_length(
             outstats.write("%s\t%s\t%s\t%s\n" % (key, value, value / mean, status))
 
     with open(outfile_f_path, "w") as outfile:
-        for seq_record in SeqIO.parse(input_path, "fasta"):
+        for seq_record in parse_fasta_records(input_path):
             seq = seq_record.seq
             if (len(seq) < lower_bound) or (len(seq) > upper_bound):
                 logger.warning(
@@ -395,7 +397,7 @@ def filter_groups(
 
     os.makedirs(group_filter_dir, exist_ok=True)
     os.makedirs(group_stats_dir, exist_ok=True)
-    files = os.listdir(length_filter_dir)
+    files = list_data_files(length_filter_dir)
 
     drop_reasons:  list[tuple[str, str, str]] = []
     species_counts_before: Counter = Counter()
@@ -407,7 +409,7 @@ def filter_groups(
         path_to_file  = os.path.join(length_filter_dir, file)
         outfile_path  = os.path.join(group_filter_dir, file)
 
-        records = list(SeqIO.parse(path_to_file, "fasta"))
+        records = parse_fasta_records(path_to_file)
         if len(records) < min_sequences:
             logger.warning(
                 "Group %s has fewer than %d sequences. Group removed.",
@@ -522,13 +524,13 @@ def strip_species_from_alignments(
         show_progress: Show a tqdm progress bar.
     """
     os.makedirs(stripped_dir, exist_ok=True)
-    files = os.listdir(alignment_dir)
+    files = list_data_files(alignment_dir)
     for file in tqdm(files, desc="  stripping", unit="group",
                      leave=False, disable=not show_progress):
         in_path  = os.path.join(alignment_dir, file)
         out_path = os.path.join(stripped_dir, file)
         records  = [
-            r for r in SeqIO.parse(in_path, "fasta")
+            r for r in parse_fasta_records(in_path)
             if r.id.split("|")[0] not in exclude
         ]
         if not records:
@@ -768,7 +770,7 @@ def filter_divergent_sequences(
     drop_reasons:   list[tuple[str, str, str, str, str]] = []
     dropped_groups: set[str] = set()
 
-    files = [f for f in os.listdir(alignment_dir)
+    files = [f for f in list_data_files(alignment_dir)
              if os.path.isfile(os.path.join(alignment_dir, f))]
 
     for file in tqdm(files, desc="  groups", unit="group",
@@ -777,7 +779,7 @@ def filter_divergent_sequences(
         aln_path    = os.path.join(alignment_dir, file)
         sident_path = os.path.join(sident_dir, file + ".ident")
 
-        n_records = sum(1 for _ in SeqIO.parse(aln_path, "fasta"))
+        n_records = len(parse_fasta_records(aln_path))
 
         if n_records < min_species:
             shutil.copyfile(aln_path, os.path.join(filtered_dir, file))
@@ -805,7 +807,7 @@ def filter_divergent_sequences(
             shutil.copyfile(aln_path, os.path.join(filtered_dir, file))
             continue
 
-        records   = list(SeqIO.parse(aln_path, "fasta"))
+        records   = parse_fasta_records(aln_path)
         survivors = [r for r in records if r.id not in flagged]
         species_ids = {r.id.split("|")[0] for r in survivors}
 

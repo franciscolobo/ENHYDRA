@@ -116,6 +116,45 @@ def _dir_has_output(stage_dir: str, sentinel_files: list[str] | None) -> bool:
     return any(f != MARKER_FILENAME for f in os.listdir(stage_dir))
 
 
+def list_data_files(directory: str) -> list[str]:
+    """List directory contents, excluding this module's own marker file.
+
+    write_stage_marker() writes MARKER_FILENAME directly into a stage's
+    own output directory (e.g. alignment/), alongside that stage's real
+    output — the only place a fixed, well-known marker filename can live
+    such that deleting the stage's output directory naturally removes its
+    marker too (see this module's own top docstring for that rationale).
+    But that means any *later* stage which reads a prior stage's output
+    directory wholesale via plain os.listdir() to process "every file in
+    it" will also encounter the marker file, and (having no reason to
+    expect it) will typically try to treat it as if it were real pipeline
+    data — a divergent-sequence filter or trimAl invocation choking on
+    '.stage_marker.json.aln' being a concrete example of exactly this
+    happening; a directory-indexing helper deriving a bogus group_id from
+    it (e.g. an empty string, if it splits a filename on its first '.')
+    being a quieter, more insidious example.
+
+    Every call site anywhere in this package that lists a stage's output
+    directory in order to iterate over its *contents as pipeline data*
+    (as opposed to merely checking whether the directory has any output
+    at all, which _dir_has_output() above already handles safely) should
+    use this function instead of calling os.listdir() directly, so that
+    adding a new pipeline stage automatically stays safe against this
+    class of bug without needing to remember to special-case the marker
+    filename at every new call site individually.
+
+    Args:
+        directory: Path to list.
+
+    Returns:
+        The same list os.listdir(directory) would return, with
+        MARKER_FILENAME removed if present. Not sorted — callers that
+        need a deterministic order should sort the result themselves,
+        exactly as they would have needed to with plain os.listdir().
+    """
+    return [f for f in os.listdir(directory) if f != MARKER_FILENAME]
+
+
 def write_stage_marker(marker_dir: str, stage: str, parameters: dict) -> None:
     """Write (or overwrite) a stage's resume marker.
 
