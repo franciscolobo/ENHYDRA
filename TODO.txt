@@ -1,6 +1,10 @@
 BUGS
  - conserved and fast-evolving in cross-metrics consensus is misleading
- - 
-REVIGO
-create a non-redundant gmt using the OBO file (if GOs have a child-parent relationship and have the same genes, get only the more specific one).
-create a REVIGO-like filter to plot fewer GO terms
+ - check where the replot information is coming from
+ - keep all results in a single folder (alignment figures should be there instead of inside the "alignment" figure)
+ - the weight of GSEA should be zero only for single-list identity/rank, and one for all others
+ - the option to resume should be smarter. Ideally, the JSON should keep track of what steps have been finished and what remains to be computed.
+ - Include an option to rerun with different parameters and use previous steps
+ - some of the values in the table are missing
+ - In paralogs mode, when there are multiple genes of the anchor genome in the same group, only one alignment is shown
+

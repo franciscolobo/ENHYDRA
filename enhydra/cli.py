@@ -117,6 +117,33 @@ def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
     return out_path
 
 
+def _gsea_weight(two_list_mode: bool, metric: str) -> float:
+    """Determine the GSEA prerank 'weight' parameter for a run mode/metric pair.
+
+    weight=0 makes GSEA's running-sum enrichment statistic purely
+    rank-based (equivalent to the classic, unweighted Kolmogorov-Smirnov
+    statistic) — genes contribute to the running sum based only on their
+    position in the ranking, ignoring the magnitude of their score.
+    weight=1 (GSEApy/GSEA's standard) instead weights each gene's
+    contribution by the magnitude of its own ranking-metric value, so
+    genes with larger scores pull the running sum more strongly.
+
+    Current policy: weight=0 only for single-list 'identity' and 'rank'
+    metrics; weight=1 for every other combination (single-list 'zscore',
+    and all three metrics in two-list/differential mode).
+
+    Args:
+        two_list_mode: Whether this is a two-list/differential run.
+        metric:        The ranking metric ('identity', 'zscore', 'rank').
+
+    Returns:
+        0.0 or 1.0.
+    """
+    if not two_list_mode and metric in ("identity", "rank"):
+        return 0.0
+    return 1.0
+
+
 def _log_summary(
     stats: dict,
     results_dir: str,
@@ -813,7 +840,9 @@ def main():
             if replot or not _step_complete(results_dir_m,
                                             ["gseapy.gene_set.prerank.report.csv"]):
                 run_gsea(anchor2mean_path=gsea_input,
-                         results_dir=results_dir_m, **gsea_kwargs)
+                         results_dir=results_dir_m,
+                         weight=_gsea_weight(two_list_mode, m),
+                         **gsea_kwargs)
             else:
                 logger.info("Skipping GSEA for metric '%s' (output exists).", m)
 
@@ -960,6 +989,7 @@ def main():
                 run_gsea(
                     anchor2mean_path=os.path.join(diff_dir_m, "anchor2mean.tsv"),
                     results_dir=results_dir_m,
+                    weight=_gsea_weight(two_list_mode, m),
                     **gsea_kwargs,
                 )
             else:
