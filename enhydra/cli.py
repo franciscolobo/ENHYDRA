@@ -692,17 +692,20 @@ def _build_arg_parser():
     parser.add_argument("project_config", help="Path to the project configuration file.")
 
     input_group = parser.add_mutually_exclusive_group()
-    input_group.add_argument("--orthofinder-dir",
-                             help="Path to an OrthoFinder 3 output directory.")
+    input_group.add_argument("--orthofinder-dir", default=None,
+                             help="Path to an OrthoFinder 3 output directory. "
+                                  "Can also be set via 'orthofinder_dir' in "
+                                  "the project config.")
 
-    parser.add_argument("--resume",  action="store_true", default=False,
+    parser.add_argument("--resume",  action="store_true", default=None,
                         help="Resume a previously interrupted run. Each "
                              "pipeline stage's existing output is reused "
                              "only if a per-stage marker confirms it was "
                              "produced with the same parameters as this "
                              "invocation; otherwise that stage and every "
                              "stage downstream of it are recomputed, with "
-                             "a warning.")
+                             "a warning. Can also be set via 'resume' in "
+                             "the project config.")
     parser.add_argument(
         "--fork-from", default=None, metavar="OUTDIR",
         help="Seed a new output directory from a prior completed run's "
@@ -715,14 +718,17 @@ def _build_arg_parser():
              "reused as-is; the first stage whose parameters differ, and "
              "every stage after it, is recomputed. The destination "
              "'outdir' (in the project config) must not already exist. "
-             "Implies --resume."
+             "Implies --resume. Can also be set via 'fork_from' in the "
+             "project config."
     )
-    parser.add_argument("--replot",  action="store_true", default=False,
+    parser.add_argument("--replot",  action="store_true", default=None,
                         help="Re-run GSEA, plots, and the HTML report without "
-                             "repeating alignment. Implies --resume.")
-    parser.add_argument("--quiet",   action="store_true", default=False,
+                             "repeating alignment. Implies --resume. Can also "
+                             "be set via 'replot' in the project config.")
+    parser.add_argument("--quiet",   action="store_true", default=None,
                         help="Suppress INFO/WARNING on the console; show progress "
-                             "bars instead.")
+                             "bars instead. Can also be set via 'quiet' in the "
+                             "project config.")
     parser.add_argument("--paralogs", choices=["all", "remove", "longest"], default=None)
     parser.add_argument("--min-species", type=int, default=None)
     parser.add_argument("--length-filter-sd", type=float, default=None,
@@ -751,9 +757,10 @@ def _build_arg_parser():
                              "too few sequences make the mean/SD unreliable. "
                              "If unset (default), no divergence filtering is "
                              "performed.")
-    parser.add_argument("--all-metrics", action="store_true", default=False,
+    parser.add_argument("--all-metrics", action="store_true", default=None,
                         help="Run GSEA for all three ranking metrics and produce "
-                             "a tabbed HTML report.")
+                             "a tabbed HTML report. Can also be set via "
+                             "'all_metrics' in the project config.")
 
     diff_group = parser.add_argument_group("two-list differential mode")
     diff_group.add_argument("--list1",   default=None)
@@ -820,9 +827,21 @@ def main():
     aligner       = parameters['aligner']
     mafft_mode    = parameters['mafft_mode']
     obo_cache     = _resolve(args.obo_cache, parameters['obo_cache'], None)
-    all_metrics   = args.all_metrics
-    replot        = args.replot
-    resume        = args.resume or replot
+
+    # Run-mode flags: previously CLI-only (argparse defaults of False/None
+    # with no config fallback). All five now accept a project-config value
+    # too — argparse's store_true flags use default=None (not False) so
+    # that "flag not passed on the CLI" can be distinguished from
+    # "explicitly disabled", letting _resolve() fall through to the config
+    # value in the former case. An explicit CLI flag always wins over the
+    # config file, consistent with every other parameter in this function.
+    orthofinder_dir = _resolve(args.orthofinder_dir, parameters['orthofinder_dir'], None) or None
+    fork_from       = _resolve(args.fork_from,       parameters['fork_from'],       None) or None
+    resume_flag     = _resolve(args.resume,          parameters['resume'],          False)
+    replot          = _resolve(args.replot,          parameters['replot'],          False)
+    quiet           = _resolve(args.quiet,           parameters['quiet'],           False)
+    all_metrics     = _resolve(args.all_metrics,     parameters['all_metrics'],     False)
+    resume          = resume_flag or replot
 
     try:
         trim_args = resolve_trim_args(trim)
@@ -872,8 +891,7 @@ def main():
     if two_list_mode and not (list1_path and list2_path):
         parser.error("Two-list mode requires both list1 and list2.")
 
-    fork_from = args.fork_from
-    outdir    = parameters['outdir']
+    outdir = parameters['outdir']
 
     if fork_from:
         if os.path.isdir(outdir):
@@ -920,7 +938,7 @@ def main():
         )
     os.makedirs(outdir, exist_ok=True)
 
-    _setup_logging(outdir, quiet=args.quiet)
+    _setup_logging(outdir, quiet=quiet)
     logger = logging.getLogger(__name__)
     logger.info("Welcome to Enhydra")
     logger.info(
@@ -932,10 +950,10 @@ def main():
         min_species, permutations, fdr_threshold,
     )
 
-    if args.orthofinder_dir:
+    if orthofinder_dir:
         logger.info("OrthoFinder mode: preprocessing Orthogroup_Sequences/")
         preprocess_orthofinder(
-            orthofinder_dir=args.orthofinder_dir,
+            orthofinder_dir=orthofinder_dir,
             inputdir=parameters['inputdir'],
         )
 
@@ -969,7 +987,7 @@ def main():
         mafft_mode=mafft_mode,
         parameters=parameters,
         resume=resume,
-        show_progress=args.quiet,
+        show_progress=quiet,
         trim_args=trim_args,
         divergence_filter_sd=divergence_filter_sd,
     )
@@ -1008,7 +1026,7 @@ def main():
             anchor=parameters['anchor'],
             resolved_params=resolved_params_for_provenance,
             two_list_mode=False,
-            orthofinder_dir=args.orthofinder_dir,
+            orthofinder_dir=orthofinder_dir,
             all_metrics=all_metrics,
             metrics_run=metrics_to_run,
         )
@@ -1070,7 +1088,7 @@ def main():
                 colnumbering_dir=colnumbering_dir_single,
                 divergence_drop_reasons_path=divergence_drop_reasons_path_single,
                 length_filter_drop_reasons_path=length_filter_drop_reasons_path_single,
-                show_progress=args.quiet,
+                show_progress=quiet,
             )
         else:
             logger.info(
@@ -1182,7 +1200,7 @@ def main():
             anchor=anchor,
             resolved_params=resolved_params_for_provenance,
             two_list_mode=True,
-            orthofinder_dir=args.orthofinder_dir,
+            orthofinder_dir=orthofinder_dir,
             list1_path=list1_path,
             list2_path=list2_path,
             list1_name=list1_name,
@@ -1334,7 +1352,7 @@ def main():
                 colnumbering_dir=list1_colnum_dir,
                 divergence_drop_reasons_path=list1_divergence_drop_reasons_path,
                 length_filter_drop_reasons_path=list1_length_filter_drop_reasons_path,
-                show_progress=args.quiet,
+                show_progress=quiet,
             )
         else:
             logger.info(
@@ -1360,7 +1378,7 @@ def main():
                 colnumbering_dir=list2_colnum_dir,
                 divergence_drop_reasons_path=list2_divergence_drop_reasons_path,
                 length_filter_drop_reasons_path=list2_length_filter_drop_reasons_path,
-                show_progress=args.quiet,
+                show_progress=quiet,
             )
         else:
             logger.info(

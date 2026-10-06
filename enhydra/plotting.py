@@ -103,7 +103,6 @@ def plot_identity_distribution(
         fig.tight_layout()
     _save(fig, plots_dir, "identity_distribution")
 
-
 def plot_gsea_barplot(
     results_dir: str,
     plots_dir: str,
@@ -125,7 +124,7 @@ def plot_gsea_barplot(
     pos     = sig[sig["NES"] > 0].nlargest(top_n, "NES")
     neg     = sig[sig["NES"] < 0].nsmallest(top_n, "NES")
     plot_df = pd.concat([pos, neg]).sort_values("NES").reset_index(drop=True)
-    colors  = [PALETTE["positive"] if nes > 0 else PALETTE["negative"]
+    colors  = [PALETTE["negative"] if nes > 0 else PALETTE["positive"]
                for nes in plot_df["NES"]]
 
     with plt.style.context(FIGURE_STYLE):
@@ -154,7 +153,6 @@ def plot_gsea_barplot(
         fig.tight_layout()
     _save(fig, plots_dir, "gsea_barplot")
     _save_gsea_barplot_svg(plot_df, colors, offset, title, plots_dir, obo_names or {})
-
 
 def _save_gsea_barplot_svg(
     plot_df: pd.DataFrame,
@@ -228,7 +226,7 @@ def _save_gsea_barplot_svg(
         nes      = row["NES"]
         bar_x    = min(zero_px, to_px(nes))
         bar_w    = max(abs(to_px(nes) - zero_px), 1)
-        color    = PALETTE["positive"] if nes > 0 else PALETTE["negative"]
+        color    = PALETTE["negative"] if nes > 0 else PALETTE["positive"]
         go_id    = row["Term"]
         defn     = obo_names.get(go_id, "")
         tip_text = "%s | %s | NES=%.3f | FDR=%.3f" % (
@@ -521,7 +519,6 @@ def plot_identity_scatter(
         label1=label1, label2=label2, vmax=vmax, title=title,
     )
 
-
 def plot_differential_distribution(
     diff_scores_path: str,
     plots_dir: str,
@@ -541,10 +538,10 @@ def plot_differential_distribution(
 
     with plt.style.context(FIGURE_STYLE):
         fig, ax = plt.subplots(figsize=(7, 4))
-        ax.hist(scores[scores >= 0], bins=40, color=PALETTE["positive"],
+        ax.hist(scores[scores >= 0], bins=40, color=PALETTE["negative"],
                 edgecolor="white", linewidth=0.5,
                 label="More variable in %s" % name2)
-        ax.hist(scores[scores < 0], bins=40, color=PALETTE["negative"],
+        ax.hist(scores[scores < 0], bins=40, color=PALETTE["positive"],
                 edgecolor="white", linewidth=0.5,
                 label="More variable in %s" % name1)
         ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
@@ -554,7 +551,6 @@ def plot_differential_distribution(
         ax.legend(fontsize=10)
         fig.tight_layout()
     _save(fig, plots_dir, "differential_distribution")
-
 
 # ---------------------------------------------------------------------------
 # Entry points called from cli.py

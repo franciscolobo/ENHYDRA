@@ -18,6 +18,24 @@ def _parse_config(fh) -> dict:
     return config
 
 
+def _parse_bool(value: str, default: bool = False) -> bool:
+    """Parse a config-file string as a boolean.
+
+    Accepts (case-insensitive): 'true', 'yes', 'on', '1' as True, and
+    'false', 'no', 'off', '0' as False. An empty or unset value returns
+    default rather than raising, since these are all optional flags that
+    default to off.
+    """
+    if value is None or value == '':
+        return default
+    v = str(value).strip().lower()
+    if v in ('true', 'yes', 'on', '1'):
+        return True
+    if v in ('false', 'no', 'off', '0'):
+        return False
+    return default
+
+
 def read_config_file(fh_project, fh_code) -> dict:
     """Read project and code config files into a parameters dict."""
     project = _parse_config(fh_project)
@@ -63,6 +81,13 @@ def read_config_file(fh_project, fh_code) -> dict:
         'list1_name':       project.get('list1_name', 'List 1'),
         'list2_name':       project.get('list2_name', 'List 2'),
         'sources':          project.get('sources', 'GO:BP GO:MF GO:CC KEGG REAC'),
+        # Run-mode flags (previously CLI-only; can now also be set here)
+        'orthofinder_dir':  project.get('orthofinder_dir', ''),
+        'resume':           _parse_bool(project.get('resume', '')),
+        'fork_from':        project.get('fork_from', ''),
+        'replot':           _parse_bool(project.get('replot', '')),
+        'quiet':            _parse_bool(project.get('quiet', '')),
+        'all_metrics':      _parse_bool(project.get('all_metrics', '')),
     }
     return parameters
 
