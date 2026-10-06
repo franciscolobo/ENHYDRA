@@ -173,3 +173,51 @@ def resolve_divergence_filter_sd(value: str | float | None) -> float | None:
             "number." % (value,)
         )
     return sd
+
+
+def resolve_gene_set_embed_threshold(value: str | float | None) -> float | None:
+    """Translate the 'gene_set_embed_threshold' parameter into an FDR cutoff.
+
+    Controls which tested gene sets have their full membership / leading
+    edge gene lists embedded in the HTML report for click-to-view (see
+    report._results_table_html()). Embedding this data for every tested
+    gene set inflates report size and browser memory dramatically for
+    genome-scale gene set collections (tens of thousands of terms), most
+    of which are never significant and never actually inspected.
+
+    Args:
+        value: One of:
+            - '' or None: not set — callers should fall back to using
+              the run's own --fdr-threshold as the embed cutoff (i.e.
+              only significant gene sets get their gene lists embedded).
+            - a positive number (str or float): gene sets with
+              FDR q-val strictly below this value have their gene lists
+              embedded; all others show a plain count only. Pass a value
+              looser than --fdr-threshold (e.g. 0.5) to also embed
+              near-significant terms, or 'inf' to embed every tested gene
+              set's data regardless of significance (restores the
+              previous, unrestricted behaviour — expect large reports
+              for genome-scale gene set collections).
+
+    Returns:
+        The threshold as a float, or None if not set.
+
+    Raises:
+        EnhydraConfigError: If value is set but is not a positive number.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        raise EnhydraConfigError(
+            "Invalid 'gene_set_embed_threshold' value: %r. Must be a "
+            "positive number, or 'inf' to embed every tested gene set's "
+            "data regardless of significance." % (value,)
+        )
+    if threshold <= 0:
+        raise EnhydraConfigError(
+            "Invalid 'gene_set_embed_threshold' value: %r. Must be a "
+            "positive number." % (value,)
+        )
+    return threshold

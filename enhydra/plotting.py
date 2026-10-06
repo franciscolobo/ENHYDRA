@@ -7,7 +7,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-
+from .filtering import display_group_id
 from .differential import normalise_scores
 
 logging.getLogger("fontTools").setLevel(logging.ERROR)

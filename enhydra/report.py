@@ -45,10 +45,9 @@ _METRIC_DESCS = {
 }
 
 # Overlap coefficient above which two significant gene sets are considered
-# redundant by build_significance_agreement... no — by
-# _cluster_redundant_terms() (see that function's own docstring for the
-# full rationale). Exposed here as a module-level default so
-# _results_table_html()/_build_report_impl()/build_report()/
+# redundant by _cluster_redundant_terms() (see that function's own
+# docstring for the full rationale). Exposed here as a module-level
+# default so _results_table_html()/_build_report_impl()/build_report()/
 # build_multi_metric_report() all share one fallback value.
 DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD = 0.75
 
@@ -1962,6 +1961,7 @@ def _results_table_html(
     gene_sets: dict[str, list[str]] | None = None,
     gene_to_page: dict[str, tuple[str | None, str | None]] | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ) -> tuple[str, list[int], dict[str, str], dict[str, str],
           dict[str, str], dict[str, str], dict[str, str]]:
     """Build the enrichment results DataTable HTML for one metric.
@@ -1981,11 +1981,35 @@ def _results_table_html(
     with" column is not given special handling in the Excel export, so
     only the HTML-modal rendering is needed.
 
+    Only gene sets with FDR < gene_list_fdr_threshold (defaulting to
+    fdr_threshold itself if not given) have their full/leading-edge gene
+    lists populated in these dicts at all — see the gene_list_fdr_threshold
+    arg below. A gene set that doesn't qualify still gets a "Full gene
+    set"/"Leading edge" cell showing a plain gene count, just with nothing
+    added to these dicts (and therefore nothing embedded in the report's
+    JSON payload for it). This matters for large, genome-scale GMTs: with
+    tens of thousands of tested gene sets, embedding every one's full
+    membership (plus a second, HTML-chip-rendered copy of the same list)
+    previously caused multi-GB browser memory usage when the report was
+    opened.
+
     Args:
         overlap_threshold: Passed through to _cluster_redundant_terms()
                            for computing the "Redundant with" column. See
                            that function's own docstring for the full
                            rationale.
+        gene_list_fdr_threshold: FDR threshold below which a gene set's
+                           full gene list / leading-edge gene list is
+                           embedded (as a clickable "View" link) rather
+                           than shown as a plain count. None (the
+                           default) means "use fdr_threshold" — i.e. only
+                           gene sets significant at the table's own
+                           significance cutoff get embedded gene lists.
+                           Set higher than fdr_threshold (e.g. 1.0) to
+                           embed gene lists for virtually all tested gene
+                           sets, restoring the original, unrestricted
+                           behaviour (can produce very large reports for
+                           genome-scale GMTs).
     """
     df = df.copy()
     if "Term" not in df.columns:
@@ -2002,6 +2026,18 @@ def _results_table_html(
         cluster_info = _cluster_redundant_terms(
             df, gene_sets, fdr_threshold, overlap_threshold,
         )
+
+    # Also computed here, before stringification, for the same reason:
+    # the embedding-gate check below (in _full_set_cell/_leadedge_cell)
+    # needs a numeric FDR comparison, not the "%.4f"-formatted string the
+    # stringification loop below produces.
+    effective_gene_list_threshold = (
+        gene_list_fdr_threshold if gene_list_fdr_threshold is not None
+        else fdr_threshold
+    )
+    fdr_numeric_by_term: dict[str, float] = dict(
+        zip(df["Term"], pd.to_numeric(df["FDR q-val"], errors="coerce"))
+    )
 
     for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val",
                 "Tag %", "Gene %", "Mean score",
@@ -2027,9 +2063,12 @@ def _results_table_html(
             genes = gene_sets.get(term_id)
             if not genes:
                 return ""
-            full_sets_js[term_id] = "\n".join(genes)
-            full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
-            return "View (%d)" % len(genes)
+            fdr = fdr_numeric_by_term.get(term_id)
+            if fdr is not None and fdr < effective_gene_list_threshold:
+                full_sets_js[term_id] = "\n".join(genes)
+                full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
+                return "View (%d)" % len(genes)
+            return "%d gene%s" % (len(genes), "" if len(genes) == 1 else "s")
         df["Full gene set"] = df["Term"].apply(_full_set_cell)
 
     lead_col = _find_lead_genes_col(df)
@@ -2041,9 +2080,13 @@ def _results_table_html(
             genes = [g.strip() for g in str(raw).split(";") if g.strip()]
             if not genes:
                 return ""
-            leadedge_js[row["Term"]] = "\n".join(genes)
-            leadedge_html_js[row["Term"]] = _gene_chip_list_html(genes, gene_to_page)
-            return "View (%d)" % len(genes)
+            term_id = row["Term"]
+            fdr = fdr_numeric_by_term.get(term_id)
+            if fdr is not None and fdr < effective_gene_list_threshold:
+                leadedge_js[term_id] = "\n".join(genes)
+                leadedge_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
+                return "View (%d)" % len(genes)
+            return "%d gene%s" % (len(genes), "" if len(genes) == 1 else "s")
         df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
 
     if cluster_info:
@@ -2095,10 +2138,16 @@ def _results_table_html(
         ("Gene %",       "Gene %",
          "Fraction of all ranked genes in the leading edge (0-1)."),
         ("Full gene set", "Full gene set",
-         "All genes annotated to this gene set. Click to view as a text list."),
+         "All genes annotated to this gene set. \u201cView\u201d opens the "
+         "full list as text (only embedded for gene sets with FDR < %.2f, "
+         "to limit report size \u2014 others show a count only)."
+         % effective_gene_list_threshold),
         ("Leading edge", "Leading edge",
          "Genes from this set found in the leading edge of the ranked list "
-         "(i.e. driving the enrichment score). Click to view as a text list."),
+         "(i.e. driving the enrichment score). \u201cView\u201d opens the "
+         "full list as text (only embedded for gene sets with FDR < %.2f, "
+         "to limit report size \u2014 others show a count only)."
+         % effective_gene_list_threshold),
         ("Redundant with", "Redundant with",
          "Among significant gene sets (FDR < %.2f), this gene set shares "
          "an overlap coefficient of \u2265 %.2f with the listed gene "
@@ -2145,12 +2194,12 @@ def _results_table_html(
                     '<td><a href="#" class="go-link" data-goid="%s"%s>%s</a></td>'
                     % (go_id, metric_attr, val)
                 )
-            elif col == "Full gene set" and val:
+            elif col == "Full gene set" and isinstance(val, str) and val.startswith("View ("):
                 cells += (
                     '<td><a href="#" class="geneset-link" data-goid="%s">%s</a></td>'
                     % (go_id, val)
                 )
-            elif col == "Leading edge" and val:
+            elif col == "Leading edge" and isinstance(val, str) and val.startswith("View ("):
                 cells += (
                     '<td><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
                     % (go_id, metric_attr, val)
@@ -2426,6 +2475,7 @@ def _build_report_impl(
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ):
     logger.info("Building HTML report (%d metric tab(s))...", len(metric_data))
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
@@ -2437,6 +2487,17 @@ def _build_report_impl(
     dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
     dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
     xlsx_js   = _fetch_cached(_XLSX_JS_URL,        cache_dir, "xlsx.full.min.js")
+
+    # Threshold below which a gene set's full gene list / leading-edge
+    # gene list is embedded in the report (see _results_table_html()). A
+    # single global value shared by every metric tab, since it controls
+    # report size/scope rather than anything metric-specific; defaults to
+    # fdr_threshold itself so "only significant gene sets get embedded
+    # gene lists" is the default with no config change required.
+    effective_gene_list_threshold = (
+        gene_list_fdr_threshold if gene_list_fdr_threshold is not None
+        else fdr_threshold
+    )
 
     single_metric = len(metric_data) == 1
     if mode == "differential":
@@ -2507,6 +2568,7 @@ def _build_report_impl(
                 metric=metric, col1_label=label1, col2_label=label2,
                 gene_sets=gene_sets_all, gene_to_page=gene_to_page,
                 overlap_threshold=overlap_threshold,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
             numeric_cols_map[metric] = num_cols
             full_gene_sets_accum.update(full_sets_js)
@@ -2532,7 +2594,10 @@ def _build_report_impl(
             'in blue. Click a GO ID to view its enrichment plot, or "View" '
             'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge / '
             'Redundant&nbsp;with to see the associated gene/gene-set '
-            'lists, with links to alignment pages where available.</p>\n'
+            'lists, with links to alignment pages where available. To keep '
+            'report size manageable, full gene and leading-edge lists are '
+            'only embedded for gene sets with FDR&nbsp;&lt;&nbsp;{gl_fdr}; '
+            'other gene sets show a count only.</p>\n'
             '  <p>'
             '<button class="sig-toggle-btn" data-metric="{m}">Show only significant</button> '
             '<button class="nonredundant-toggle-btn" data-metric="{m}">Show non-redundant only</button> '
@@ -2544,7 +2609,8 @@ def _build_report_impl(
             '  {tbl}\n'
             '</div>\n'.format(
                 m=metric, ac=active_cls, desc_html=desc_html,
-                plots=plots_html, fdr=fdr_threshold, tbl=tbl_html,
+                plots=plots_html, fdr=fdr_threshold,
+                gl_fdr=effective_gene_list_threshold, tbl=tbl_html,
             )
         )
         first = False
@@ -2752,6 +2818,7 @@ def build_report(
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ):
     """Build a single-metric HTML report (one enrichment tab + Alignments +
     Filtering summary + Run parameters).
@@ -2775,6 +2842,16 @@ def build_report(
                              metric's enrichment table. See
                              _cluster_redundant_terms() for the full
                              algorithm.
+        gene_list_fdr_threshold: FDR threshold below which a gene set's
+                             full gene list / leading-edge gene list is
+                             embedded in the report as a clickable "View"
+                             link, rather than shown as a plain count.
+                             None (the default) means "use fdr_threshold"
+                             — i.e. only significant gene sets get
+                             embedded gene lists, which keeps report size
+                             manageable for large (e.g. genome-scale)
+                             gene set collections. See
+                             _results_table_html() for the full rationale.
     """
     metric_data = {metric: {"results_dir": results_dir, "plots_dir": plots_dir}}
     _build_report_impl(
@@ -2790,6 +2867,7 @@ def build_report(
         alignment_pages2=alignment_pages2,
         run_parameters_path=run_parameters_path,
         overlap_threshold=overlap_threshold,
+        gene_list_fdr_threshold=gene_list_fdr_threshold,
     )
 
 
@@ -2812,6 +2890,7 @@ def build_multi_metric_report(
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ):
     """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
     including the Cross-metric consensus, Alignments, Filtering summary,
@@ -2830,6 +2909,16 @@ def build_multi_metric_report(
                              metric's enrichment table. See
                              _cluster_redundant_terms() for the full
                              algorithm.
+        gene_list_fdr_threshold: FDR threshold below which a gene set's
+                             full gene list / leading-edge gene list is
+                             embedded in the report as a clickable "View"
+                             link, rather than shown as a plain count.
+                             None (the default) means "use fdr_threshold"
+                             — i.e. only significant gene sets get
+                             embedded gene lists, which keeps report size
+                             manageable for large (e.g. genome-scale)
+                             gene set collections. See
+                             _results_table_html() for the full rationale.
     """
     _build_report_impl(
         metric_data=metric_data, report_path=report_path, obo_path=obo_path,
@@ -2844,4 +2933,5 @@ def build_multi_metric_report(
         alignment_pages2=alignment_pages2,
         run_parameters_path=run_parameters_path,
         overlap_threshold=overlap_threshold,
+        gene_list_fdr_threshold=gene_list_fdr_threshold,
     )

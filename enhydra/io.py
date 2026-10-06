@@ -75,6 +75,7 @@ def read_config_file(fh_project, fh_code) -> dict:
         # Report
         'top_n':            int(project.get('top_n', 20)),
         'obo_cache':        project.get('obo_cache', ''),
+        'gene_list_fdr_threshold': project.get('gene_list_fdr_threshold', ''),
         # Two-list mode
         'list1':            project.get('list1', ''),
         'list2':            project.get('list2', ''),

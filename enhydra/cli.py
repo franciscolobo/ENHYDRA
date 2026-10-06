@@ -778,6 +778,20 @@ def _build_arg_parser():
     parser.add_argument("--max-size",      type=int,   default=None)
     parser.add_argument("--seed",          type=int,   default=None)
     parser.add_argument("--fdr-threshold", type=float, default=None)
+    parser.add_argument(
+        "--gene-list-fdr-threshold", type=float, default=None, metavar="FDR",
+        help="(Advanced) FDR threshold below which a gene set's full gene "
+             "list and leading-edge gene list are embedded in the HTML "
+             "report as clickable 'View' links; gene sets at or above "
+             "this threshold show a count only, to keep report size "
+             "manageable for large (e.g. genome-scale) gene set "
+             "collections. Defaults to the same value as --fdr-threshold "
+             "(i.e. only significant gene sets get embedded gene lists). "
+             "Set to 1.0 or higher to embed gene lists for virtually all "
+             "tested gene sets (restores the original, unrestricted "
+             "behaviour — can produce very large reports). Can also be "
+             "set via 'gene_list_fdr_threshold' in the project config."
+    )
     parser.add_argument("--top-n",         type=int,   default=None)
     parser.add_argument("--obo-cache",     default=None)
 
@@ -814,6 +828,28 @@ def main():
     max_size      = _resolve(args.max_size,      parameters['max_size'],      500)
     seed          = _resolve(args.seed,          parameters['seed'],          42)
     fdr_threshold = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
+
+    # (Advanced) Independent FDR cutoff controlling which gene sets get
+    # their full gene / leading-edge gene lists embedded in the report
+    # (see report._results_table_html()). Kept separate from
+    # fdr_threshold itself (which still governs significance everywhere
+    # else) so a person can keep a lenient --fdr-threshold for the results
+    # table while still capping report size. '' / unset means "use
+    # fdr_threshold" — i.e. only significant gene sets get embedded gene
+    # lists, which is the default, restricted behaviour.
+    gene_list_fdr_threshold_raw = _resolve(
+        args.gene_list_fdr_threshold, parameters['gene_list_fdr_threshold'], '')
+    try:
+        gene_list_fdr_threshold = (
+            float(gene_list_fdr_threshold_raw)
+            if gene_list_fdr_threshold_raw not in (None, '') else None
+        )
+    except (TypeError, ValueError):
+        sys.exit(
+            "Configuration error: invalid 'gene_list_fdr_threshold' value: "
+            "%r. Must be a number." % (gene_list_fdr_threshold_raw,)
+        )
+
     top_n         = _resolve(args.top_n,         parameters['top_n'],         20)
     list1_path    = _resolve(args.list1,         parameters['list1'],         None)
     list2_path    = _resolve(args.list2,         parameters['list2'],         None)
@@ -860,6 +896,10 @@ def main():
     # not the raw config file contents, which a CLI flag may have silently
     # overridden. Keys match collect_run_parameters()'s resolved_params
     # contract exactly.
+    #
+    # Note: gene_list_fdr_threshold is NOT yet included here, so it is not
+    # currently recorded in run_parameters.json / shown in the report's
+    # Run Parameters tab — a small follow-up, not yet done.
     resolved_params_for_provenance = {
         "min_species":          min_species,
         "min_sequences":        min_sequences,
@@ -944,10 +984,12 @@ def main():
     logger.info(
         "Resolved parameters: metric=%s, all_metrics=%s, replot=%s, "
         "paralogs=%s, trim=%s, divergence_filter_sd=%s, min_species=%d, "
-        "permutations=%d, fdr_threshold=%.2f",
+        "permutations=%d, fdr_threshold=%.2f, gene_list_fdr_threshold=%s",
         metric, all_metrics, replot, paralogs, (trim or "none"),
         (divergence_filter_sd if divergence_filter_sd else "none"),
         min_species, permutations, fdr_threshold,
+        (gene_list_fdr_threshold if gene_list_fdr_threshold is not None
+         else "same as fdr_threshold"),
     )
 
     if orthofinder_dir:
@@ -1141,6 +1183,7 @@ def main():
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
         else:
             build_report(
@@ -1155,6 +1198,7 @@ def main():
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
 
         # Fold every stage marker produced under outdir into
@@ -1406,6 +1450,7 @@ def main():
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
         else:
             build_report(
@@ -1427,6 +1472,7 @@ def main():
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
 
         # See the single-list branch's identical call for the full
