@@ -61,7 +61,14 @@ def collect_run_parameters(
                                length_filter_sd, divergence_filter_sd, trim,
                                aligner, mafft_mode, metric, permutations,
                                min_size, max_size, seed, fdr_threshold,
-                               top_n, gene_sets, organism, sources.
+                               gene_list_fdr_threshold, top_n, gene_sets,
+                               organism, sources. gene_list_fdr_threshold
+                               is recorded as given (including None) — None
+                               means "defaults to fdr_threshold", not
+                               "unset/unknown"; see report.py's
+                               _GSEA_FIELDS label for how this is
+                               surfaced to a reader.
+
         two_list_mode:       Whether this was a two-list differential run.
         orthofinder_dir:     Path to an OrthoFinder output directory, if
                              --orthofinder-dir was used. None otherwise.
@@ -127,6 +134,7 @@ def collect_run_parameters(
             "max_size":      _get("max_size"),
             "seed":          _get("seed"),
             "fdr_threshold": _get("fdr_threshold"),
+            "gene_list_fdr_threshold": _get("gene_list_fdr_threshold"),
             "top_n":         _get("top_n"),
         },
         "gene_sets": {

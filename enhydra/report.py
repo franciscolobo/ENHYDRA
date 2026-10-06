@@ -1038,6 +1038,8 @@ _GSEA_FIELDS = [
     ("max_size",      "Maximum gene set size"),
     ("seed",          "Random seed"),
     ("fdr_threshold", "FDR threshold"),
+    ("gene_list_fdr_threshold", "Gene list embed FDR threshold "
+                                 "(blank = same as FDR threshold)"),
     ("top_n",         "Top N gene sets (plots)"),
 ]
 

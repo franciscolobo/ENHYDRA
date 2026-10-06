@@ -9,7 +9,4 @@ BUGS
 # - some of the values in the table are missing
 # - In paralogs mode, when there are multiple genes of the anchor genome in the same group, only one alignment is shown
 # - color in the dotplot is wrong for the red color.
-- html RAM footprint is still huge
-- html still takes too long to manipulate
-- change ranking for the full and leading edge to use numbers instead of View(number)
 - Some genes from the gmt may be missing in the anchor genome, so they shouldn't be considered as full gene set (table), and shouldn't be shown.

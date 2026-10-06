@@ -10715,184 +10715,6 @@ Paralog handling is controlled by `--paralogs`:
 > *(License information to be added.)*
 </file>
 
-<file path="enhydra/utils.py">
-import os
-import logging
-from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
-
-logger = logging.getLogger(__name__)
-
-
-def _check_tool(path: str, name: str, code_config: str):
-    """Validate that an external tool path is specified, exists, and is executable."""
-    if not path:
-        raise EnhydraConfigError(
-            "No path to %s was specified in code_config: %s" % (name, code_config))
-    if not os.path.isfile(path):
-        raise EnhydraToolError(
-            "%s executable not found at: %s" % (name, path))
-    if not os.access(path, os.X_OK):
-        raise EnhydraToolError(
-            "No execute permission for %s at: %s" % (name, path))
-
-
-def check_parameters(parameters, code_config):
-    if not parameters['inputdir']:
-        raise EnhydraConfigError(
-            "No path to inputdir was specified in your project's configuration file.")
-    if not os.path.isdir(parameters['inputdir']):
-        raise EnhydraIOError(
-            "inputdir is not a valid directory: %s" % parameters['inputdir'])
-    if not os.access(parameters['inputdir'], os.R_OK):
-        raise EnhydraIOError(
-            "No read permission for inputdir: %s" % parameters['inputdir'])
-
-    if not parameters['outdir']:
-        raise EnhydraConfigError(
-            "No path to outdir was specified in your project's configuration file.")
-
-    if not parameters['min_species']:
-        raise EnhydraConfigError(
-            "min_species was not specified in your project's configuration file.")
-
-    if not parameters['anchor']:
-        raise EnhydraConfigError(
-            "No anchor species was specified in your project's configuration file.")
-
-    if not parameters['max_process']:
-        raise EnhydraConfigError(
-            "max_process was not specified in your project's configuration file.")
-
-    # trimal is always required
-    _check_tool(parameters['trimal'], "trimal", code_config)
-
-    # Only validate the configured aligner
-    aligner = parameters.get('aligner', 'mafft')
-    if aligner == 'mafft':
-        _check_tool(parameters['mafft'], "mafft", code_config)
-    elif aligner == 'muscle':
-        _check_tool(parameters['muscle'], "muscle", code_config)
-    elif aligner == 'prank':
-        _check_tool(parameters['prank'], "prank", code_config)
-    else:
-        raise EnhydraConfigError(
-            "Unknown aligner '%s'. Choose from: mafft, muscle, prank." % aligner)
-
-
-def check_lists(
-    species1: list[str],
-    species2: list[str],
-    anchor: str,
-):
-    """Warn if the anchor is absent from list 1 or present in list 2.
-
-    In two-list mode the anchor must be present in list 1 (or will be
-    injected automatically) because group→gene ID mapping is derived
-    exclusively from list 1 alignments.
-
-    Args:
-        species1: Species IDs in list 1.
-        species2: Species IDs in list 2.
-        anchor:   Anchor species ID.
-    """
-    if anchor not in species1:
-        logger.warning(
-            "Anchor species '%s' is not in list 1. It will be added "
-            "automatically, but consider using an anchor that belongs "
-            "to list 1 to avoid potential bias in group filtering.",
-            anchor,
-        )
-    if anchor in species2:
-        logger.warning(
-            "Anchor species '%s' is present in list 2. This is unusual — "
-            "the anchor is expected to belong to list 1.",
-            anchor,
-        )
-
-def resolve_trim_args(trim: str | float | None) -> list[str] | None:
-    """Translate the 'trim' config parameter into trimAl CLI flags.
-
-    Args:
-        trim: One of:
-            - '' or None         : no column trimming (returns None).
-            - a number in [0, 1] : used as trimAl's gap threshold,
-                                   i.e. ['-gt', str(value)].
-            - 'strict'           : ['-strict'].
-            - 'strictplus'       : ['-strictplus'].
-            - 'automated'        : ['-automated1'].
-        Matching against the keyword values is case-insensitive.
-
-    Returns:
-        List of trimAl CLI arguments, or None if trimming is disabled.
-
-    Raises:
-        EnhydraConfigError: If trim is set but matches none of the
-                            accepted values.
-    """
-    if trim in (None, ""):
-        return None
-
-    keyword_map = {
-        "strict":     ["-strict"],
-        "strictplus": ["-strictplus"],
-        "automated":  ["-automated1"],
-    }
-    if isinstance(trim, str) and trim.strip().lower() in keyword_map:
-        return keyword_map[trim.strip().lower()]
-
-    try:
-        value = float(trim)
-    except (TypeError, ValueError):
-        raise EnhydraConfigError(
-            "Invalid 'trim' value: %r. Must be a number between 0 and 1, "
-            "or one of: strict, strictplus, automated." % (trim,)
-        )
-    if not (0 <= value <= 1):
-        raise EnhydraConfigError(
-            "Invalid 'trim' value: %r. Numeric trim values must be between "
-            "0 and 1 (used as trimAl's -gt gap threshold)." % (trim,)
-        )
-    return ["-gt", str(value)]
-
-
-def resolve_divergence_filter_sd(value: str | float | None) -> float | None:
-    """Translate the 'divergence_filter_sd' config parameter into a threshold.
-
-    Used by the post-alignment divergent-sequence filter (see
-    filtering.filter_divergent_sequences()): sequences whose trimAl -sident
-    identity-to-closest-match falls more than this many standard deviations
-    below the group's own mean are flagged, removed, and the group is
-    realigned without them.
-
-    Args:
-        value: One of:
-            - '' or None      : divergence filtering disabled (returns None).
-            - a positive number (str or float): the SD multiplier threshold.
-
-    Returns:
-        The threshold as a float, or None if filtering is disabled.
-
-    Raises:
-        EnhydraConfigError: If value is set but is not a positive number.
-    """
-    if value in (None, ""):
-        return None
-    try:
-        sd = float(value)
-    except (TypeError, ValueError):
-        raise EnhydraConfigError(
-            "Invalid 'divergence_filter_sd' value: %r. Must be a positive "
-            "number (standard deviations below the mean identity-to-"
-            "closest-match)." % (value,)
-        )
-    if sd <= 0:
-        raise EnhydraConfigError(
-            "Invalid 'divergence_filter_sd' value: %r. Must be a positive "
-            "number." % (value,)
-        )
-    return sd
-</file>
-
 <file path="enhydra/msa_viewer.py">
 from __future__ import annotations
 
@@ -12021,6 +11843,232 @@ def build_alignment_pages(
     return pages
 </file>
 
+<file path="enhydra/utils.py">
+import os
+import logging
+from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
+
+logger = logging.getLogger(__name__)
+
+
+def _check_tool(path: str, name: str, code_config: str):
+    """Validate that an external tool path is specified, exists, and is executable."""
+    if not path:
+        raise EnhydraConfigError(
+            "No path to %s was specified in code_config: %s" % (name, code_config))
+    if not os.path.isfile(path):
+        raise EnhydraToolError(
+            "%s executable not found at: %s" % (name, path))
+    if not os.access(path, os.X_OK):
+        raise EnhydraToolError(
+            "No execute permission for %s at: %s" % (name, path))
+
+
+def check_parameters(parameters, code_config):
+    if not parameters['inputdir']:
+        raise EnhydraConfigError(
+            "No path to inputdir was specified in your project's configuration file.")
+    if not os.path.isdir(parameters['inputdir']):
+        raise EnhydraIOError(
+            "inputdir is not a valid directory: %s" % parameters['inputdir'])
+    if not os.access(parameters['inputdir'], os.R_OK):
+        raise EnhydraIOError(
+            "No read permission for inputdir: %s" % parameters['inputdir'])
+
+    if not parameters['outdir']:
+        raise EnhydraConfigError(
+            "No path to outdir was specified in your project's configuration file.")
+
+    if not parameters['min_species']:
+        raise EnhydraConfigError(
+            "min_species was not specified in your project's configuration file.")
+
+    if not parameters['anchor']:
+        raise EnhydraConfigError(
+            "No anchor species was specified in your project's configuration file.")
+
+    if not parameters['max_process']:
+        raise EnhydraConfigError(
+            "max_process was not specified in your project's configuration file.")
+
+    # trimal is always required
+    _check_tool(parameters['trimal'], "trimal", code_config)
+
+    # Only validate the configured aligner
+    aligner = parameters.get('aligner', 'mafft')
+    if aligner == 'mafft':
+        _check_tool(parameters['mafft'], "mafft", code_config)
+    elif aligner == 'muscle':
+        _check_tool(parameters['muscle'], "muscle", code_config)
+    elif aligner == 'prank':
+        _check_tool(parameters['prank'], "prank", code_config)
+    else:
+        raise EnhydraConfigError(
+            "Unknown aligner '%s'. Choose from: mafft, muscle, prank." % aligner)
+
+
+def check_lists(
+    species1: list[str],
+    species2: list[str],
+    anchor: str,
+):
+    """Warn if the anchor is absent from list 1 or present in list 2.
+
+    In two-list mode the anchor must be present in list 1 (or will be
+    injected automatically) because group→gene ID mapping is derived
+    exclusively from list 1 alignments.
+
+    Args:
+        species1: Species IDs in list 1.
+        species2: Species IDs in list 2.
+        anchor:   Anchor species ID.
+    """
+    if anchor not in species1:
+        logger.warning(
+            "Anchor species '%s' is not in list 1. It will be added "
+            "automatically, but consider using an anchor that belongs "
+            "to list 1 to avoid potential bias in group filtering.",
+            anchor,
+        )
+    if anchor in species2:
+        logger.warning(
+            "Anchor species '%s' is present in list 2. This is unusual — "
+            "the anchor is expected to belong to list 1.",
+            anchor,
+        )
+
+def resolve_trim_args(trim: str | float | None) -> list[str] | None:
+    """Translate the 'trim' config parameter into trimAl CLI flags.
+
+    Args:
+        trim: One of:
+            - '' or None         : no column trimming (returns None).
+            - a number in [0, 1] : used as trimAl's gap threshold,
+                                   i.e. ['-gt', str(value)].
+            - 'strict'           : ['-strict'].
+            - 'strictplus'       : ['-strictplus'].
+            - 'automated'        : ['-automated1'].
+        Matching against the keyword values is case-insensitive.
+
+    Returns:
+        List of trimAl CLI arguments, or None if trimming is disabled.
+
+    Raises:
+        EnhydraConfigError: If trim is set but matches none of the
+                            accepted values.
+    """
+    if trim in (None, ""):
+        return None
+
+    keyword_map = {
+        "strict":     ["-strict"],
+        "strictplus": ["-strictplus"],
+        "automated":  ["-automated1"],
+    }
+    if isinstance(trim, str) and trim.strip().lower() in keyword_map:
+        return keyword_map[trim.strip().lower()]
+
+    try:
+        value = float(trim)
+    except (TypeError, ValueError):
+        raise EnhydraConfigError(
+            "Invalid 'trim' value: %r. Must be a number between 0 and 1, "
+            "or one of: strict, strictplus, automated." % (trim,)
+        )
+    if not (0 <= value <= 1):
+        raise EnhydraConfigError(
+            "Invalid 'trim' value: %r. Numeric trim values must be between "
+            "0 and 1 (used as trimAl's -gt gap threshold)." % (trim,)
+        )
+    return ["-gt", str(value)]
+
+
+def resolve_divergence_filter_sd(value: str | float | None) -> float | None:
+    """Translate the 'divergence_filter_sd' config parameter into a threshold.
+
+    Used by the post-alignment divergent-sequence filter (see
+    filtering.filter_divergent_sequences()): sequences whose trimAl -sident
+    identity-to-closest-match falls more than this many standard deviations
+    below the group's own mean are flagged, removed, and the group is
+    realigned without them.
+
+    Args:
+        value: One of:
+            - '' or None      : divergence filtering disabled (returns None).
+            - a positive number (str or float): the SD multiplier threshold.
+
+    Returns:
+        The threshold as a float, or None if filtering is disabled.
+
+    Raises:
+        EnhydraConfigError: If value is set but is not a positive number.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        sd = float(value)
+    except (TypeError, ValueError):
+        raise EnhydraConfigError(
+            "Invalid 'divergence_filter_sd' value: %r. Must be a positive "
+            "number (standard deviations below the mean identity-to-"
+            "closest-match)." % (value,)
+        )
+    if sd <= 0:
+        raise EnhydraConfigError(
+            "Invalid 'divergence_filter_sd' value: %r. Must be a positive "
+            "number." % (value,)
+        )
+    return sd
+
+
+def resolve_gene_set_embed_threshold(value: str | float | None) -> float | None:
+    """Translate the 'gene_set_embed_threshold' parameter into an FDR cutoff.
+
+    Controls which tested gene sets have their full membership / leading
+    edge gene lists embedded in the HTML report for click-to-view (see
+    report._results_table_html()). Embedding this data for every tested
+    gene set inflates report size and browser memory dramatically for
+    genome-scale gene set collections (tens of thousands of terms), most
+    of which are never significant and never actually inspected.
+
+    Args:
+        value: One of:
+            - '' or None: not set — callers should fall back to using
+              the run's own --fdr-threshold as the embed cutoff (i.e.
+              only significant gene sets get their gene lists embedded).
+            - a positive number (str or float): gene sets with
+              FDR q-val strictly below this value have their gene lists
+              embedded; all others show a plain count only. Pass a value
+              looser than --fdr-threshold (e.g. 0.5) to also embed
+              near-significant terms, or 'inf' to embed every tested gene
+              set's data regardless of significance (restores the
+              previous, unrestricted behaviour — expect large reports
+              for genome-scale gene set collections).
+
+    Returns:
+        The threshold as a float, or None if not set.
+
+    Raises:
+        EnhydraConfigError: If value is set but is not a positive number.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        raise EnhydraConfigError(
+            "Invalid 'gene_set_embed_threshold' value: %r. Must be a "
+            "positive number, or 'inf' to embed every tested gene set's "
+            "data regardless of significance." % (value,)
+        )
+    if threshold <= 0:
+        raise EnhydraConfigError(
+            "Invalid 'gene_set_embed_threshold' value: %r. Must be a "
+            "positive number." % (value,)
+        )
+    return threshold
+</file>
+
 <file path="enhydra/tables.py">
 import os
 import logging
@@ -12222,226 +12270,6 @@ def make_tables(
         len(drop_reasons), "y" if len(drop_reasons) == 1 else "ies",
         drop_reasons_path,
     )
-</file>
-
-<file path="enhydra/io.py">
-from __future__ import annotations
-
-import re
-from io import StringIO
-
-from Bio import SeqIO
-from Bio.SeqRecord import SeqRecord
-
-
-def _parse_config(fh) -> dict:
-    """Parse a config file handle into a dict, ignoring comments and blank lines."""
-    pattern = re.compile(r'^\s*(\w+)\s*=\s*([^#]*)')
-    config = {}
-    for line in fh:
-        m = pattern.match(line)
-        if m:
-            config[m.group(1)] = m.group(2).strip()
-    return config
-
-
-def _parse_bool(value: str, default: bool = False) -> bool:
-    """Parse a config-file string as a boolean.
-
-    Accepts (case-insensitive): 'true', 'yes', 'on', '1' as True, and
-    'false', 'no', 'off', '0' as False. An empty or unset value returns
-    default rather than raising, since these are all optional flags that
-    default to off.
-    """
-    if value is None or value == '':
-        return default
-    v = str(value).strip().lower()
-    if v in ('true', 'yes', 'on', '1'):
-        return True
-    if v in ('false', 'no', 'off', '0'):
-        return False
-    return default
-
-
-def read_config_file(fh_project, fh_code) -> dict:
-    """Read project and code config files into a parameters dict."""
-    project = _parse_config(fh_project)
-    code    = _parse_config(fh_code)
-
-    parameters = {
-        # Required
-        'inputdir':         project.get('inputdir', ''),
-        'outdir':           project.get('outdir', ''),
-        'anchor':           project.get('anchor', ''),
-        'max_process':      int(project.get('max_process', 1)),
-        'mafft':            code.get('mafft', ''),
-        'trimal':           code.get('trimal', ''),
-        # Optional tool paths
-        'muscle':           code.get('muscle', ''),
-        'prank':            code.get('prank', ''),
-        # Filtering
-        'min_species':      int(project.get('min_species', 4)),
-        'min_sequences':    int(project.get('min_sequences', 2)),
-        'paralogs':         project.get('paralogs', 'all'),
-        'length_filter_sd': float(project.get('length_filter_sd', 2.0)),
-        'trim':             project.get('trim', ''),
-        'divergence_filter_sd': project.get('divergence_filter_sd', ''),
-        # Alignment
-        'aligner':          project.get('aligner', 'mafft'),
-        'mafft_mode':       project.get('mafft_mode', 'auto'),
-        # Ranking
-        'metric':           project.get('metric', 'zscore'),
-        # Gene sets
-        'gene_sets':        project.get('gene_sets', ''),
-        'organism':         project.get('organism', ''),
-        'min_size':         int(project.get('min_size', 5)),
-        'max_size':         int(project.get('max_size', 500)),
-        'permutations':     int(project.get('permutations', 1000)),
-        'seed':             int(project.get('seed', 42)),
-        'fdr_threshold':    float(project.get('fdr_threshold', 0.25)),
-        # Report
-        'top_n':            int(project.get('top_n', 20)),
-        'obo_cache':        project.get('obo_cache', ''),
-        # Two-list mode
-        'list1':            project.get('list1', ''),
-        'list2':            project.get('list2', ''),
-        'list1_name':       project.get('list1_name', 'List 1'),
-        'list2_name':       project.get('list2_name', 'List 2'),
-        'sources':          project.get('sources', 'GO:BP GO:MF GO:CC KEGG REAC'),
-        # Run-mode flags (previously CLI-only; can now also be set here)
-        'orthofinder_dir':  project.get('orthofinder_dir', ''),
-        'resume':           _parse_bool(project.get('resume', '')),
-        'fork_from':        project.get('fork_from', ''),
-        'replot':           _parse_bool(project.get('replot', '')),
-        'quiet':            _parse_bool(project.get('quiet', '')),
-        'all_metrics':      _parse_bool(project.get('all_metrics', '')),
-    }
-    return parameters
-
-
-def read_species_list(path: str) -> list[str]:
-    """Parse a species list file into a list of species IDs.
-
-    Lines starting with '#' and blank lines are ignored.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
-        ValueError: If the file is empty after filtering.
-    """
-    species = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            species.append(line)
-    if not species:
-        raise ValueError(
-            "Species list file '%s' is empty or contains only comments." % path
-        )
-    return species
-
-
-def parse_obo_names(obo_path: str) -> dict[str, str]:
-    """Parse a GO OBO file and return a dict mapping GO ID → term name.
-
-    Obsolete terms are excluded.
-
-    Args:
-        obo_path: Path to the go-basic.obo file.
-
-    Returns:
-        Dict of GO ID → human-readable term name.
-    """
-    names: dict[str, str] = {}
-    current_id   = None
-    current_name = None
-    is_obsolete  = False
-    with open(obo_path) as fh:
-        for line in fh:
-            line = line.rstrip()
-            if line == "[Term]":
-                if current_id and not is_obsolete and current_name:
-                    names[current_id] = current_name
-                current_id   = None
-                current_name = None
-                is_obsolete  = False
-            elif line.startswith("id: GO:"):
-                current_id = line[4:]
-            elif line.startswith("name: "):
-                current_name = line[6:]
-            elif line == "is_obsolete: true":
-                is_obsolete = True
-    if current_id and not is_obsolete and current_name:
-        names[current_id] = current_name
-    return names
-
-
-def parse_fasta_records(path: str) -> list[SeqRecord]:
-    """Parse a FASTA file into a list of SeqRecord objects, tolerating any
-    junk/comment lines that precede the first '>' record header.
-
-    Equivalent to `list(Bio.SeqIO.parse(path, "fasta"))` for every
-    well-formed FASTA file, with one difference: newer versions of
-    Biopython's strict "fasta" parser (Biopython >= 1.85) raise
-    ValueError if a file contains any non-header lines before its first
-    '>' record — a pattern that occurs in practice with sequences
-    exported by some external databases/tools that prepend a metadata
-    banner, and that older Biopython versions silently tolerated. This
-    function makes ENHYDRA tolerant of that same input regardless of
-    which Biopython version is installed, by stripping everything before
-    the first '>' line itself — rather than depending on Biopython's own
-    newer 'fasta-pearson'/'fasta-blast' formats (mentioned in that
-    ValueError's own message), which are not available on Biopython
-    versions older than 1.85 and would make adopting them a version
-    compatibility risk for ENHYDRA's own users.
-
-    This deliberately targets only the specific failure mode above
-    (leading junk before the first sequence). It does not attempt to
-    interpret or strip comment-like lines (e.g. ';'-prefixed) that might
-    appear *within* the sequence portion of the file — that is a
-    materially different, more invasive change to how a file's actual
-    sequence content is interpreted, not merely how tolerantly its
-    (possible) leading preamble is skipped, and every ENHYDRA-internal
-    consumer of a FASTA file already writes clean, comment-free files of
-    its own, so this narrower scope covers every place ENHYDRA actually
-    encounters this problem: files originating from outside the pipeline
-    (a user's own input directory, or another tool's output).
-
-    A file containing no '>' line at all (including a completely empty
-    file, or one containing only comments) returns an empty list rather
-    than raising — callers throughout the pipeline already handle "zero
-    sequences found" as a normal, if usually degenerate, case (e.g.
-    filtering.filter_length()'s existing `len(lengths) < 2` check, which
-    already treats a group with too few sequences to filter as one to
-    skip rather than an error).
-
-    Args:
-        path: Path to a FASTA file.
-
-    Returns:
-        A list of Bio.SeqRecord.SeqRecord objects, in file order. Every
-        record's .id/.description/.seq have identical semantics to
-        Bio.SeqIO.parse(path, "fasta")'s own records, since parsing
-        itself (of the part of the file that follows the first '>') is
-        delegated to Biopython entirely unchanged.
-
-    Raises:
-        FileNotFoundError: If path does not exist (matching
-                           Bio.SeqIO.parse()'s own behaviour for a
-                           missing file).
-    """
-    with open(path) as fh:
-        lines = fh.readlines()
-
-    first_header_idx = next(
-        (i for i, line in enumerate(lines) if line.startswith(">")), None
-    )
-    if first_header_idx is None:
-        return []
-
-    cleaned = "".join(lines[first_header_idx:])
-    return list(SeqIO.parse(StringIO(cleaned), "fasta"))
 </file>
 
 <file path="enhydra/alignment.py">
@@ -12804,6 +12632,465 @@ def run_aligner(
     logger.info("Alignment complete using %s.", aligner)
 </file>
 
+<file path="enhydra/io.py">
+from __future__ import annotations
+
+import re
+from io import StringIO
+
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
+
+
+def _parse_config(fh) -> dict:
+    """Parse a config file handle into a dict, ignoring comments and blank lines."""
+    pattern = re.compile(r'^\s*(\w+)\s*=\s*([^#]*)')
+    config = {}
+    for line in fh:
+        m = pattern.match(line)
+        if m:
+            config[m.group(1)] = m.group(2).strip()
+    return config
+
+
+def _parse_bool(value: str, default: bool = False) -> bool:
+    """Parse a config-file string as a boolean.
+
+    Accepts (case-insensitive): 'true', 'yes', 'on', '1' as True, and
+    'false', 'no', 'off', '0' as False. An empty or unset value returns
+    default rather than raising, since these are all optional flags that
+    default to off.
+    """
+    if value is None or value == '':
+        return default
+    v = str(value).strip().lower()
+    if v in ('true', 'yes', 'on', '1'):
+        return True
+    if v in ('false', 'no', 'off', '0'):
+        return False
+    return default
+
+
+def read_config_file(fh_project, fh_code) -> dict:
+    """Read project and code config files into a parameters dict."""
+    project = _parse_config(fh_project)
+    code    = _parse_config(fh_code)
+
+    parameters = {
+        # Required
+        'inputdir':         project.get('inputdir', ''),
+        'outdir':           project.get('outdir', ''),
+        'anchor':           project.get('anchor', ''),
+        'max_process':      int(project.get('max_process', 1)),
+        'mafft':            code.get('mafft', ''),
+        'trimal':           code.get('trimal', ''),
+        # Optional tool paths
+        'muscle':           code.get('muscle', ''),
+        'prank':            code.get('prank', ''),
+        # Filtering
+        'min_species':      int(project.get('min_species', 4)),
+        'min_sequences':    int(project.get('min_sequences', 2)),
+        'paralogs':         project.get('paralogs', 'all'),
+        'length_filter_sd': float(project.get('length_filter_sd', 2.0)),
+        'trim':             project.get('trim', ''),
+        'divergence_filter_sd': project.get('divergence_filter_sd', ''),
+        # Alignment
+        'aligner':          project.get('aligner', 'mafft'),
+        'mafft_mode':       project.get('mafft_mode', 'auto'),
+        # Ranking
+        'metric':           project.get('metric', 'zscore'),
+        # Gene sets
+        'gene_sets':        project.get('gene_sets', ''),
+        'organism':         project.get('organism', ''),
+        'min_size':         int(project.get('min_size', 5)),
+        'max_size':         int(project.get('max_size', 500)),
+        'permutations':     int(project.get('permutations', 1000)),
+        'seed':             int(project.get('seed', 42)),
+        'fdr_threshold':    float(project.get('fdr_threshold', 0.25)),
+        # Report
+        'top_n':            int(project.get('top_n', 20)),
+        'obo_cache':        project.get('obo_cache', ''),
+        'gene_list_fdr_threshold': project.get('gene_list_fdr_threshold', ''),
+        # Two-list mode
+        'list1':            project.get('list1', ''),
+        'list2':            project.get('list2', ''),
+        'list1_name':       project.get('list1_name', 'List 1'),
+        'list2_name':       project.get('list2_name', 'List 2'),
+        'sources':          project.get('sources', 'GO:BP GO:MF GO:CC KEGG REAC'),
+        # Run-mode flags (previously CLI-only; can now also be set here)
+        'orthofinder_dir':  project.get('orthofinder_dir', ''),
+        'resume':           _parse_bool(project.get('resume', '')),
+        'fork_from':        project.get('fork_from', ''),
+        'replot':           _parse_bool(project.get('replot', '')),
+        'quiet':            _parse_bool(project.get('quiet', '')),
+        'all_metrics':      _parse_bool(project.get('all_metrics', '')),
+    }
+    return parameters
+
+
+def read_species_list(path: str) -> list[str]:
+    """Parse a species list file into a list of species IDs.
+
+    Lines starting with '#' and blank lines are ignored.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the file is empty after filtering.
+    """
+    species = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            species.append(line)
+    if not species:
+        raise ValueError(
+            "Species list file '%s' is empty or contains only comments." % path
+        )
+    return species
+
+
+def parse_obo_names(obo_path: str) -> dict[str, str]:
+    """Parse a GO OBO file and return a dict mapping GO ID → term name.
+
+    Obsolete terms are excluded.
+
+    Args:
+        obo_path: Path to the go-basic.obo file.
+
+    Returns:
+        Dict of GO ID → human-readable term name.
+    """
+    names: dict[str, str] = {}
+    current_id   = None
+    current_name = None
+    is_obsolete  = False
+    with open(obo_path) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line == "[Term]":
+                if current_id and not is_obsolete and current_name:
+                    names[current_id] = current_name
+                current_id   = None
+                current_name = None
+                is_obsolete  = False
+            elif line.startswith("id: GO:"):
+                current_id = line[4:]
+            elif line.startswith("name: "):
+                current_name = line[6:]
+            elif line == "is_obsolete: true":
+                is_obsolete = True
+    if current_id and not is_obsolete and current_name:
+        names[current_id] = current_name
+    return names
+
+
+def parse_fasta_records(path: str) -> list[SeqRecord]:
+    """Parse a FASTA file into a list of SeqRecord objects, tolerating any
+    junk/comment lines that precede the first '>' record header.
+
+    Equivalent to `list(Bio.SeqIO.parse(path, "fasta"))` for every
+    well-formed FASTA file, with one difference: newer versions of
+    Biopython's strict "fasta" parser (Biopython >= 1.85) raise
+    ValueError if a file contains any non-header lines before its first
+    '>' record — a pattern that occurs in practice with sequences
+    exported by some external databases/tools that prepend a metadata
+    banner, and that older Biopython versions silently tolerated. This
+    function makes ENHYDRA tolerant of that same input regardless of
+    which Biopython version is installed, by stripping everything before
+    the first '>' line itself — rather than depending on Biopython's own
+    newer 'fasta-pearson'/'fasta-blast' formats (mentioned in that
+    ValueError's own message), which are not available on Biopython
+    versions older than 1.85 and would make adopting them a version
+    compatibility risk for ENHYDRA's own users.
+
+    This deliberately targets only the specific failure mode above
+    (leading junk before the first sequence). It does not attempt to
+    interpret or strip comment-like lines (e.g. ';'-prefixed) that might
+    appear *within* the sequence portion of the file — that is a
+    materially different, more invasive change to how a file's actual
+    sequence content is interpreted, not merely how tolerantly its
+    (possible) leading preamble is skipped, and every ENHYDRA-internal
+    consumer of a FASTA file already writes clean, comment-free files of
+    its own, so this narrower scope covers every place ENHYDRA actually
+    encounters this problem: files originating from outside the pipeline
+    (a user's own input directory, or another tool's output).
+
+    A file containing no '>' line at all (including a completely empty
+    file, or one containing only comments) returns an empty list rather
+    than raising — callers throughout the pipeline already handle "zero
+    sequences found" as a normal, if usually degenerate, case (e.g.
+    filtering.filter_length()'s existing `len(lengths) < 2` check, which
+    already treats a group with too few sequences to filter as one to
+    skip rather than an error).
+
+    Args:
+        path: Path to a FASTA file.
+
+    Returns:
+        A list of Bio.SeqRecord.SeqRecord objects, in file order. Every
+        record's .id/.description/.seq have identical semantics to
+        Bio.SeqIO.parse(path, "fasta")'s own records, since parsing
+        itself (of the part of the file that follows the first '>') is
+        delegated to Biopython entirely unchanged.
+
+    Raises:
+        FileNotFoundError: If path does not exist (matching
+                           Bio.SeqIO.parse()'s own behaviour for a
+                           missing file).
+    """
+    with open(path) as fh:
+        lines = fh.readlines()
+
+    first_header_idx = next(
+        (i for i, line in enumerate(lines) if line.startswith(">")), None
+    )
+    if first_header_idx is None:
+        return []
+
+    cleaned = "".join(lines[first_header_idx:])
+    return list(SeqIO.parse(StringIO(cleaned), "fasta"))
+</file>
+
+<file path="enhydra/gsea.py">
+from __future__ import annotations
+import os
+import logging
+import pandas as pd
+import gseapy as gp
+from gprofiler import GProfiler
+
+from .exceptions import EnhydraIOError
+
+logger = logging.getLogger(__name__)
+
+def _load_ranked(anchor2mean_path: str) -> pd.DataFrame:
+    """Load and sort the anchor2mean table by identity (descending)."""
+    if not os.path.isfile(anchor2mean_path):
+        raise EnhydraIOError("anchor2mean file not found: %s" % anchor2mean_path)
+    ranked = pd.read_csv(
+        anchor2mean_path,
+        sep="\t",
+        header=None,
+        names=["gene_id", "identity"],
+        dtype={"gene_id": str},
+    )
+    ranked["identity"] = pd.to_numeric(ranked["identity"], errors="coerce")
+    ranked = ranked.dropna(subset=["identity"])
+    return ranked.sort_values("identity", ascending=False)
+
+
+def _gmt_gene_set(gmt_path: str) -> set[str]:
+    """Return the set of all gene IDs present in a GMT file."""
+    genes: set[str] = set()
+    with open(gmt_path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            # GMT: term_id <TAB> description <TAB> gene1 <TAB> gene2 ...
+            genes.update(fields[2:])
+    return genes
+
+
+def _check_overlap(ranked: pd.DataFrame, gmt_path: str) -> None:
+    """Raise a clear error if the ranked list barely overlaps with the GMT.
+
+    Args:
+        ranked:   Ranked gene DataFrame (gene_id, identity).
+        gmt_path: Path to the GMT file.
+
+    Raises:
+        EnhydraIOError: If fewer than 2 genes overlap, with a diagnostic
+                        message showing example IDs from both sides.
+    """
+    ranked_ids = set(ranked["gene_id"].astype(str))
+    gmt_ids    = _gmt_gene_set(gmt_path)
+    overlap    = ranked_ids & gmt_ids
+    n_overlap  = len(overlap)
+
+    logger.info(
+        "Preflight: %d ranked genes, %d genes in GMT, %d in common.",
+        len(ranked_ids), len(gmt_ids), n_overlap,
+    )
+
+    if n_overlap < 2:
+        ranked_ex = ", ".join(list(ranked_ids)[:5])
+        gmt_ex    = ", ".join(list(gmt_ids)[:5])
+        raise EnhydraIOError(
+            "Too few genes overlap between the ranked list and the GMT file "
+            "(%d in common — GSEApy requires at least 2).\n\n"
+            "This usually means the gene IDs in anchor2mean.tsv do not match "
+            "those in the GMT file.\n\n"
+            "Example ranked IDs : %s\n"
+            "Example GMT IDs    : %s\n\n"
+            "Check that the GMT was built from the same anchor proteome used "
+            "to run the pipeline."
+            % (n_overlap, ranked_ex, gmt_ex)
+        )
+
+
+def _convert_gsea_plots_to_png(results_dir: str):
+    """Convert GSEApy-generated PDFs to PNGs for HTML embedding."""
+    prerank_dir = os.path.join(results_dir, "prerank")
+    if not os.path.isdir(prerank_dir):
+        return
+    pdfs = [f for f in os.listdir(prerank_dir) if f.endswith(".pdf")]
+    if not pdfs:
+        return
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        logger.warning(
+            "pdf2image not installed — enrichment plots will not be embedded "
+            "in the HTML report. Install with: pip install 'enhydra[plots]'\n"
+            "Also requires poppler: brew install poppler (macOS) or "
+            "apt install poppler-utils (Linux)."
+        )
+        return
+    logger.info("Converting %d GSEApy PDF plots to PNG...", len(pdfs))
+    for pdf_file in pdfs:
+        pdf_path = os.path.join(prerank_dir, pdf_file)
+        png_path = pdf_path.replace(".pdf", ".png")
+        if os.path.isfile(png_path):
+            continue
+        try:
+            images = convert_from_path(pdf_path, dpi=150)
+            if images:
+                images[0].save(png_path, "PNG")
+        except Exception as e:
+            logger.warning("Failed to convert %s: %s", pdf_file, e)
+
+
+def build_gmt_from_gprofiler(
+    gene_ids: list[str],
+    organism: str,
+    gmt_path: str,
+    sources: list[str] | None = None,
+) -> str:
+    """Fetch annotations from g:Profiler and write a GMT file."""
+    if sources is None:
+        sources = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]
+    logger.info(
+        "Fetching annotations from g:Profiler for %d genes, organism: %s, sources: %s",
+        len(gene_ids), organism, sources,
+    )
+    gprofiler = GProfiler(user_agent="ENHYDRA", return_dataframe=True)
+    results = gprofiler.profile(
+        organism=organism,
+        query=gene_ids,
+        sources=sources,
+        user_threshold=1.0,
+        no_evidences=False,
+    )
+    if results.empty:
+        raise EnhydraIOError(
+            "g:Profiler returned no annotations for organism '%s'. "
+            "Please check the organism name at https://biit.cs.ut.ee/gprofiler."
+            % organism
+        )
+    n_terms = 0
+    with open(gmt_path, "w") as fh:
+        for _, row in results.iterrows():
+            genes = row.get("intersections")
+            if not isinstance(genes, (list, tuple, set)) or len(genes) == 0:
+                continue
+            fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], "\t".join(genes)))
+            n_terms += 1
+    logger.info("GMT file written: %d terms, path: %s", n_terms, gmt_path)
+    return gmt_path
+
+def run_gsea(
+    anchor2mean_path: str,
+    results_dir: str,
+    gene_sets: str,
+    organism: str | None = None,
+    sources: list[str] | None = None,
+    permutations: int = 1000,
+    min_size: int = 5,
+    max_size: int = 500,
+    seed: int = 42,
+    fdr_threshold: float = 0.25,
+    weight: float = 0,
+) -> gp.Prerank:
+    """Run GSEApy prerank, optionally fetching annotations from g:Profiler."""
+    os.makedirs(results_dir, exist_ok=True)
+    ranked = _load_ranked(anchor2mean_path)
+
+    if organism is not None:
+        gmt_path = os.path.join(results_dir, "gprofiler_%s.gmt" % organism)
+
+        if os.path.isfile(gmt_path):
+            logger.info("GMT file already exists, skipping API call: %s", gmt_path)
+        else:
+            build_gmt_from_gprofiler(
+                gene_ids=ranked["gene_id"].tolist(),
+                organism=organism,
+                gmt_path=gmt_path,
+                sources=sources,
+            )
+
+        gene_sets = gmt_path
+
+    # Preflight: fail early with a clear message if IDs don't match
+    _check_overlap(ranked, gene_sets)
+
+    logger.info(
+        "Running GSEApy prerank: %d genes, gene sets: %s, permutations: %d",
+        len(ranked),
+        gene_sets,
+        permutations,
+    )
+
+    results = gp.prerank(
+        rnk=ranked,
+        gene_sets=gene_sets,
+        outdir=results_dir,
+        permutation_num=permutations,
+        min_size=min_size,
+        max_size=max_size,
+        seed=seed,
+        weight=weight,
+        graph_num=0,
+        verbose=False,
+    )
+
+    sig_rows = results.res2d[
+        results.res2d["FDR q-val"] < fdr_threshold
+    ]
+    n_sig = len(sig_rows)
+
+    logger.info(
+        "GSEA complete. %d significant gene sets (FDR < %s).",
+        n_sig,
+        fdr_threshold,
+    )
+
+    if n_sig > 0:
+        logger.info(
+            "Generating enrichment plots for %d significant gene sets...",
+            n_sig,
+        )
+
+        plots_dir = os.path.join(results_dir, "prerank")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        for term in sig_rows["Term"]:
+            safe_term_name = term.replace("/", "_").replace("\\", "_")
+            output_path = os.path.join(
+                plots_dir,
+                f"{safe_term_name}.png",
+            )
+
+            gp.gseaplot(
+                rank_metric=results.ranking,
+                term=term,
+                **results.results[term],
+                ofname=output_path,
+            )
+
+    return results
+</file>
+
 <file path="enhydra/plotting.py">
 from __future__ import annotations
 
@@ -12814,7 +13101,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-
+from .filtering import display_group_id
 from .differential import normalise_scores
 
 logging.getLogger("fontTools").setLevel(logging.ERROR)
@@ -13420,244 +13707,143 @@ def make_differential_plots(
         obo_names=obo_names, fdr_threshold=fdr_threshold, top_n=top_n,
         title="Top differentially enriched gene sets",
     )
-</file>
 
-<file path="enhydra/gsea.py">
-from __future__ import annotations
-import os
-import logging
-import pandas as pd
-import gseapy as gp
-from gprofiler import GProfiler
+def _save_identity_scatter_svg(
+    x: pd.Series,
+    y: pd.Series,
+    c: pd.Series,
+    group2anchor: dict[str, str],
+    out_path: str,
+    label1: str,
+    label2: str,
+    vmax: float,
+    title: str = "Identity comparison between lists",
+):
+    """Generate an interactive SVG scatter plot with per-point hover tooltips.
 
-from .exceptions import EnhydraIOError
-
-logger = logging.getLogger(__name__)
-
-def _load_ranked(anchor2mean_path: str) -> pd.DataFrame:
-    """Load and sort the anchor2mean table by identity (descending)."""
-    if not os.path.isfile(anchor2mean_path):
-        raise EnhydraIOError("anchor2mean file not found: %s" % anchor2mean_path)
-    ranked = pd.read_csv(
-        anchor2mean_path,
-        sep="\t",
-        header=None,
-        names=["gene_id", "identity"],
-        dtype={"gene_id": str},
-    )
-    ranked["identity"] = pd.to_numeric(ranked["identity"], errors="coerce")
-    ranked = ranked.dropna(subset=["identity"])
-    return ranked.sort_values("identity", ascending=False)
-
-
-def _gmt_gene_set(gmt_path: str) -> set[str]:
-    """Return the set of all gene IDs present in a GMT file."""
-    genes: set[str] = set()
-    with open(gmt_path) as fh:
-        for line in fh:
-            fields = line.rstrip("\n").split("\t")
-            # GMT: term_id <TAB> description <TAB> gene1 <TAB> gene2 ...
-            genes.update(fields[2:])
-    return genes
-
-
-def _check_overlap(ranked: pd.DataFrame, gmt_path: str) -> None:
-    """Raise a clear error if the ranked list barely overlaps with the GMT.
+    Each circle represents one orthogroup.  Hovering shows the orthogroup ID,
+    anchor gene ID, list 1 score, list 2 score, and differential score.
+    Color encodes the differential score on an RdBu scale (blue = more
+    variable in list 2, red = more variable in list 1).
 
     Args:
-        ranked:   Ranked gene DataFrame (gene_id, identity).
-        gmt_path: Path to the GMT file.
-
-    Raises:
-        EnhydraIOError: If fewer than 2 genes overlap, with a diagnostic
-                        message showing example IDs from both sides.
+        x:             List 1 scores, indexed by group_id. Callers are
+                       expected to pass the same metric-transformed values
+                       (raw identity, z-score, or rank) used to produce
+                       the differential score in `c` — see
+                       plot_identity_scatter()'s own docstring.
+        y:             List 2 scores, indexed by group_id.
+        c:             Differential scores, indexed by group_id.
+        group2anchor:  group_id → anchor gene ID.
+        out_path:      Output SVG file path.
+        label1:        X-axis label.
+        label2:        Y-axis label.
+        vmax:          Differential score magnitude used for colour saturation
+                       (typically the 95th percentile of abs(c)).
+        title:         Plot title. Defaults to the identity-metric wording
+                       for backward compatibility with any direct callers;
+                       plot_identity_scatter() always passes an explicit,
+                       metric-aware title.
     """
-    ranked_ids = set(ranked["gene_id"].astype(str))
-    gmt_ids    = _gmt_gene_set(gmt_path)
-    overlap    = ranked_ids & gmt_ids
-    n_overlap  = len(overlap)
+    import xml.etree.ElementTree as ET
 
-    logger.info(
-        "Preflight: %d ranked genes, %d genes in GMT, %d in common.",
-        len(ranked_ids), len(gmt_ids), n_overlap,
-    )
+    ml, mr, mt, mb = 55, 20, 30, 55
+    pw, ph = 370, 370
+    sw, sh = ml + pw + mr, mt + ph + mb
 
-    if n_overlap < 2:
-        ranked_ex = ", ".join(list(ranked_ids)[:5])
-        gmt_ex    = ", ".join(list(gmt_ids)[:5])
-        raise EnhydraIOError(
-            "Too few genes overlap between the ranked list and the GMT file "
-            "(%d in common — GSEApy requires at least 2).\n\n"
-            "This usually means the gene IDs in anchor2mean.tsv do not match "
-            "those in the GMT file.\n\n"
-            "Example ranked IDs : %s\n"
-            "Example GMT IDs    : %s\n\n"
-            "Check that the GMT was built from the same anchor proteome used "
-            "to run the pipeline."
-            % (n_overlap, ranked_ex, gmt_ex)
+    # Padding is proportional to the data's own range rather than a fixed
+    # absolute offset — see plot_identity_scatter()'s own note on this,
+    # since identity (~0-1), z-score (roughly -3 to 3), and rank (0-1)
+    # spans differ substantially and a fixed pad tuned for one looks wrong
+    # on another.
+    data_min = min(float(x.min()), float(y.min()))
+    data_max = max(float(x.max()), float(y.max()))
+    span     = data_max - data_min
+    pad      = span * 0.03 if span > 0 else 0.02
+    lo, hi   = data_min - pad, data_max + pad
+    rng      = hi - lo or 1.0
+
+    def spx(v):  return ml + (v - lo) / rng * pw
+    def spy(v):  return mt + ph - (v - lo) / rng * ph   # y-axis flipped
+
+    svg = ET.Element("svg", {
+        "xmlns": "http://www.w3.org/2000/svg",
+        "width": str(sw), "height": str(sh),
+        "font-family": "Arial, sans-serif",
+    })
+
+    # Title
+    ET.SubElement(svg, "text", {
+        "x": str(sw // 2), "y": "20",
+        "text-anchor": "middle", "font-size": "12",
+        "font-weight": "bold", "fill": "#1a3a5c",
+    }).text = title
+
+    # Axes
+    ax_y = mt + ph
+    ET.SubElement(svg, "line", {
+        "x1": str(ml), "y1": str(mt), "x2": str(ml), "y2": str(ax_y),
+        "stroke": "#555", "stroke-width": "1"})
+    ET.SubElement(svg, "line", {
+        "x1": str(ml), "y1": str(ax_y), "x2": str(ml + pw), "y2": str(ax_y),
+        "stroke": "#555", "stroke-width": "1"})
+
+    # 1:1 diagonal
+    ET.SubElement(svg, "line", {
+        "x1": str(spx(lo)), "y1": str(spy(lo)),
+        "x2": str(spx(hi)), "y2": str(spy(hi)),
+        "stroke": "#555", "stroke-width": "0.8",
+        "stroke-dasharray": "4,3", "opacity": "0.5"})
+
+    # Ticks
+    for v in [lo + rng * i / 4 for i in range(5)]:
+        ET.SubElement(svg, "line", {
+            "x1": str(spx(v)), "y1": str(ax_y),
+            "x2": str(spx(v)), "y2": str(ax_y + 4),
+            "stroke": "#555", "stroke-width": "1"})
+        ET.SubElement(svg, "text", {
+            "x": str(spx(v)), "y": str(ax_y + 14),
+            "text-anchor": "middle", "font-size": "9", "fill": "#555"
+        }).text = "%.2f" % v
+        ET.SubElement(svg, "line", {
+            "x1": str(ml - 4), "y1": str(spy(v)),
+            "x2": str(ml),     "y2": str(spy(v)),
+            "stroke": "#555", "stroke-width": "1"})
+        ET.SubElement(svg, "text", {
+            "x": str(ml - 7), "y": str(spy(v) + 4),
+            "text-anchor": "end", "font-size": "9", "fill": "#555"
+        }).text = "%.2f" % v
+
+    # Axis labels
+    ET.SubElement(svg, "text", {
+        "x": str(ml + pw // 2), "y": str(sh - 5),
+        "text-anchor": "middle", "font-size": "11", "fill": "#333"
+    }).text = label1
+    ET.SubElement(svg, "text", {
+        "x": "0", "y": "0",
+        "transform": "translate(13,%d) rotate(-90)" % (mt + ph // 2),
+        "text-anchor": "middle", "font-size": "11", "fill": "#333"
+    }).text = label2
+
+    # Data points — draw below average first so denser regions don't obscure outliers
+    for gid in x.index:
+        xi   = float(x[gid])
+        yi   = float(y[gid])
+        ci   = float(c.get(gid, 0.0))
+        gene = group2anchor.get(gid, "—")
+        col  = _rdbu_color(ci / vmax if vmax else 0.0)
+        tip  = (
+            "Group: %s | Gene: %s | %s: %.4f | %s: %.4f | diff: %+.4f"
+            % (display_group_id(gid), gene, label1, xi, label2, yi, ci)
         )
+        ET.SubElement(svg, "circle", {
+            "cx": "%.1f" % spx(xi), "cy": "%.1f" % spy(yi),
+            "r": "4", "fill": col, "opacity": "0.65",
+            "data-tip": tip, "style": "cursor:pointer;",
+        })
 
-
-def _convert_gsea_plots_to_png(results_dir: str):
-    """Convert GSEApy-generated PDFs to PNGs for HTML embedding."""
-    prerank_dir = os.path.join(results_dir, "prerank")
-    if not os.path.isdir(prerank_dir):
-        return
-    pdfs = [f for f in os.listdir(prerank_dir) if f.endswith(".pdf")]
-    if not pdfs:
-        return
-    try:
-        from pdf2image import convert_from_path
-    except ImportError:
-        logger.warning(
-            "pdf2image not installed — enrichment plots will not be embedded "
-            "in the HTML report. Install with: pip install 'enhydra[plots]'\n"
-            "Also requires poppler: brew install poppler (macOS) or "
-            "apt install poppler-utils (Linux)."
-        )
-        return
-    logger.info("Converting %d GSEApy PDF plots to PNG...", len(pdfs))
-    for pdf_file in pdfs:
-        pdf_path = os.path.join(prerank_dir, pdf_file)
-        png_path = pdf_path.replace(".pdf", ".png")
-        if os.path.isfile(png_path):
-            continue
-        try:
-            images = convert_from_path(pdf_path, dpi=150)
-            if images:
-                images[0].save(png_path, "PNG")
-        except Exception as e:
-            logger.warning("Failed to convert %s: %s", pdf_file, e)
-
-
-def build_gmt_from_gprofiler(
-    gene_ids: list[str],
-    organism: str,
-    gmt_path: str,
-    sources: list[str] | None = None,
-) -> str:
-    """Fetch annotations from g:Profiler and write a GMT file."""
-    if sources is None:
-        sources = ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"]
-    logger.info(
-        "Fetching annotations from g:Profiler for %d genes, organism: %s, sources: %s",
-        len(gene_ids), organism, sources,
-    )
-    gprofiler = GProfiler(user_agent="ENHYDRA", return_dataframe=True)
-    results = gprofiler.profile(
-        organism=organism,
-        query=gene_ids,
-        sources=sources,
-        user_threshold=1.0,
-        no_evidences=False,
-    )
-    if results.empty:
-        raise EnhydraIOError(
-            "g:Profiler returned no annotations for organism '%s'. "
-            "Please check the organism name at https://biit.cs.ut.ee/gprofiler."
-            % organism
-        )
-    n_terms = 0
-    with open(gmt_path, "w") as fh:
-        for _, row in results.iterrows():
-            genes = row.get("intersections")
-            if not isinstance(genes, (list, tuple, set)) or len(genes) == 0:
-                continue
-            fh.write("%s\t%s\t%s\n" % (row["native"], row["name"], "\t".join(genes)))
-            n_terms += 1
-    logger.info("GMT file written: %d terms, path: %s", n_terms, gmt_path)
-    return gmt_path
-
-def run_gsea(
-    anchor2mean_path: str,
-    results_dir: str,
-    gene_sets: str,
-    organism: str | None = None,
-    sources: list[str] | None = None,
-    permutations: int = 1000,
-    min_size: int = 5,
-    max_size: int = 500,
-    seed: int = 42,
-    fdr_threshold: float = 0.25,
-    weight: float = 0,
-) -> gp.Prerank:
-    """Run GSEApy prerank, optionally fetching annotations from g:Profiler."""
-    os.makedirs(results_dir, exist_ok=True)
-    ranked = _load_ranked(anchor2mean_path)
-
-    if organism is not None:
-        gmt_path = os.path.join(results_dir, "gprofiler_%s.gmt" % organism)
-
-        if os.path.isfile(gmt_path):
-            logger.info("GMT file already exists, skipping API call: %s", gmt_path)
-        else:
-            build_gmt_from_gprofiler(
-                gene_ids=ranked["gene_id"].tolist(),
-                organism=organism,
-                gmt_path=gmt_path,
-                sources=sources,
-            )
-
-        gene_sets = gmt_path
-
-    # Preflight: fail early with a clear message if IDs don't match
-    _check_overlap(ranked, gene_sets)
-
-    logger.info(
-        "Running GSEApy prerank: %d genes, gene sets: %s, permutations: %d",
-        len(ranked),
-        gene_sets,
-        permutations,
-    )
-
-    results = gp.prerank(
-        rnk=ranked,
-        gene_sets=gene_sets,
-        outdir=results_dir,
-        permutation_num=permutations,
-        min_size=min_size,
-        max_size=max_size,
-        seed=seed,
-        weight=weight,
-        graph_num=0,
-        verbose=False,
-    )
-
-    sig_rows = results.res2d[
-        results.res2d["FDR q-val"] < fdr_threshold
-    ]
-    n_sig = len(sig_rows)
-
-    logger.info(
-        "GSEA complete. %d significant gene sets (FDR < %s).",
-        n_sig,
-        fdr_threshold,
-    )
-
-    if n_sig > 0:
-        logger.info(
-            "Generating enrichment plots for %d significant gene sets...",
-            n_sig,
-        )
-
-        plots_dir = os.path.join(results_dir, "prerank")
-        os.makedirs(plots_dir, exist_ok=True)
-
-        for term in sig_rows["Term"]:
-            safe_term_name = term.replace("/", "_").replace("\\", "_")
-            output_path = os.path.join(
-                plots_dir,
-                f"{safe_term_name}.png",
-            )
-
-            gp.gseaplot(
-                rank_metric=results.ranking,
-                term=term,
-                **results.results[term],
-                ofname=output_path,
-            )
-
-    return results
+    ET.ElementTree(svg).write(out_path, encoding="unicode", xml_declaration=False)
+    logger.info("Scatter SVG written to: %s", out_path)
 </file>
 
 <file path="enhydra/__init__.py">
@@ -13669,7 +13855,7 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 from .io import read_config_file, read_species_list, parse_obo_names, parse_fasta_records
 from .utils import check_parameters, resolve_trim_args
-from .filtering import filter_length, filter_groups, subset_groups, strip_species_from_alignments, filter_divergent_sequences
+from .filtering import display_group_id, filter_length, filter_groups, subset_groups, strip_species_from_alignments, filter_divergent_sequences
 from .alignment import run_mafft, run_trimal, run_muscle, run_trimal_columns
 from .tables import make_tables
 from .gsea import run_gsea
@@ -14593,10 +14779,9 @@ _METRIC_DESCS = {
 }
 
 # Overlap coefficient above which two significant gene sets are considered
-# redundant by build_significance_agreement... no — by
-# _cluster_redundant_terms() (see that function's own docstring for the
-# full rationale). Exposed here as a module-level default so
-# _results_table_html()/_build_report_impl()/build_report()/
+# redundant by _cluster_redundant_terms() (see that function's own
+# docstring for the full rationale). Exposed here as a module-level
+# default so _results_table_html()/_build_report_impl()/build_report()/
 # build_multi_metric_report() all share one fallback value.
 DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD = 0.75
 
@@ -14855,6 +15040,7 @@ function initTable(metric) {{
         ? defaultOrderMap[metric] : [[4, 'asc']];
     var dt = $('#results-table-' + metric).DataTable({{
         pageLength: 25, orderCellsTop: true, order: order,
+        deferRender: true,
         columnDefs: [{{ targets: numericCols, type: 'num' }}],
     }});
     sigColIndexMap[metric]       = getHeaderIndex('#results-table-' + metric, 'Sig.');
@@ -16510,6 +16696,7 @@ def _results_table_html(
     gene_sets: dict[str, list[str]] | None = None,
     gene_to_page: dict[str, tuple[str | None, str | None]] | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ) -> tuple[str, list[int], dict[str, str], dict[str, str],
           dict[str, str], dict[str, str], dict[str, str]]:
     """Build the enrichment results DataTable HTML for one metric.
@@ -16529,11 +16716,35 @@ def _results_table_html(
     with" column is not given special handling in the Excel export, so
     only the HTML-modal rendering is needed.
 
+    Only gene sets with FDR < gene_list_fdr_threshold (defaulting to
+    fdr_threshold itself if not given) have their full/leading-edge gene
+    lists populated in these dicts at all — see the gene_list_fdr_threshold
+    arg below. A gene set that doesn't qualify still gets a "Full gene
+    set"/"Leading edge" cell showing a plain gene count, just with nothing
+    added to these dicts (and therefore nothing embedded in the report's
+    JSON payload for it). This matters for large, genome-scale GMTs: with
+    tens of thousands of tested gene sets, embedding every one's full
+    membership (plus a second, HTML-chip-rendered copy of the same list)
+    previously caused multi-GB browser memory usage when the report was
+    opened.
+
     Args:
         overlap_threshold: Passed through to _cluster_redundant_terms()
                            for computing the "Redundant with" column. See
                            that function's own docstring for the full
                            rationale.
+        gene_list_fdr_threshold: FDR threshold below which a gene set's
+                           full gene list / leading-edge gene list is
+                           embedded (as a clickable "View" link) rather
+                           than shown as a plain count. None (the
+                           default) means "use fdr_threshold" — i.e. only
+                           gene sets significant at the table's own
+                           significance cutoff get embedded gene lists.
+                           Set higher than fdr_threshold (e.g. 1.0) to
+                           embed gene lists for virtually all tested gene
+                           sets, restoring the original, unrestricted
+                           behaviour (can produce very large reports for
+                           genome-scale GMTs).
     """
     df = df.copy()
     if "Term" not in df.columns:
@@ -16550,6 +16761,18 @@ def _results_table_html(
         cluster_info = _cluster_redundant_terms(
             df, gene_sets, fdr_threshold, overlap_threshold,
         )
+
+    # Also computed here, before stringification, for the same reason:
+    # the embedding-gate check below (in _full_set_cell/_leadedge_cell)
+    # needs a numeric FDR comparison, not the "%.4f"-formatted string the
+    # stringification loop below produces.
+    effective_gene_list_threshold = (
+        gene_list_fdr_threshold if gene_list_fdr_threshold is not None
+        else fdr_threshold
+    )
+    fdr_numeric_by_term: dict[str, float] = dict(
+        zip(df["Term"], pd.to_numeric(df["FDR q-val"], errors="coerce"))
+    )
 
     for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val",
                 "Tag %", "Gene %", "Mean score",
@@ -16575,9 +16798,15 @@ def _results_table_html(
             genes = gene_sets.get(term_id)
             if not genes:
                 return ""
-            full_sets_js[term_id] = "\n".join(genes)
-            full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
-            return "View (%d)" % len(genes)
+            fdr = fdr_numeric_by_term.get(term_id)
+            if fdr is not None and fdr < effective_gene_list_threshold:
+                full_sets_js[term_id] = "\n".join(genes)
+                full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
+            # Bare count only (not "View (N)" / "N genes") so the column
+            # sorts numerically in DataTables — clickability is signalled
+            # separately via membership in full_sets_js, not by the text
+            # of this cell. See the row-rendering loop below.
+            return len(genes)
         df["Full gene set"] = df["Term"].apply(_full_set_cell)
 
     lead_col = _find_lead_genes_col(df)
@@ -16589,9 +16818,13 @@ def _results_table_html(
             genes = [g.strip() for g in str(raw).split(";") if g.strip()]
             if not genes:
                 return ""
-            leadedge_js[row["Term"]] = "\n".join(genes)
-            leadedge_html_js[row["Term"]] = _gene_chip_list_html(genes, gene_to_page)
-            return "View (%d)" % len(genes)
+            term_id = row["Term"]
+            fdr = fdr_numeric_by_term.get(term_id)
+            if fdr is not None and fdr < effective_gene_list_threshold:
+                leadedge_js[term_id] = "\n".join(genes)
+                leadedge_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
+            # Bare count only — see _full_set_cell()'s comment above.
+            return len(genes)
         df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
 
     if cluster_info:
@@ -16643,10 +16876,16 @@ def _results_table_html(
         ("Gene %",       "Gene %",
          "Fraction of all ranked genes in the leading edge (0-1)."),
         ("Full gene set", "Full gene set",
-         "All genes annotated to this gene set. Click to view as a text list."),
+         "Number of genes annotated to this gene set. Click the number to "
+         "view the full list as text (only clickable for gene sets with "
+         "FDR < %.2f, to limit report size \u2014 other counts are plain "
+         "text)." % effective_gene_list_threshold),
         ("Leading edge", "Leading edge",
-         "Genes from this set found in the leading edge of the ranked list "
-         "(i.e. driving the enrichment score). Click to view as a text list."),
+         "Number of genes from this set found in the leading edge of the "
+         "ranked list (i.e. driving the enrichment score). Click the "
+         "number to view the full list as text (only clickable for gene "
+         "sets with FDR < %.2f, to limit report size \u2014 other counts "
+         "are plain text)." % effective_gene_list_threshold),
         ("Redundant with", "Redundant with",
          "Among significant gene sets (FDR < %.2f), this gene set shares "
          "an overlap coefficient of \u2265 %.2f with the listed gene "
@@ -16669,7 +16908,8 @@ def _results_table_html(
 
     numeric_names       = {"NES", "p-value", "FDR", "Tag %", "Gene %",
                            "Mean score", diff_label,
-                           "%s score" % col1_label, "%s score" % col2_label}
+                           "%s score" % col1_label, "%s score" % col2_label,
+                           "Full gene set", "Leading edge"}
     numeric_col_indices = [i for i, n in enumerate(display_names)
                            if n in numeric_names]
 
@@ -16688,26 +16928,46 @@ def _results_table_html(
         go_id     = row.get("GO ID", "")
         cells     = ""
         for col, val in row.items():
+            # Full gene set / Leading edge cells are sometimes wrapped in
+            # an <a> link (when that term qualifies for embedding — see
+            # _full_set_cell()/_leadedge_cell() above). DataTables' numeric
+            # sort type parses a cell's own displayed content directly, so
+            # an anchor tag around the count breaks numeric sorting for
+            # exactly the (often most interesting, most significant) rows
+            # that happen to be clickable. A `data-sort` attribute on the
+            # <td> tells DataTables to sort on that explicit value instead
+            # of the cell's displayed HTML, regardless of markup inside it
+            # — this is a built-in DataTables feature requiring no extra
+            # JS (see "Orthogonal data" / HTML5 data-* attributes in the
+            # DataTables manual). Applied uniformly to both the clickable
+            # and plain-text cases for these two columns, so sorting is
+            # correct and consistent either way.
+            sort_attr = ""
+            if col in ("Full gene set", "Leading edge") and val != "":
+                sort_attr = ' data-sort="%s"' % val
+
             if col == "GO ID" and go_id in plot_index:
                 cells += (
                     '<td><a href="#" class="go-link" data-goid="%s"%s>%s</a></td>'
                     % (go_id, metric_attr, val)
                 )
-            elif col == "Full gene set" and val:
+            elif col == "Full gene set" and go_id in full_sets_js:
                 cells += (
-                    '<td><a href="#" class="geneset-link" data-goid="%s">%s</a></td>'
-                    % (go_id, val)
+                    '<td%s><a href="#" class="geneset-link" data-goid="%s">%s</a></td>'
+                    % (sort_attr, go_id, val)
                 )
-            elif col == "Leading edge" and val:
+            elif col == "Leading edge" and go_id in leadedge_js:
                 cells += (
-                    '<td><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
-                    % (go_id, metric_attr, val)
+                    '<td%s><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
+                    % (sort_attr, go_id, metric_attr, val)
                 )
             elif col == "Redundant with" and isinstance(val, str) and val.startswith("View ("):
                 cells += (
                     '<td><a href="#" class="redundant-link" data-goid="%s">%s</a></td>'
                     % (go_id, val)
                 )
+            elif col in ("Full gene set", "Leading edge"):
+                cells += "<td%s>%s</td>" % (sort_attr, str(val))
             else:
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
@@ -16974,6 +17234,7 @@ def _build_report_impl(
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ):
     logger.info("Building HTML report (%d metric tab(s))...", len(metric_data))
     first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
@@ -16985,6 +17246,17 @@ def _build_report_impl(
     dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
     dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
     xlsx_js   = _fetch_cached(_XLSX_JS_URL,        cache_dir, "xlsx.full.min.js")
+
+    # Threshold below which a gene set's full gene list / leading-edge
+    # gene list is embedded in the report (see _results_table_html()). A
+    # single global value shared by every metric tab, since it controls
+    # report size/scope rather than anything metric-specific; defaults to
+    # fdr_threshold itself so "only significant gene sets get embedded
+    # gene lists" is the default with no config change required.
+    effective_gene_list_threshold = (
+        gene_list_fdr_threshold if gene_list_fdr_threshold is not None
+        else fdr_threshold
+    )
 
     single_metric = len(metric_data) == 1
     if mode == "differential":
@@ -17055,6 +17327,7 @@ def _build_report_impl(
                 metric=metric, col1_label=label1, col2_label=label2,
                 gene_sets=gene_sets_all, gene_to_page=gene_to_page,
                 overlap_threshold=overlap_threshold,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
             numeric_cols_map[metric] = num_cols
             full_gene_sets_accum.update(full_sets_js)
@@ -17080,7 +17353,10 @@ def _build_report_impl(
             'in blue. Click a GO ID to view its enrichment plot, or "View" '
             'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge / '
             'Redundant&nbsp;with to see the associated gene/gene-set '
-            'lists, with links to alignment pages where available.</p>\n'
+            'lists, with links to alignment pages where available. To keep '
+            'report size manageable, full gene and leading-edge lists are '
+            'only embedded for gene sets with FDR&nbsp;&lt;&nbsp;{gl_fdr}; '
+            'other gene sets show a count only.</p>\n'
             '  <p>'
             '<button class="sig-toggle-btn" data-metric="{m}">Show only significant</button> '
             '<button class="nonredundant-toggle-btn" data-metric="{m}">Show non-redundant only</button> '
@@ -17092,7 +17368,8 @@ def _build_report_impl(
             '  {tbl}\n'
             '</div>\n'.format(
                 m=metric, ac=active_cls, desc_html=desc_html,
-                plots=plots_html, fdr=fdr_threshold, tbl=tbl_html,
+                plots=plots_html, fdr=fdr_threshold,
+                gl_fdr=effective_gene_list_threshold, tbl=tbl_html,
             )
         )
         first = False
@@ -17185,12 +17462,35 @@ def _build_report_impl(
     # the single list's) group2anchor.tsv plus whichever groups actually
     # received a rendered alignment page; see _build_alignment_tree_html()
     # for the full membership rules.
+    #
+    # Restricted here to GO terms significant (FDR < fdr_threshold) in at
+    # least one of the metrics run, rather than every term in the full
+    # GMT. With a genome-scale GMT, most terms are not significant but
+    # still happen to match at least one rendered alignment page purely
+    # by chance overlap with the (typically large) ranked gene list —
+    # _build_alignment_tree_html() previously built one permanent,
+    # un-deferred <details> DOM block per such term regardless of
+    # significance, which for e.g. a mammalian GO:BP GMT can mean
+    # thousands of expandable blocks present in the page at load time.
+    # This was found to be the single largest remaining driver of browser
+    # memory after gene-list embedding was already gated by
+    # fdr_threshold/gene_list_fdr_threshold elsewhere in this function —
+    # restricting this tab the same way (reusing fdr_threshold directly,
+    # not a separate configurable cutoff) is the matching fix.
+    significant_terms: set[str] = set()
+    for df_raw in metric_raw_dfs.values():
+        fdr_numeric = pd.to_numeric(df_raw["FDR q-val"], errors="coerce")
+        significant_terms.update(df_raw.loc[fdr_numeric < fdr_threshold, "Term"])
+    gene_sets_for_alignments = {
+        t: genes for t, genes in gene_sets_all.items() if t in significant_terms
+    }
+
     tab_buttons_parts.append(
         '    <button class="tab-btn" data-metric="alignments" '
         'role="tab" aria-controls="tab-alignments">Alignments</button>'
     )
     alignment_tree_html = _build_alignment_tree_html(
-        gmt_gene_sets=gene_sets_all,
+        gmt_gene_sets=gene_sets_for_alignments,
         tables_dir1=tables_dir1,
         obo_names=term_names,
         alignment_pages1=alignment_pages1,
@@ -17203,10 +17503,16 @@ def _build_report_impl(
     tab_panels_parts.append(
         '<div id="tab-alignments" class="tab-panel" role="tabpanel">\n'
         '  <p class="metric-desc">Alignments for every orthogroup that fed '
-        'GSEA, nested by GO term. Columns shown hatched/dimmed, if any, '
-        'were removed by trimAl before identity estimation.</p>\n'
+        'GSEA, nested by GO term. Only GO terms significant at '
+        'FDR&nbsp;&lt;&nbsp;{fdr} in at least one ranking metric are shown '
+        'here, to keep report size manageable \u2014 non-significant terms\u2019 '
+        'alignments are not listed in this tab, though the underlying '
+        'alignment pages themselves are still generated and linked from '
+        'significant terms that share the same orthogroup. Columns shown '
+        'hatched/dimmed, if any, were removed by trimAl before identity '
+        'estimation.</p>\n'
         '  %s\n'
-        '</div>\n' % alignment_tree_html
+        '</div>\n'.format(fdr=fdr_threshold) % alignment_tree_html
     )
 
     # Filtering summary tab — appended after Alignments.
@@ -17300,6 +17606,7 @@ def build_report(
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ):
     """Build a single-metric HTML report (one enrichment tab + Alignments +
     Filtering summary + Run parameters).
@@ -17323,6 +17630,16 @@ def build_report(
                              metric's enrichment table. See
                              _cluster_redundant_terms() for the full
                              algorithm.
+        gene_list_fdr_threshold: FDR threshold below which a gene set's
+                             full gene list / leading-edge gene list is
+                             embedded in the report as a clickable "View"
+                             link, rather than shown as a plain count.
+                             None (the default) means "use fdr_threshold"
+                             — i.e. only significant gene sets get
+                             embedded gene lists, which keeps report size
+                             manageable for large (e.g. genome-scale)
+                             gene set collections. See
+                             _results_table_html() for the full rationale.
     """
     metric_data = {metric: {"results_dir": results_dir, "plots_dir": plots_dir}}
     _build_report_impl(
@@ -17338,6 +17655,7 @@ def build_report(
         alignment_pages2=alignment_pages2,
         run_parameters_path=run_parameters_path,
         overlap_threshold=overlap_threshold,
+        gene_list_fdr_threshold=gene_list_fdr_threshold,
     )
 
 
@@ -17360,6 +17678,7 @@ def build_multi_metric_report(
     alignment_pages2: dict[str, str] | None = None,
     run_parameters_path: str | None = None,
     overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
+    gene_list_fdr_threshold: float | None = None,
 ):
     """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
     including the Cross-metric consensus, Alignments, Filtering summary,
@@ -17378,6 +17697,16 @@ def build_multi_metric_report(
                              metric's enrichment table. See
                              _cluster_redundant_terms() for the full
                              algorithm.
+        gene_list_fdr_threshold: FDR threshold below which a gene set's
+                             full gene list / leading-edge gene list is
+                             embedded in the report as a clickable "View"
+                             link, rather than shown as a plain count.
+                             None (the default) means "use fdr_threshold"
+                             — i.e. only significant gene sets get
+                             embedded gene lists, which keeps report size
+                             manageable for large (e.g. genome-scale)
+                             gene set collections. See
+                             _results_table_html() for the full rationale.
     """
     _build_report_impl(
         metric_data=metric_data, report_path=report_path, obo_path=obo_path,
@@ -17392,6 +17721,7 @@ def build_multi_metric_report(
         alignment_pages2=alignment_pages2,
         run_parameters_path=run_parameters_path,
         overlap_threshold=overlap_threshold,
+        gene_list_fdr_threshold=gene_list_fdr_threshold,
     )
 </file>
 
@@ -18176,6 +18506,20 @@ def _build_arg_parser():
     parser.add_argument("--max-size",      type=int,   default=None)
     parser.add_argument("--seed",          type=int,   default=None)
     parser.add_argument("--fdr-threshold", type=float, default=None)
+    parser.add_argument(
+        "--gene-list-fdr-threshold", type=float, default=None, metavar="FDR",
+        help="(Advanced) FDR threshold below which a gene set's full gene "
+             "list and leading-edge gene list are embedded in the HTML "
+             "report as clickable 'View' links; gene sets at or above "
+             "this threshold show a count only, to keep report size "
+             "manageable for large (e.g. genome-scale) gene set "
+             "collections. Defaults to the same value as --fdr-threshold "
+             "(i.e. only significant gene sets get embedded gene lists). "
+             "Set to 1.0 or higher to embed gene lists for virtually all "
+             "tested gene sets (restores the original, unrestricted "
+             "behaviour — can produce very large reports). Can also be "
+             "set via 'gene_list_fdr_threshold' in the project config."
+    )
     parser.add_argument("--top-n",         type=int,   default=None)
     parser.add_argument("--obo-cache",     default=None)
 
@@ -18212,6 +18556,28 @@ def main():
     max_size      = _resolve(args.max_size,      parameters['max_size'],      500)
     seed          = _resolve(args.seed,          parameters['seed'],          42)
     fdr_threshold = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
+
+    # (Advanced) Independent FDR cutoff controlling which gene sets get
+    # their full gene / leading-edge gene lists embedded in the report
+    # (see report._results_table_html()). Kept separate from
+    # fdr_threshold itself (which still governs significance everywhere
+    # else) so a person can keep a lenient --fdr-threshold for the results
+    # table while still capping report size. '' / unset means "use
+    # fdr_threshold" — i.e. only significant gene sets get embedded gene
+    # lists, which is the default, restricted behaviour.
+    gene_list_fdr_threshold_raw = _resolve(
+        args.gene_list_fdr_threshold, parameters['gene_list_fdr_threshold'], '')
+    try:
+        gene_list_fdr_threshold = (
+            float(gene_list_fdr_threshold_raw)
+            if gene_list_fdr_threshold_raw not in (None, '') else None
+        )
+    except (TypeError, ValueError):
+        sys.exit(
+            "Configuration error: invalid 'gene_list_fdr_threshold' value: "
+            "%r. Must be a number." % (gene_list_fdr_threshold_raw,)
+        )
+
     top_n         = _resolve(args.top_n,         parameters['top_n'],         20)
     list1_path    = _resolve(args.list1,         parameters['list1'],         None)
     list2_path    = _resolve(args.list2,         parameters['list2'],         None)
@@ -18258,6 +18624,10 @@ def main():
     # not the raw config file contents, which a CLI flag may have silently
     # overridden. Keys match collect_run_parameters()'s resolved_params
     # contract exactly.
+    #
+    # Note: gene_list_fdr_threshold is NOT yet included here, so it is not
+    # currently recorded in run_parameters.json / shown in the report's
+    # Run Parameters tab — a small follow-up, not yet done.
     resolved_params_for_provenance = {
         "min_species":          min_species,
         "min_sequences":        min_sequences,
@@ -18342,10 +18712,12 @@ def main():
     logger.info(
         "Resolved parameters: metric=%s, all_metrics=%s, replot=%s, "
         "paralogs=%s, trim=%s, divergence_filter_sd=%s, min_species=%d, "
-        "permutations=%d, fdr_threshold=%.2f",
+        "permutations=%d, fdr_threshold=%.2f, gene_list_fdr_threshold=%s",
         metric, all_metrics, replot, paralogs, (trim or "none"),
         (divergence_filter_sd if divergence_filter_sd else "none"),
         min_species, permutations, fdr_threshold,
+        (gene_list_fdr_threshold if gene_list_fdr_threshold is not None
+         else "same as fdr_threshold"),
     )
 
     if orthofinder_dir:
@@ -18539,6 +18911,7 @@ def main():
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
         else:
             build_report(
@@ -18553,6 +18926,7 @@ def main():
                 pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
                 alignment_pages1=alignment_pages,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
 
         # Fold every stage marker produced under outdir into
@@ -18804,6 +19178,7 @@ def main():
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
         else:
             build_report(
@@ -18825,6 +19200,7 @@ def main():
                 alignment_pages1=alignment_pages1,
                 alignment_pages2=alignment_pages2,
                 run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
             )
 
         # See the single-list branch's identical call for the full

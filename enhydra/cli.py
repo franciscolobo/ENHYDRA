@@ -897,9 +897,6 @@ def main():
     # overridden. Keys match collect_run_parameters()'s resolved_params
     # contract exactly.
     #
-    # Note: gene_list_fdr_threshold is NOT yet included here, so it is not
-    # currently recorded in run_parameters.json / shown in the report's
-    # Run Parameters tab — a small follow-up, not yet done.
     resolved_params_for_provenance = {
         "min_species":          min_species,
         "min_sequences":        min_sequences,
@@ -915,6 +912,7 @@ def main():
         "max_size":             max_size,
         "seed":                 seed,
         "fdr_threshold":        fdr_threshold,
+        "gene_list_fdr_threshold": gene_list_fdr_threshold,
         "top_n":                top_n,
         "gene_sets":            gene_sets,
         "organism":             organism,
