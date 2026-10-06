@@ -613,3 +613,140 @@ def make_differential_plots(
         obo_names=obo_names, fdr_threshold=fdr_threshold, top_n=top_n,
         title="Top differentially enriched gene sets",
     )
+
+def _save_identity_scatter_svg(
+    x: pd.Series,
+    y: pd.Series,
+    c: pd.Series,
+    group2anchor: dict[str, str],
+    out_path: str,
+    label1: str,
+    label2: str,
+    vmax: float,
+    title: str = "Identity comparison between lists",
+):
+    """Generate an interactive SVG scatter plot with per-point hover tooltips.
+
+    Each circle represents one orthogroup.  Hovering shows the orthogroup ID,
+    anchor gene ID, list 1 score, list 2 score, and differential score.
+    Color encodes the differential score on an RdBu scale (blue = more
+    variable in list 2, red = more variable in list 1).
+
+    Args:
+        x:             List 1 scores, indexed by group_id. Callers are
+                       expected to pass the same metric-transformed values
+                       (raw identity, z-score, or rank) used to produce
+                       the differential score in `c` — see
+                       plot_identity_scatter()'s own docstring.
+        y:             List 2 scores, indexed by group_id.
+        c:             Differential scores, indexed by group_id.
+        group2anchor:  group_id → anchor gene ID.
+        out_path:      Output SVG file path.
+        label1:        X-axis label.
+        label2:        Y-axis label.
+        vmax:          Differential score magnitude used for colour saturation
+                       (typically the 95th percentile of abs(c)).
+        title:         Plot title. Defaults to the identity-metric wording
+                       for backward compatibility with any direct callers;
+                       plot_identity_scatter() always passes an explicit,
+                       metric-aware title.
+    """
+    import xml.etree.ElementTree as ET
+
+    ml, mr, mt, mb = 55, 20, 30, 55
+    pw, ph = 370, 370
+    sw, sh = ml + pw + mr, mt + ph + mb
+
+    # Padding is proportional to the data's own range rather than a fixed
+    # absolute offset — see plot_identity_scatter()'s own note on this,
+    # since identity (~0-1), z-score (roughly -3 to 3), and rank (0-1)
+    # spans differ substantially and a fixed pad tuned for one looks wrong
+    # on another.
+    data_min = min(float(x.min()), float(y.min()))
+    data_max = max(float(x.max()), float(y.max()))
+    span     = data_max - data_min
+    pad      = span * 0.03 if span > 0 else 0.02
+    lo, hi   = data_min - pad, data_max + pad
+    rng      = hi - lo or 1.0
+
+    def spx(v):  return ml + (v - lo) / rng * pw
+    def spy(v):  return mt + ph - (v - lo) / rng * ph   # y-axis flipped
+
+    svg = ET.Element("svg", {
+        "xmlns": "http://www.w3.org/2000/svg",
+        "width": str(sw), "height": str(sh),
+        "font-family": "Arial, sans-serif",
+    })
+
+    # Title
+    ET.SubElement(svg, "text", {
+        "x": str(sw // 2), "y": "20",
+        "text-anchor": "middle", "font-size": "12",
+        "font-weight": "bold", "fill": "#1a3a5c",
+    }).text = title
+
+    # Axes
+    ax_y = mt + ph
+    ET.SubElement(svg, "line", {
+        "x1": str(ml), "y1": str(mt), "x2": str(ml), "y2": str(ax_y),
+        "stroke": "#555", "stroke-width": "1"})
+    ET.SubElement(svg, "line", {
+        "x1": str(ml), "y1": str(ax_y), "x2": str(ml + pw), "y2": str(ax_y),
+        "stroke": "#555", "stroke-width": "1"})
+
+    # 1:1 diagonal
+    ET.SubElement(svg, "line", {
+        "x1": str(spx(lo)), "y1": str(spy(lo)),
+        "x2": str(spx(hi)), "y2": str(spy(hi)),
+        "stroke": "#555", "stroke-width": "0.8",
+        "stroke-dasharray": "4,3", "opacity": "0.5"})
+
+    # Ticks
+    for v in [lo + rng * i / 4 for i in range(5)]:
+        ET.SubElement(svg, "line", {
+            "x1": str(spx(v)), "y1": str(ax_y),
+            "x2": str(spx(v)), "y2": str(ax_y + 4),
+            "stroke": "#555", "stroke-width": "1"})
+        ET.SubElement(svg, "text", {
+            "x": str(spx(v)), "y": str(ax_y + 14),
+            "text-anchor": "middle", "font-size": "9", "fill": "#555"
+        }).text = "%.2f" % v
+        ET.SubElement(svg, "line", {
+            "x1": str(ml - 4), "y1": str(spy(v)),
+            "x2": str(ml),     "y2": str(spy(v)),
+            "stroke": "#555", "stroke-width": "1"})
+        ET.SubElement(svg, "text", {
+            "x": str(ml - 7), "y": str(spy(v) + 4),
+            "text-anchor": "end", "font-size": "9", "fill": "#555"
+        }).text = "%.2f" % v
+
+    # Axis labels
+    ET.SubElement(svg, "text", {
+        "x": str(ml + pw // 2), "y": str(sh - 5),
+        "text-anchor": "middle", "font-size": "11", "fill": "#333"
+    }).text = label1
+    ET.SubElement(svg, "text", {
+        "x": "0", "y": "0",
+        "transform": "translate(13,%d) rotate(-90)" % (mt + ph // 2),
+        "text-anchor": "middle", "font-size": "11", "fill": "#333"
+    }).text = label2
+
+    # Data points — draw below average first so denser regions don't obscure outliers
+    for gid in x.index:
+        xi   = float(x[gid])
+        yi   = float(y[gid])
+        ci   = float(c.get(gid, 0.0))
+        gene = group2anchor.get(gid, "—")
+        col  = _rdbu_color(ci / vmax if vmax else 0.0)
+        tip  = (
+            "Group: %s | Gene: %s | %s: %.4f | %s: %.4f | diff: %+.4f"
+            % (display_group_id(gid), gene, label1, xi, label2, yi, ci)
+        )
+        ET.SubElement(svg, "circle", {
+            "cx": "%.1f" % spx(xi), "cy": "%.1f" % spy(yi),
+            "r": "4", "fill": col, "opacity": "0.65",
+            "data-tip": tip, "style": "cursor:pointer;",
+        })
+
+    ET.ElementTree(svg).write(out_path, encoding="unicode", xml_declaration=False)
+    logger.info("Scatter SVG written to: %s", out_path)
