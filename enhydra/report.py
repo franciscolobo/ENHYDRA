@@ -306,6 +306,7 @@ function initTable(metric) {{
         ? defaultOrderMap[metric] : [[4, 'asc']];
     var dt = $('#results-table-' + metric).DataTable({{
         pageLength: 25, orderCellsTop: true, order: order,
+        deferRender: true,
         columnDefs: [{{ targets: numericCols, type: 'num' }}],
     }});
     sigColIndexMap[metric]       = getHeaderIndex('#results-table-' + metric, 'Sig.');
@@ -2067,8 +2068,11 @@ def _results_table_html(
             if fdr is not None and fdr < effective_gene_list_threshold:
                 full_sets_js[term_id] = "\n".join(genes)
                 full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
-                return "View (%d)" % len(genes)
-            return "%d gene%s" % (len(genes), "" if len(genes) == 1 else "s")
+            # Bare count only (not "View (N)" / "N genes") so the column
+            # sorts numerically in DataTables — clickability is signalled
+            # separately via membership in full_sets_js, not by the text
+            # of this cell. See the row-rendering loop below.
+            return len(genes)
         df["Full gene set"] = df["Term"].apply(_full_set_cell)
 
     lead_col = _find_lead_genes_col(df)
@@ -2085,8 +2089,8 @@ def _results_table_html(
             if fdr is not None and fdr < effective_gene_list_threshold:
                 leadedge_js[term_id] = "\n".join(genes)
                 leadedge_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
-                return "View (%d)" % len(genes)
-            return "%d gene%s" % (len(genes), "" if len(genes) == 1 else "s")
+            # Bare count only — see _full_set_cell()'s comment above.
+            return len(genes)
         df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
 
     if cluster_info:
@@ -2138,16 +2142,16 @@ def _results_table_html(
         ("Gene %",       "Gene %",
          "Fraction of all ranked genes in the leading edge (0-1)."),
         ("Full gene set", "Full gene set",
-         "All genes annotated to this gene set. \u201cView\u201d opens the "
-         "full list as text (only embedded for gene sets with FDR < %.2f, "
-         "to limit report size \u2014 others show a count only)."
-         % effective_gene_list_threshold),
+         "Number of genes annotated to this gene set. Click the number to "
+         "view the full list as text (only clickable for gene sets with "
+         "FDR < %.2f, to limit report size \u2014 other counts are plain "
+         "text)." % effective_gene_list_threshold),
         ("Leading edge", "Leading edge",
-         "Genes from this set found in the leading edge of the ranked list "
-         "(i.e. driving the enrichment score). \u201cView\u201d opens the "
-         "full list as text (only embedded for gene sets with FDR < %.2f, "
-         "to limit report size \u2014 others show a count only)."
-         % effective_gene_list_threshold),
+         "Number of genes from this set found in the leading edge of the "
+         "ranked list (i.e. driving the enrichment score). Click the "
+         "number to view the full list as text (only clickable for gene "
+         "sets with FDR < %.2f, to limit report size \u2014 other counts "
+         "are plain text)." % effective_gene_list_threshold),
         ("Redundant with", "Redundant with",
          "Among significant gene sets (FDR < %.2f), this gene set shares "
          "an overlap coefficient of \u2265 %.2f with the listed gene "
@@ -2170,7 +2174,8 @@ def _results_table_html(
 
     numeric_names       = {"NES", "p-value", "FDR", "Tag %", "Gene %",
                            "Mean score", diff_label,
-                           "%s score" % col1_label, "%s score" % col2_label}
+                           "%s score" % col1_label, "%s score" % col2_label,
+                           "Full gene set", "Leading edge"}
     numeric_col_indices = [i for i, n in enumerate(display_names)
                            if n in numeric_names]
 
@@ -2189,26 +2194,46 @@ def _results_table_html(
         go_id     = row.get("GO ID", "")
         cells     = ""
         for col, val in row.items():
+            # Full gene set / Leading edge cells are sometimes wrapped in
+            # an <a> link (when that term qualifies for embedding — see
+            # _full_set_cell()/_leadedge_cell() above). DataTables' numeric
+            # sort type parses a cell's own displayed content directly, so
+            # an anchor tag around the count breaks numeric sorting for
+            # exactly the (often most interesting, most significant) rows
+            # that happen to be clickable. A `data-sort` attribute on the
+            # <td> tells DataTables to sort on that explicit value instead
+            # of the cell's displayed HTML, regardless of markup inside it
+            # — this is a built-in DataTables feature requiring no extra
+            # JS (see "Orthogonal data" / HTML5 data-* attributes in the
+            # DataTables manual). Applied uniformly to both the clickable
+            # and plain-text cases for these two columns, so sorting is
+            # correct and consistent either way.
+            sort_attr = ""
+            if col in ("Full gene set", "Leading edge") and val != "":
+                sort_attr = ' data-sort="%s"' % val
+
             if col == "GO ID" and go_id in plot_index:
                 cells += (
                     '<td><a href="#" class="go-link" data-goid="%s"%s>%s</a></td>'
                     % (go_id, metric_attr, val)
                 )
-            elif col == "Full gene set" and isinstance(val, str) and val.startswith("View ("):
+            elif col == "Full gene set" and go_id in full_sets_js:
                 cells += (
-                    '<td><a href="#" class="geneset-link" data-goid="%s">%s</a></td>'
-                    % (go_id, val)
+                    '<td%s><a href="#" class="geneset-link" data-goid="%s">%s</a></td>'
+                    % (sort_attr, go_id, val)
                 )
-            elif col == "Leading edge" and isinstance(val, str) and val.startswith("View ("):
+            elif col == "Leading edge" and go_id in leadedge_js:
                 cells += (
-                    '<td><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
-                    % (go_id, metric_attr, val)
+                    '<td%s><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
+                    % (sort_attr, go_id, metric_attr, val)
                 )
             elif col == "Redundant with" and isinstance(val, str) and val.startswith("View ("):
                 cells += (
                     '<td><a href="#" class="redundant-link" data-goid="%s">%s</a></td>'
                     % (go_id, val)
                 )
+            elif col in ("Full gene set", "Leading edge"):
+                cells += "<td%s>%s</td>" % (sort_attr, str(val))
             else:
                 cells += "<td>%s</td>" % str(val)
         rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
@@ -2703,12 +2728,35 @@ def _build_report_impl(
     # the single list's) group2anchor.tsv plus whichever groups actually
     # received a rendered alignment page; see _build_alignment_tree_html()
     # for the full membership rules.
+    #
+    # Restricted here to GO terms significant (FDR < fdr_threshold) in at
+    # least one of the metrics run, rather than every term in the full
+    # GMT. With a genome-scale GMT, most terms are not significant but
+    # still happen to match at least one rendered alignment page purely
+    # by chance overlap with the (typically large) ranked gene list —
+    # _build_alignment_tree_html() previously built one permanent,
+    # un-deferred <details> DOM block per such term regardless of
+    # significance, which for e.g. a mammalian GO:BP GMT can mean
+    # thousands of expandable blocks present in the page at load time.
+    # This was found to be the single largest remaining driver of browser
+    # memory after gene-list embedding was already gated by
+    # fdr_threshold/gene_list_fdr_threshold elsewhere in this function —
+    # restricting this tab the same way (reusing fdr_threshold directly,
+    # not a separate configurable cutoff) is the matching fix.
+    significant_terms: set[str] = set()
+    for df_raw in metric_raw_dfs.values():
+        fdr_numeric = pd.to_numeric(df_raw["FDR q-val"], errors="coerce")
+        significant_terms.update(df_raw.loc[fdr_numeric < fdr_threshold, "Term"])
+    gene_sets_for_alignments = {
+        t: genes for t, genes in gene_sets_all.items() if t in significant_terms
+    }
+
     tab_buttons_parts.append(
         '    <button class="tab-btn" data-metric="alignments" '
         'role="tab" aria-controls="tab-alignments">Alignments</button>'
     )
     alignment_tree_html = _build_alignment_tree_html(
-        gmt_gene_sets=gene_sets_all,
+        gmt_gene_sets=gene_sets_for_alignments,
         tables_dir1=tables_dir1,
         obo_names=term_names,
         alignment_pages1=alignment_pages1,
@@ -2721,10 +2769,16 @@ def _build_report_impl(
     tab_panels_parts.append(
         '<div id="tab-alignments" class="tab-panel" role="tabpanel">\n'
         '  <p class="metric-desc">Alignments for every orthogroup that fed '
-        'GSEA, nested by GO term. Columns shown hatched/dimmed, if any, '
-        'were removed by trimAl before identity estimation.</p>\n'
+        'GSEA, nested by GO term. Only GO terms significant at '
+        'FDR&nbsp;&lt;&nbsp;{fdr} in at least one ranking metric are shown '
+        'here, to keep report size manageable \u2014 non-significant terms\u2019 '
+        'alignments are not listed in this tab, though the underlying '
+        'alignment pages themselves are still generated and linked from '
+        'significant terms that share the same orthogroup. Columns shown '
+        'hatched/dimmed, if any, were removed by trimAl before identity '
+        'estimation.</p>\n'
         '  %s\n'
-        '</div>\n' % alignment_tree_html
+        '</div>\n'.format(fdr=fdr_threshold) % alignment_tree_html
     )
 
     # Filtering summary tab — appended after Alignments.
