@@ -8,13 +8,30 @@ from Bio.SeqRecord import SeqRecord
 
 
 def _parse_config(fh) -> dict:
-    """Parse a config file handle into a dict, ignoring comments and blank lines."""
-    pattern = re.compile(r'^\s*(\w+)\s*=\s*([^#]*)')
+    """Parse a config file handle into a dict, ignoring comments and blank lines.
+
+    Keys may be written with underscores or hyphens (e.g. 'length_filter_sd'
+    or 'length-filter-sd') -- hyphens are normalised to underscores before
+    being stored, so the config file tolerates the same naming style as the
+    CLI flags (which conventionally use hyphens, e.g. --length-filter-sd)
+    without silently dropping the line.
+
+    This matters because the previous regex ('\\w+', which does not include
+    '-') simply failed to match any line whose key contained a hyphen -- no
+    error was raised, the line was just skipped entirely, and the affected
+    parameter silently fell back to its hardcoded default. That is a
+    dangerous failure mode: nothing in the console output or logs flags it,
+    and the only way to notice is to go check the resulting value in
+    run_parameters.json. Accepting both key styles removes the trap rather
+    than just documenting around it.
+    """
+    pattern = re.compile(r'^\s*([\w-]+)\s*=\s*([^#]*)')
     config = {}
     for line in fh:
         m = pattern.match(line)
         if m:
-            config[m.group(1)] = m.group(2).strip()
+            key = m.group(1).replace('-', '_')
+            config[key] = m.group(2).strip()
     return config
 
 

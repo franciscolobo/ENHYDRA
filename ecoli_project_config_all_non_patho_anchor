@@ -1,30 +1,23 @@
 # --- Input/Output ---
-inputdir    = test_data/ecoli_orthogroups/all
-outdir      = test_data/ecoli_output_all_non_patho_anchor
+inputdir    = test_data/e_coli/groups/all
+outdir      = validation/e_coli/all_1_1_orthologs_non_patho_anchor
 anchor      = NZ_CP016546
 max_process = 8
 
 # --- Filtering ---
-min_species     = 10        # minimum number of species per orthogroup
-min_sequences   = 5         # minimum sequences per group after length filtering
-paralogs        = all       # all | remove | longest
-length_filter_sd = 2.0      # sequences beyond mean ± (sd * length_filter_sd) are removed
-
-# --- Alignment ---
-aligner     = mafft         # mafft | muscle | prank
-mafft_mode  = auto          # auto | linsi | ginsi | einsi | fftnsi | fftns | nwnsi | nwns
+min_species          = 70        # minimum number of species per orthogroup
+paralogs             = remove       # all | remove | longest
+trim                 = strict
+divergence-filter-sd = 1.5
+length-filter-sd     = 1.5
 
 # --- Gene set enrichment ---
-gene_sets     = test_data/gmt/NZ_CP016546_GO_BP.gmt
-min_size      = 5
-max_size      = 500
-permutations  = 1000
-seed          = 42
-fdr_threshold = 0.1
-
-# --- Report ---
-top_n       = 20            # number of gene sets shown in barplot
-obo_cache   = test_data/obo_cache
+gene_sets   = test_data/e_coli/GO_annotation/gmt/NZ_CP016546_GO_BP.gmt
+min_size    = 5         # minimum number of genes per gene set
+max_size    = 500       # maximum number of genes per gene set
+permutations = 1000
+seed        = 42
+fdr_threshold = 0.2    # significance threshold for plots and report
 
 # --- Two-list differential mode (optional) ---
 # list1      = tests/pathogenic_strains.txt
