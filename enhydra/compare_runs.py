@@ -39,6 +39,7 @@ runs share identical input data.
 from __future__ import annotations
 
 import os
+import sys
 import json
 import html
 import logging
@@ -63,7 +64,7 @@ from .report import (
     _find_gmt_in_dir,
 )
 from .package_report import package_comparison_report
-from .exceptions import EnhydraIOError
+from .exceptions import EnhydraConfigError, EnhydraIOError
 
 logger = logging.getLogger(__name__)
 
@@ -815,6 +816,7 @@ function initTable(tableId) {{
     var numericCols = numericColsMap[tableId] || [];
     var dt = $('#' + tableId).DataTable({{
         pageLength: 25, orderCellsTop: true, order: [[4, 'asc']],
+        deferRender: true,
         columnDefs: [{{ targets: numericCols, type: 'num' }}],
     }});
     $('#' + tableId + ' thead tr.filter-row th').each(function(i) {{
@@ -900,6 +902,108 @@ $(document).ready(function() {{
 
 
 # ---------------------------------------------------------------------------
+# FDR threshold resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_fdr_threshold(runs: dict[str, dict], cli_value: float | None) -> float:
+    """Resolve the FDR threshold this comparison report should use.
+
+    compare_runs.py is a fully standalone tool with no access to whatever
+    project config produced each of the compared runs. Its own
+    --fdr-threshold flag previously defaulted to a hardcoded 0.25
+    regardless of what the original runs actually used, which created a
+    confusing and easy-to-hit trap: a person running their own ENHYDRA
+    pipeline with (say) --fdr-threshold 0.2 would reasonably expect a
+    comparison across those same runs to also treat 0.2 as the cutoff,
+    but unless they remembered to pass --fdr-threshold 0.2 again to this
+    separate tool, gene sets with an FDR between 0.2 and 0.25 would
+    silently be reported as "significant" in the comparison report even
+    though neither original run's own report considered them so.
+
+    This function closes that gap by preferring, in order:
+        1. An explicitly given cli_value — always wins outright, even if
+           it disagrees with every compared run's own recorded threshold.
+           This is the deliberate escape hatch for comparing runs that
+           were produced with different thresholds (or none recorded at
+           all) under one uniform cutoff of the caller's choosing.
+        2. The FDR threshold recorded in every compared run's own
+           run_parameters.json (written by
+           provenance.write_run_parameters() when each run itself was
+           produced) — used automatically, with an informational log
+           message, provided every run that has a recorded value agrees
+           on the same one. This is the common case (comparing several
+           runs of the same pipeline invoked with the same
+           --fdr-threshold) and means no action is needed from the
+           person running the comparison for it to "just do the right
+           thing".
+        3. A hardcoded fallback of 0.25, with a warning, if none of the
+           compared runs has a usable recorded threshold at all (e.g.
+           every run predates provenance tracking).
+
+    If runs that DO have a recorded threshold disagree with each other,
+    this raises rather than silently picking one — picking a value here
+    without telling the caller is exactly the failure mode this function
+    exists to eliminate.
+
+    Args:
+        runs:      {run_name: info} as built by build_comparison_report(),
+                  where info["run_parameters"] is the parsed
+                  run_parameters.json dict (or None).
+        cli_value: The value passed via --fdr-threshold, or None if not
+                  given.
+
+    Returns:
+        The FDR threshold to use for this comparison report.
+
+    Raises:
+        EnhydraConfigError: If cli_value is None and the compared runs'
+                            own recorded thresholds disagree.
+    """
+    if cli_value is not None:
+        return cli_value
+
+    per_run_thresholds: dict[str, float] = {}
+    for name, info in runs.items():
+        run_params = info.get("run_parameters")
+        if not run_params:
+            continue
+        fdr = (run_params.get("gsea") or {}).get("fdr_threshold")
+        if fdr is not None:
+            per_run_thresholds[name] = fdr
+
+    if not per_run_thresholds:
+        logger.warning(
+            "No --fdr-threshold given, and none of the selected runs have "
+            "a recorded FDR threshold in their own run_parameters.json "
+            "(they may predate provenance tracking) — falling back to "
+            "this tool's own default of 0.25. Pass --fdr-threshold "
+            "explicitly to set this directly."
+        )
+        return 0.25
+
+    distinct_values = set(per_run_thresholds.values())
+    if len(distinct_values) == 1:
+        value = next(iter(distinct_values))
+        logger.info(
+            "No --fdr-threshold given — using %.4g, the FDR threshold "
+            "recorded by every selected run's own run_parameters.json.",
+            value,
+        )
+        return value
+
+    breakdown = "; ".join(
+        "%s: %.4g" % (name, fdr) for name, fdr in sorted(per_run_thresholds.items())
+    )
+    raise EnhydraConfigError(
+        "No --fdr-threshold given, and the selected runs do not agree on "
+        "their own recorded FDR threshold (%s). Silently picking one here "
+        "would risk misreporting significance, so pass --fdr-threshold "
+        "explicitly to choose the cutoff this comparison report should use."
+        % breakdown
+    )
+
+
+# ---------------------------------------------------------------------------
 # Report assembly
 # ---------------------------------------------------------------------------
 
@@ -907,7 +1011,7 @@ def build_comparison_report(
     run_dirs: list[str],
     run_names: list[str],
     output_path: str,
-    fdr_threshold: float = 0.25,
+    fdr_threshold: float | None = None,
     obo_path: str | None = None,
 ) -> str:
     """Build a cross-run comparison HTML report.
@@ -918,7 +1022,16 @@ def build_comparison_report(
         run_names:     Display names, one per run_dirs entry, in the same
                        order. Must be unique.
         output_path:   Path to write the comparison HTML report to.
-        fdr_threshold: Significance cutoff applied throughout.
+        fdr_threshold: Significance cutoff applied throughout. If None
+                       (the default), this is resolved automatically from
+                       the compared runs' own run_parameters.json —
+                       see _resolve_fdr_threshold() for the full
+                       precedence rules and why this matters (a
+                       previous hardcoded 0.25 default here, independent
+                       of whatever threshold the original runs were
+                       actually produced with, could silently report
+                       gene sets as "significant" that neither original
+                       run's own report considered significant).
         obo_path:      Optional path to a cached go-basic.obo file, for
                        resolving GO term names. Falls back to any GMT
                        files found in the runs' own enrichment
@@ -928,11 +1041,19 @@ def build_comparison_report(
     Returns:
         The absolute path the report was written to.
 
+    Raises:
+        EnhydraConfigError: If fdr_threshold is None and the compared
+                            runs' own recorded thresholds disagree (see
+                            _resolve_fdr_threshold()).
+
     Note:
         The report links to each run's own per-gene-set enrichment plot
         PNGs by relative path rather than embedding them, so it must
         remain on the same filesystem as the run directories (or be
-        moved together with them) for those links to resolve.
+        moved together with them) for those links to resolve. Use
+        package_report.package_comparison_report() to bundle the report
+        and every PNG it references into one self-contained, shareable
+        folder.
     """
     report_dir = os.path.dirname(os.path.abspath(output_path)) or "."
     os.makedirs(report_dir, exist_ok=True)
@@ -941,6 +1062,8 @@ def build_comparison_report(
     runs: dict[str, dict] = {}
     for d, name in zip(run_dirs, run_names):
         runs[name] = _discover_run(d)
+
+    fdr_threshold = _resolve_fdr_threshold(runs, fdr_threshold)
 
     # GO term names: any GMT found in any run's results dirs, then OBO
     # (if given) taking precedence on conflicts — same precedence order
@@ -1121,7 +1244,7 @@ def build_comparison_report(
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m enhydra.compare_runs",
-        description="Compare two or more completed ENHYDRA run output directories.",
+        description="Compare two or more completed ENHYDRA output directories.",
     )
     parser.add_argument(
         "--runs", nargs="+", required=True, metavar="DIR",
@@ -1138,8 +1261,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "comparison_report.html in the current directory).",
     )
     parser.add_argument(
-        "--fdr-threshold", type=float, default=0.25,
-        help="FDR significance cutoff applied throughout (default: 0.25).",
+        "--fdr-threshold", type=float, default=None,
+        help="FDR significance cutoff applied throughout. If not given, "
+             "automatically uses the threshold recorded in the selected "
+             "runs' own run_parameters.json, provided every run with a "
+             "recorded value agrees on the same one; falls back to 0.25 "
+             "if none of the runs has a recorded value, or raises an "
+             "error if the runs disagree (pass this flag explicitly to "
+             "resolve that).",
     )
     parser.add_argument(
         "--obo-cache", default=None,
@@ -1159,7 +1288,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="If --package-dir already exists, replace it rather than "
              "raising an error.",
     )
-
     return parser
 
 
@@ -1193,13 +1321,16 @@ def main():
         os.path.join(args.obo_cache, "go-basic.obo") if args.obo_cache else None
     )
 
-    build_comparison_report(
-        run_dirs=args.runs,
-        run_names=names,
-        output_path=args.output,
-        fdr_threshold=args.fdr_threshold,
-        obo_path=obo_path,
-    )
+    try:
+        build_comparison_report(
+            run_dirs=args.runs,
+            run_names=names,
+            output_path=args.output,
+            fdr_threshold=args.fdr_threshold,
+            obo_path=obo_path,
+        )
+    except EnhydraConfigError as e:
+        sys.exit("Configuration error: %s" % e)
 
     if args.package_dir:
         logger.info("Packaging shareable comparison report bundle...")
@@ -1216,6 +1347,7 @@ def main():
                 "The full comparison report is still available at: %s",
                 e, args.output,
             )
+
 
 if __name__ == "__main__":
     main()
