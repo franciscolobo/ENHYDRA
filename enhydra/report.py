@@ -1033,14 +1033,14 @@ _RANKING_FIELDS = [
 ]
 
 _GSEA_FIELDS = [
-    ("permutations",  "Permutations"),
-    ("min_size",      "Minimum gene set size"),
-    ("max_size",      "Maximum gene set size"),
-    ("seed",          "Random seed"),
-    ("fdr_threshold", "FDR threshold"),
+    ("permutations",            "Permutations"),
+    ("min_size",                "Minimum gene set size"),
+    ("max_size",                "Maximum gene set size"),
+    ("seed",                    "Random seed"),
+    ("fdr_threshold",           "FDR threshold"),
     ("gene_list_fdr_threshold", "Gene list embed FDR threshold "
                                  "(blank = same as FDR threshold)"),
-    ("top_n",         "Top N gene sets (plots)"),
+    ("top_n",                   "Top N gene sets (plots)"),
 ]
 
 _GENE_SETS_FIELDS = [
@@ -2013,6 +2013,17 @@ def _results_table_html(
                            sets, restoring the original, unrestricted
                            behaviour (can produce very large reports for
                            genome-scale GMTs).
+
+    Note on sorting: the "Full gene set" and "Leading edge" cells
+    sometimes wrap their visible count in an <a> link (when that term
+    qualifies for embedding). DataTables' numeric sort type parses a
+    cell's own rendered content, so an anchor tag around the number
+    otherwise breaks numeric sorting specifically for whichever rows
+    happen to be clickable. Every cell in these two columns therefore
+    carries an explicit data-sort="<count>" attribute (a built-in
+    DataTables feature — see "Orthogonal data" in the DataTables manual)
+    so sorting is driven by that attribute rather than the cell's own
+    markup, regardless of whether it's wrapped in a link.
     """
     df = df.copy()
     if "Term" not in df.columns:
@@ -2073,7 +2084,10 @@ def _results_table_html(
             # Bare count only (not "View (N)" / "N genes") so the column
             # sorts numerically in DataTables — clickability is signalled
             # separately via membership in full_sets_js, not by the text
-            # of this cell. See the row-rendering loop below.
+            # of this cell. See the row-rendering loop below, which also
+            # attaches a data-sort attribute so DataTables sorts on this
+            # raw count regardless of whether the cell ends up wrapped in
+            # a link.
             return len(genes)
         df["Full gene set"] = df["Term"].apply(_full_set_cell)
 
@@ -2344,6 +2358,16 @@ def build_significance_agreement_table_html(
         numeric_col_indices is None — callers should treat a None second
         element as "do not register this table with the DataTables JS",
         since no <table> element is present in that case.
+
+    Note on sorting: every per-column NES and FDR cell below carries an
+    explicit data-sort attribute, independent of that cell's own visible
+    markup (which may wrap the NES value in a '.go-link' anchor, or the
+    FDR value in <strong>). DataTables' numeric sort type parses a cell's
+    rendered HTML content directly, so without this attribute, sorting
+    silently breaks for exactly the rows most likely to be interesting
+    (plot-linked and/or significant) — the same class of bug already
+    fixed for the "Full gene set"/"Leading edge" columns in
+    _results_table_html().
     """
     columns   = list(column_dfs.keys())
     n_columns = len(columns)
@@ -2432,6 +2456,10 @@ def build_significance_agreement_table_html(
                 is_sig  = fdr < fdr_threshold
                 nes_str = "%.4f" % nes
                 fdr_str = "%.4f" % fdr
+                # data-sort carries the raw numeric value so DataTables
+                # sorts correctly regardless of whichever HTML wrapper (if
+                # any) the visible cell content below uses — see this
+                # function's own docstring note on sorting.
                 if enrichment_plots_map.get(c, {}).get(term):
                     nes_cell = (
                         '<a href="#" class="go-link" data-goid="%s" '
@@ -2440,9 +2468,19 @@ def build_significance_agreement_table_html(
                 else:
                     nes_cell = nes_str
                 fdr_cell = ("<strong>%s</strong>" % fdr_str) if is_sig else fdr_str
-                row_cells += "<td>%s</td><td>%s</td>" % (nes_cell, fdr_cell)
+                row_cells += (
+                    '<td data-sort="%s">%s</td><td data-sort="%s">%s</td>'
+                    % (nes, nes_cell, fdr, fdr_cell)
+                )
             else:
-                row_cells += "<td>\u2014</td><td>\u2014</td>"
+                # '\u2014' (em dash) has no numeric value — sort it to one
+                # extreme end regardless of sort direction, below/above
+                # every real numeric cell, rather than DataTables trying
+                # (and failing) to parse it as 0 or NaN.
+                row_cells += (
+                    '<td data-sort="-Infinity">\u2014</td>'
+                    '<td data-sort="Infinity">\u2014</td>'
+                )
         row_cells += "<td>%d / %d</td><td>%s</td>" % (n_sig, n_columns, direction)
         row_class = ' class="sig-row"' if n_sig == n_columns else ""
         body_rows.append("<tr%s>%s</tr>" % (row_class, row_cells))

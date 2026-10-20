@@ -4,7 +4,5 @@ BUGS
 # - check where the replot information is coming from
 # - some of the values in the table are missing
 # - In paralogs mode, when there are multiple genes of the anchor genome in the same group, only one alignment is shown
-- When comparing results from different runs, some results are not significant but are being shown as so
 - The NES plots in the comparison are broken
-- The ranking in the tables for the comparison between experiments doesn't work
 - Some genes from the gmt may be missing in the anchor genome, so they shouldn't be considered as full gene set (table), and shouldn't be shown.
