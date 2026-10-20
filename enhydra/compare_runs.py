@@ -62,6 +62,8 @@ from .report import (
     _gmt_term_names,
     _find_gmt_in_dir,
 )
+from .package_report import package_comparison_report
+from .exceptions import EnhydraIOError
 
 logger = logging.getLogger(__name__)
 
@@ -1145,6 +1147,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "resolving GO term names. Optional — falls back to any GMT "
              "files found in the runs' own enrichment directories.",
     )
+    parser.add_argument(
+        "--package-dir", default=None, metavar="DIR",
+        help="After building the comparison report, copy it and every "
+             "enrichment plot image it links to into this directory, as "
+             "a single self-contained folder suitable for sharing without "
+             "needing access to the original run directories.",
+    )
+    parser.add_argument(
+        "--package-overwrite", action="store_true", default=False,
+        help="If --package-dir already exists, replace it rather than "
+             "raising an error.",
+    )
+
     return parser
 
 
@@ -1186,6 +1201,21 @@ def main():
         obo_path=obo_path,
     )
 
+    if args.package_dir:
+        logger.info("Packaging shareable comparison report bundle...")
+        try:
+            packaged_path = package_comparison_report(
+                args.output, args.package_dir, overwrite=args.package_overwrite,
+            )
+            logger.info(
+                "Shareable comparison report bundle ready: %s", packaged_path,
+            )
+        except EnhydraIOError as e:
+            logger.warning(
+                "Could not package shareable comparison report bundle: %s. "
+                "The full comparison report is still available at: %s",
+                e, args.output,
+            )
 
 if __name__ == "__main__":
     main()

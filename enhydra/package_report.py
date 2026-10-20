@@ -46,6 +46,8 @@ working unchanged, with no HTML rewriting required.
 from __future__ import annotations
 
 import os
+import re
+import json
 import shutil
 import logging
 import argparse
@@ -182,6 +184,167 @@ def package_report(
         n_copied, total_bytes / 1_000_000, package_dir,
     )
     return os.path.join(package_dir, "report.html")
+
+
+# ---------------------------------------------------------------------------
+# compare_runs.py comparison reports
+# ---------------------------------------------------------------------------
+
+_ENRICHMENT_PLOTS_MAP_PATTERN = re.compile(
+    r"var enrichmentPlotsMap\s*=\s*(\{.*?\});", re.DOTALL
+)
+
+
+def _extract_enrichment_plot_paths(report_html_path: str) -> set[str]:
+    """Extract every relative PNG path embedded in a compare_runs.py
+    comparison report's own enrichmentPlotsMap JS variable.
+
+    compare_runs.py's comparison report (see
+    compare_runs.build_comparison_report()) is otherwise fully
+    self-contained — every plot other than per-gene-set enrichment plots is
+    rendered as embedded SVG/HTML, and all CSS/JS is inlined — except for
+    this one JSON blob, which records nested {.../run_name: {go_id:
+    relative_path}} mappings to each run's own on-disk enrichment plot
+    PNGs (see compare_runs._build_enrichment_plot_index(), reused from
+    report.py), referenced by a path relative to the comparison report's
+    own directory, using '/' separators regardless of platform (the same
+    convention report.py's own _build_enrichment_plot_index() uses).
+
+    Parsed by regex rather than importing compare_runs.py's own data
+    structures, since this only needs to work from an already-written
+    report file — the caller does not need to re-supply the original
+    run_dirs/run_names used to build it.
+
+    Args:
+        report_html_path: Path to a comparison report HTML file, as
+                          written by compare_runs.build_comparison_report().
+
+    Returns:
+        Set of relative path strings (using '/' separators, as embedded).
+        Empty set if the variable could not be found or parsed, or
+        contained no paths — treated as "nothing to copy", not an error,
+        since a comparison run with no ranking metric shared across at
+        least 2 runs produces an empty map by design (see
+        build_comparison_report()'s own 'usable_metrics' handling).
+    """
+    with open(report_html_path, encoding="utf-8") as fh:
+        html_content = fh.read()
+
+    match = _ENRICHMENT_PLOTS_MAP_PATTERN.search(html_content)
+    if not match:
+        logger.warning(
+            "Could not find enrichmentPlotsMap in report: %s — no "
+            "enrichment plot images will be packaged.", report_html_path,
+        )
+        return set()
+
+    try:
+        plots_map = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        logger.warning(
+            "Could not parse enrichmentPlotsMap JSON in report: %s — no "
+            "enrichment plot images will be packaged.", report_html_path,
+        )
+        return set()
+
+    # Nested dict of arbitrary depth (table_id -> run_name -> {go_id: path}
+    # in compare_runs.py's case); traversed generically by recursing into
+    # dict values until reaching plain strings, so this stays correct
+    # regardless of the exact key names or nesting used to produce it.
+    paths: set[str] = set()
+
+    def _collect(node):
+        if isinstance(node, dict):
+            for v in node.values():
+                _collect(v)
+        elif isinstance(node, str):
+            paths.add(node)
+
+    _collect(plots_map)
+    return paths
+
+
+def package_comparison_report(
+    report_path: str,
+    package_dir: str,
+    overwrite: bool = False,
+) -> str:
+    """Copy a compare_runs.py comparison report and every enrichment plot
+    image it links to into one shareable, self-contained folder.
+
+    compare_runs.py's own comparison report is already self-contained for
+    everything except per-gene-set enrichment plot images, which it links
+    to by relative path on the filesystem rather than embedding (see that
+    module's own build_comparison_report() docstring). This function
+    copies exactly that remaining dependency, discovered directly from the
+    report's own embedded enrichmentPlotsMap JS variable (see
+    _extract_enrichment_plot_paths()) rather than requiring the caller to
+    re-supply the original run_dirs/run_names used to build it.
+
+    Args:
+        report_path: Path to an existing comparison report HTML file, as
+                    written by compare_runs.build_comparison_report().
+        package_dir: Destination directory for the shareable bundle.
+                    Created if it does not already exist.
+        overwrite:   If True and package_dir already exists, it is removed
+                    and recreated from scratch. If False (default) and
+                    package_dir already exists, raises EnhydraIOError
+                    rather than merging into or silently overwriting its
+                    existing contents.
+
+    Returns:
+        The absolute path to the copied report HTML inside package_dir.
+
+    Raises:
+        EnhydraIOError: If report_path does not exist, or if package_dir
+                       already exists and overwrite=False.
+    """
+    report_path = os.path.abspath(report_path)
+    if not os.path.isfile(report_path):
+        raise EnhydraIOError("Comparison report not found: %s" % report_path)
+    report_dir = os.path.dirname(report_path)
+
+    package_dir = os.path.abspath(package_dir)
+    if os.path.exists(package_dir):
+        if not overwrite:
+            raise EnhydraIOError(
+                "Destination directory already exists: %s\n"
+                "Pass overwrite=True (or --overwrite on the command line) "
+                "to replace it, or choose a new destination path."
+                % package_dir
+            )
+        shutil.rmtree(package_dir)
+    os.makedirs(package_dir, exist_ok=True)
+
+    report_filename = os.path.basename(report_path)
+    shutil.copy2(report_path, os.path.join(package_dir, report_filename))
+
+    rel_paths   = _extract_enrichment_plot_paths(report_path)
+    n_copied    = 1   # the report itself
+    n_missing   = 0
+    total_bytes = os.path.getsize(report_path)
+    for rel_path in sorted(rel_paths):
+        rel_path_local = rel_path.replace("/", os.sep)
+        src  = os.path.join(report_dir, rel_path_local)
+        dest = os.path.join(package_dir, rel_path_local)
+        if not os.path.isfile(src):
+            logger.warning(
+                "Enrichment plot referenced by report not found on disk "
+                "(skipping): %s", src,
+            )
+            n_missing += 1
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        n_copied    += 1
+        total_bytes += os.path.getsize(src)
+
+    logger.info(
+        "Packaged shareable comparison report bundle: %d file(s) (%d "
+        "referenced plot(s) missing on disk), %.1f MB, written to: %s",
+        n_copied, n_missing, total_bytes / 1_000_000, package_dir,
+    )
+    return os.path.join(package_dir, report_filename)
 
 
 # ---------------------------------------------------------------------------
