@@ -1,7 +1,7 @@
 # --- Input/Output ---
 inputdir    = test_data/e_coli/groups/all
-outdir      = validation/e_coli/all_1_1_orthologs_non_patho_anchor
-anchor      = NZ_CP016546
+outdir      = validation/e_coli/all_1_1_orthologs_patho_anchor
+anchor      = NC_004431
 max_process = 8
 
 # --- Filtering ---
@@ -12,12 +12,13 @@ divergence-filter-sd = 1.5
 length-filter-sd     = 1.5
 
 # --- Gene set enrichment ---
-gene_sets   = test_data/e_coli/GO_annotation/gmt/NZ_CP016546_GO_BP.gmt
+gene_sets   = test_data/e_coli/GO_annotation/gmt/NC_004431_GO_BP.gmt
 min_size    = 5         # minimum number of genes per gene set
 max_size    = 500       # maximum number of genes per gene set
 permutations = 1000
 seed        = 42
 fdr_threshold = 0.2    # significance threshold for plots and report
+all_metrics = yes
 
 # --- Two-list differential mode (optional) ---
 # list1      = tests/pathogenic_strains.txt

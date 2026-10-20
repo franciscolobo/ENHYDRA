@@ -1,11 +1,11 @@
 # --- Input/Output ---
 inputdir    = test_data/e_coli/groups/all
-outdir      = validation/e_coli/all_1_1_orthologs_patho_anchor
+outdir      = validation/e_coli/patho_vs_non_patho_1_1_orthologs_patho_anchor
 anchor      = NC_004431
 max_process = 8
 
 # --- Filtering ---
-min_species          = 70        # minimum number of species per orthogroup
+min_species          = 10        # minimum number of species per orthogroup
 paralogs             = remove       # all | remove | longest
 trim                 = strict
 divergence-filter-sd = 1.5
@@ -18,7 +18,10 @@ max_size    = 500       # maximum number of genes per gene set
 permutations = 1000
 seed        = 42
 fdr_threshold = 0.2    # significance threshold for plots and report
+all_metrics = yes
 
 # --- Two-list differential mode (optional) ---
-# list1      = tests/pathogenic_strains.txt
-# list2      = tests/non_pathogenic_strains.txt
+list1      = tests/E_coli_pathogenic.txt
+list2      = tests/E_coli_non_pathogenic.txt
+list1_name = Pathogenic
+list2_name = Non-pathogenic
