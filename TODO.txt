@@ -1,8 +1,6 @@
 BUGS
-# - code_config should be configured only once and shouldn't be needed to be provided in the command line
 # - conserved and fast-evolving in cross-metrics consensus is misleading
 # - check where the replot information is coming from
 # - some of the values in the table are missing
 # - In paralogs mode, when there are multiple genes of the anchor genome in the same group, only one alignment is shown
-- The NES plots in the comparison are broken
 - Some genes from the gmt may be missing in the anchor genome, so they shouldn't be considered as full gene set (table), and shouldn't be shown.

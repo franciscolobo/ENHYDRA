@@ -1,3031 +1,1766 @@
-from __future__ import annotations
-from .io import parse_obo_names as _parse_obo_names
-from .filtering import display_group_id
-
-import json
-import shlex
 import os
-import html
-import base64
+import sys
+import json
+import shutil
 import logging
-import urllib.request
-import ssl
-from urllib.parse import quote as _urlquote
-import pandas as pd
+import argparse
+import multiprocessing
 
-logger = logging.getLogger(__name__)
+from tqdm import tqdm
 
-_DATATABLES_JS_URL  = "https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"
-_JQUERY_URL         = "https://code.jquery.com/jquery-3.7.0.min.js"
-_DATATABLES_CSS_URL = "https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"
-_XLSX_JS_URL        = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"
+from .io import read_config_file, read_species_list, parse_obo_names
+from .utils import check_parameters, check_lists, resolve_trim_args, \
+    resolve_divergence_filter_sd
+from .filtering import filter_length, filter_groups, subset_groups, \
+    strip_species_from_alignments, aggregate_length_filter_stats, \
+    filter_divergent_sequences
+from .alignment import run_aligner, run_trimal, run_trimal_columns
+from .tables import make_tables
+from .gsea import run_gsea
+from .orthofinder import preprocess_orthofinder
+from .differential import compute_differential, normalise_scores
+from .plotting import make_single_list_plots, make_differential_plots
+from .report import build_report, build_multi_metric_report, load_ranked_gene_ids
+from .stats import aggregate_pipeline_stats, compute_differential_stats
+from .msa_viewer import build_alignment_pages, load_group_anchor
+from .provenance import collect_run_parameters, write_run_parameters, \
+    add_stage_summary
+from .stage_markers import check_stage, write_stage_marker, aggregate_stage_markers
+from .package_report import package_report
+from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
-METRIC_LABELS = {
-    "identity": "Identity",
-    "zscore":   "Z-score",
-    "rank":     "Rank",
-}
+ALL_METRICS = ("identity", "zscore", "rank")
 
-_METRIC_DESCS = {
-    "identity": (
-        "Raw mean pairwise sequence identity averaged across all species pairs "
-        "in each orthogroup. No normalisation is applied."
-    ),
-    "zscore": (
-        "Z-score normalised identity: each group\u2019s score is expressed in "
-        "standard deviations from the mean across all groups. "
-        "Positive\u00a0=\u00a0more conserved than average; "
-        "negative\u00a0=\u00a0faster evolving."
-    ),
-    "rank": (
-        "Normalised rank: groups are ranked by identity and scores are divided "
-        "by N so that the most-conserved group receives a score of 1.0 and the "
-        "fastest-evolving group receives 1/N."
-    ),
-}
+# Default location for the code configuration file (mafft/trimal/etc. paths),
+# used when --code-config is not given and ENHYDRA_CODE_CONFIG is not set.
+# See _resolve_code_config_path() for the full precedence order. A single,
+# per-machine code_config rarely needs to change between analyses (unlike
+# project_config, which is expected to differ per run), so requiring it to
+# be re-specified on every invocation was pure friction once a person has
+# it set up once.
+_DEFAULT_CODE_CONFIG_PATH = os.path.expanduser("~/.enhydra/code_config")
+_CODE_CONFIG_ENV_VAR = "ENHYDRA_CODE_CONFIG"
 
-# Overlap coefficient above which two significant gene sets are considered
-# redundant by _cluster_redundant_terms() (see that function's own
-# docstring for the full rationale). Exposed here as a module-level
-# default so _results_table_html()/_build_report_impl()/build_report()/
-# build_multi_metric_report() all share one fallback value.
-DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD = 0.75
-
-# ---------------------------------------------------------------------------
-# Unified report template — one tab shell used for every report, regardless
-# of how many ranking metrics were run. A single-metric report simply has
-# one metric tab plus the Alignments and Filtering summary tabs; a
-# multi-metric report has three metric tabs, a Cross-metric consensus tab,
-# plus the same two. This replaces what used to be two separate templates
-# (a flat non-tabbed layout for single-metric reports, and a tabbed layout
-# for multi-metric reports) — they had been drifting into near-duplicates
-# anyway, and the Filtering summary / Alignments tabs need to appear in
-# both cases.
-# ---------------------------------------------------------------------------
-
-_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>{title}</title>
-<style>
-{dt_css}
-body {{ font-family: Arial, sans-serif; margin: 0; padding: 0;
-        background: #f5f5f5; color: #222; }}
-header {{ background: #1a3a5c; color: white; padding: 24px 40px; }}
-header h1 {{ margin: 0; font-size: 1.8em; }}
-header p  {{ margin: 4px 0 0; font-size: 0.95em; opacity: 0.85; }}
-main {{ max-width: 1300px; margin: 32px auto; padding: 0 24px; }}
-section {{ background: white; border-radius: 8px;
-           box-shadow: 0 1px 4px rgba(0,0,0,0.1);
-           padding: 28px 32px; margin-bottom: 28px; }}
-h2 {{ margin-top: 0; color: #1a3a5c; border-bottom: 2px solid #e0e0e0;
-      padding-bottom: 8px; }}
-h3 {{ color: #2c5282; margin: 24px 0 12px; }}
-h4 {{ color: #1a3a5c; margin: 20px 0 6px; }}
-h5 {{ color: #2c5282; margin: 14px 0 4px; font-size: 0.95em; }}
-.tab-nav {{ display: flex; gap: 0; border-bottom: 3px solid #1a3a5c;
-            margin-bottom: 28px; flex-wrap: wrap; }}
-.tab-btn {{ padding: 11px 32px; border: none; border-radius: 6px 6px 0 0;
-            background: #e2eaf3; cursor: pointer; font-size: 14px;
-            font-weight: 600; color: #555; margin-right: 3px;
-            transition: background .15s, color .15s; }}
-.tab-btn:hover:not(.active) {{ background: #c8d8ec; color: #1a3a5c; }}
-.tab-btn.active {{ background: #1a3a5c; color: white; }}
-.tab-panel {{ display: none; }}
-.tab-panel.active {{ display: block; }}
-.metric-desc {{ font-size: 0.9em; color: #444; margin: 0 0 20px;
-                padding: 10px 14px; background: #f0f5fa;
-                border-left: 3px solid #1a3a5c; border-radius: 0 4px 4px 0; }}
-.plot-block {{ margin: 20px 0; text-align: center; }}
-.plot-block img {{ max-width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
-.plot-caption {{ font-size: 0.9em; color: #555; margin-bottom: 6px; }}
-.plot-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
-tr.sig-row {{ background-color: #eaf3fb !important; font-weight: bold; }}
-a.go-link, a.geneset-link, a.leadedge-link, a.detail-link, a.redundant-link {{
-    color: #1a3a5c; text-decoration: underline dotted; cursor: pointer; }}
-.col-tip {{ display: inline-block; width: 14px; height: 14px; line-height: 14px;
-            font-size: 10px; text-align: center; border-radius: 50%;
-            background: #aaa; color: white; cursor: help; margin-left: 3px;
-            position: relative; }}
-.col-tip .tip-text {{ display: none; position: absolute; bottom: 120%; left: 50%;
-                      transform: translateX(-50%); background: #333; color: #fff;
-                      padding: 6px 10px; border-radius: 4px; font-size: 11px;
-                      white-space: normal; width: 220px; z-index: 999;
-                      font-weight: normal; line-height: 1.4; }}
-.col-tip:hover .tip-text {{ display: block; }}
-thead tr.filter-row th input {{
-    width: 100%; box-sizing: border-box; font-size: 11px;
-    padding: 3px; border: 1px solid #ccc; border-radius: 3px; }}
-thead tr.filter-row th {{ padding: 4px 8px; }}
-.svg-tooltip {{ position: fixed; background: #333; color: #fff;
-                padding: 8px 12px; border-radius: 4px; font-size: 12px;
-                max-width: 360px; line-height: 1.5; pointer-events: none;
-                z-index: 2000; display: none; white-space: normal; }}
-#modal-overlay {{ display: none; position: fixed; top: 0; left: 0;
-                  width: 100%; height: 100%; background: rgba(0,0,0,0.6);
-                  z-index: 1000; justify-content: center; align-items: center; }}
-#modal-overlay.active {{ display: flex; }}
-#modal-box {{ background: white; border-radius: 8px; padding: 24px;
-              max-width: 700px; width: 90%; position: relative; }}
-#modal-title {{ font-size: 1.1em; font-weight: bold; color: #1a3a5c;
-                margin-bottom: 12px; }}
-#modal-img {{ width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; }}
-#modal-text {{ display: none; max-height: 420px; overflow-y: auto;
-               text-align: left; white-space: pre-wrap; word-break: break-word;
-               font-family: 'Courier New', monospace; font-size: 12px;
-               background: #f7f7f7; border: 1px solid #e0e0e0;
-               border-radius: 4px; padding: 10px 14px; margin: 0; }}
-#modal-close {{ position: absolute; top: 12px; right: 16px; font-size: 1.4em;
-                cursor: pointer; color: #555; background: none; border: none; }}
-.export-btn {{ padding: 8px 18px; border: none; border-radius: 4px;
-               background: #1a3a5c; color: white; font-size: 13px;
-               font-weight: 600; cursor: pointer; margin-bottom: 14px;
-               margin-right: 8px; }}
-.export-btn:hover {{ background: #12293f; }}
-.sig-toggle-btn, .nonredundant-toggle-btn {{
-    padding: 8px 18px; border: 2px solid #1a3a5c; border-radius: 4px;
-    background: white; color: #1a3a5c; font-size: 13px;
-    font-weight: 600; cursor: pointer; margin-bottom: 14px;
-    margin-right: 8px; }}
-.sig-toggle-btn:hover, .nonredundant-toggle-btn:hover {{ background: #f0f5fa; }}
-.sig-toggle-btn.active, .nonredundant-toggle-btn.active {{ background: #1a3a5c; color: white; }}
-.funnel-block {{ margin-bottom: 18px; }}
-.funnel-row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
-               margin-top: 8px; }}
-.funnel-step {{ background: #1a3a5c; color: white; border-radius: 6px;
-                padding: 10px 14px; text-align: center; min-width: 92px; }}
-.funnel-num {{ font-size: 1.3em; font-weight: 700; }}
-.funnel-label {{ font-size: 0.72em; opacity: 0.9; margin-top: 2px; }}
-.funnel-arrow {{ font-size: 1.2em; color: #888; padding: 0 4px; }}
-.filtering-overlap {{ margin-bottom: 22px; padding: 14px 20px; background: #f0f5fa;
-                      border-left: 3px solid #1a3a5c; border-radius: 0 6px 6px 0; }}
-.filtering-cols {{ display: flex; gap: 24px; flex-wrap: wrap; }}
-.filtering-col {{ flex: 1 1 380px; background: #fafbfc; border: 1px solid #e0e0e0;
-                  border-radius: 6px; padding: 16px 20px; min-width: 320px; }}
-table.reason-table {{ width: 100%; border-collapse: collapse; margin: 6px 0 16px; }}
-table.reason-table th, table.reason-table td {{ border: 1px solid #e0e0e0;
-    padding: 5px 10px; font-size: 12.5px; text-align: left; }}
-table.reason-table th {{ background: #eef2f6; }}
-p.no-drops {{ color: #2f7d3c; font-size: 0.88em; margin: 4px 0 16px; }}
-.aln-tree-controls {{ margin-bottom: 14px; }}
-.aln-tree-controls input {{ width: 100%; max-width: 480px; padding: 8px 12px;
-    font-size: 13px; border: 1px solid #ccc; border-radius: 4px;
-    box-sizing: border-box; }}
-details.aln-tree-term {{ background: #fafbfc; border: 1px solid #e0e0e0;
-    border-radius: 6px; margin-bottom: 8px; padding: 8px 14px; }}
-details.aln-tree-term > summary {{ cursor: pointer; font-weight: 600;
-    color: #1a3a5c; padding: 4px 0; }}
-.aln-tree-row {{ display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
-    padding: 6px 4px 6px 20px; border-top: 1px solid #eee; font-size: 13px; }}
-.aln-tree-group {{ font-weight: 600; min-width: 160px; }}
-.aln-tree-gene {{ color: #555; min-width: 200px; }}
-.aln-tree-identity {{ color: #555; min-width: 120px; }}
-.aln-tree-diff {{ color: #1a3a5c; font-weight: 600; min-width: 100px; }}
-.gene-chip-list {{ display: flex; flex-wrap: wrap; gap: 6px; text-align: left;
-    font-family: 'Courier New', monospace; font-size: 12px; }}
-.gene-chip {{ background: #eef2f6; border-radius: 4px; padding: 3px 8px;
-    display: inline-flex; align-items: center; gap: 5px; }}
-.gene-chip-badge {{ background: #1a3a5c; color: white; border-radius: 3px;
-    padding: 1px 5px; font-size: 10px; font-weight: 700; text-decoration: none; }}
-.gene-chip-badge:hover {{ background: #12293f; }}
-a.aln-link {{ color: #1a3a5c; text-decoration: underline dotted; margin-right: 10px; }}
-footer {{ text-align: center; padding: 20px; font-size: 0.85em; color: #888; }}
-</style>
-</head>
-<body>
-<header>
-  <h1>{title}</h1>
-  <p>ENHYDRA &mdash; Gene Set Enrichment Analysis for evolutionary genomics</p>
-</header>
-<div id="svg-tooltip" class="svg-tooltip"></div>
-<div id="modal-overlay">
-  <div id="modal-box">
-    <button id="modal-close" title="Close">&times;</button>
-    <div id="modal-title"></div>
-    <img id="modal-img" src="" alt="Enrichment plot"/>
-    <pre id="modal-text"></pre>
-  </div>
-</div>
-<main>
-<section>
-  <h2>Results</h2>
-  <nav class="tab-nav" role="tablist">
-{tab_buttons}
-  </nav>
-{tab_panels}
-</section>
-</main>
-<footer>Generated by ENHYDRA</footer>
-<script>{jquery_js}</script>
-<script>{dt_js}</script>
-<script>{xlsx_js}</script>
-<script>
-var enrichmentPlotsMap    = {enrichment_plots_map};
-var fullGeneSets          = {full_gene_sets_js};
-var leadingEdgeMap        = {leading_edge_map_js};
-var fullGeneSetsHtml      = {full_gene_sets_html_js};
-var leadingEdgeHtmlMap    = {leading_edge_html_map_js};
-var redundantClustersHtml = {redundant_clusters_html_js};
-var numericColsMap        = {numeric_cols_map};
-var dtInstances           = {{}};
-var colFiltersMap         = {{}};
-var sigOnlyMap            = {{}};
-var sigColIndexMap        = {{}};
-var nonRedundantOnlyMap   = {{}};
-var redundantColIndexMap  = {{}};
-// Per-table default initial sort override. Tables not listed here keep the
-// historical default of sorting by column index 4 ascending (FDR, for the
-// per-metric enrichment tables' fixed column layout). The consensus table
-// has a different column shape and is already pre-sorted server-side (by
-// number of metrics in agreement, descending), so it opts out of any
-// client-side re-sort on load by specifying an empty order array.
-var defaultOrderMap    = {{ consensus: [] }};
-
-function getHeaderIndex(tableSelector, name) {{
-    var headers = [];
-    $(tableSelector).find('thead tr').first().find('th').each(function() {{
-        var $clone = $(this).clone();
-        $clone.find('.col-tip').remove();
-        headers.push($clone.text().trim());
-    }});
-    return headers.indexOf(name);
-}}
-
-$.fn.dataTable.ext.search.push(function(settings, data) {{
-    var metric = settings.nTable.id.replace('results-table-', '');
-    if (sigOnlyMap[metric]) {{
-        var sigCol = sigColIndexMap[metric];
-        if (sigCol !== undefined && sigCol !== null && sigCol !== -1 &&
-            data[sigCol] !== '\u2713') {{
-            return false;
-        }}
-    }}
-    if (nonRedundantOnlyMap[metric]) {{
-        var redCol = redundantColIndexMap[metric];
-        // A satellite row's "Redundant with" cell is always rendered as
-        // plain text beginning with the arrow character (see
-        // _cluster_redundant_terms()/_results_table_html()'s own
-        // "\u2192 <representative GO ID>" rendering) — representative
-        // rows ("View (N)" / "\u2014") and non-significant rows (blank,
-        // since redundancy is only computed among significant terms)
-        // never start with it, so this single prefix check is sufficient
-        // to hide only satellite rows under this toggle.
-        if (redCol !== undefined && redCol !== null && redCol !== -1 &&
-            data[redCol].indexOf('\u2192') === 0) {{
-            return false;
-        }}
-    }}
-    var cf = colFiltersMap[metric] || {{}};
-    for (var i in cf) {{
-        var f = cf[i];
-        if (f.text !== undefined) {{
-            if (data[i].toLowerCase().indexOf(f.text) === -1) return false;
-        }} else {{
-            var v = parseFloat(data[i]);
-            if (isNaN(v)) return false;
-            if (f.op === '<'  && !(v <  f.num)) return false;
-            if (f.op === '<=' && !(v <= f.num)) return false;
-            if (f.op === '>'  && !(v >  f.num)) return false;
-            if (f.op === '>=' && !(v >= f.num)) return false;
-            if ((f.op === '=' || f.op === '==') && v !== f.num) return false;
-            if (f.op === '!=' && v === f.num)   return false;
-        }}
-    }}
-    return true;
-}});
-function initTable(metric) {{
-    if (dtInstances[metric]) return;
-    colFiltersMap[metric]      = {{}};
-    sigOnlyMap[metric]         = false;
-    nonRedundantOnlyMap[metric] = false;
-    var numericCols = numericColsMap[metric] || [];
-    var order = defaultOrderMap.hasOwnProperty(metric)
-        ? defaultOrderMap[metric] : [[4, 'asc']];
-    var dt = $('#results-table-' + metric).DataTable({{
-        pageLength: 25, orderCellsTop: true, order: order,
-        deferRender: true,
-        columnDefs: [{{ targets: numericCols, type: 'num' }}],
-    }});
-    sigColIndexMap[metric]       = getHeaderIndex('#results-table-' + metric, 'Sig.');
-    redundantColIndexMap[metric] = getHeaderIndex('#results-table-' + metric, 'Redundant with');
-    $('#results-table-' + metric + ' thead tr.filter-row th').each(function(i) {{
-        var isNum = numericCols.indexOf(i) !== -1;
-        var inp   = $('<input type="text" placeholder="' +
-                      (isNum ? 'e.g. < 0.05' : 'Filter...') + '"/>');
-        $(this).html(inp);
-        inp.on('keyup change', (function(col) {{
-            return function() {{
-                var val = $.trim(this.value);
-                if (!val) {{
-                    delete colFiltersMap[metric][col];
-                }} else if (isNum) {{
-                    var m = val.match(/^([<>=!]=?)\\s*([\\d.eE+\\-]+)$/);
-                    if (m) colFiltersMap[metric][col] = {{ op: m[1], num: parseFloat(m[2]) }};
-                    else   delete colFiltersMap[metric][col];
-                }} else {{
-                    colFiltersMap[metric][col] = {{ text: val.toLowerCase() }};
-                }}
-                dt.draw();
-            }};
-        }})(i));
-    }});
-    dtInstances[metric] = dt;
-}}
-function initFilteringSummaryTables() {{
-    if (dtInstances['filtering-summary']) return;
-    $('#tab-filtering-summary table.species-count-table').each(function() {{
-        $(this).DataTable({{ pageLength: 25, order: [] }});
-    }});
-    dtInstances['filtering-summary'] = true;
-}}
-function showImageModal(title, uri) {{
-    $('#modal-title').text(title);
-    $('#modal-text').hide();
-    $('#modal-img').attr('src', uri).show();
-    $('#modal-overlay').addClass('active');
-}}
-function showTextModal(title, text) {{
-    $('#modal-title').text(title);
-    $('#modal-img').hide();
-    $('#modal-text').text(text).show();
-    $('#modal-overlay').addClass('active');
-}}
-function showHtmlModal(title, htmlContent) {{
-    $('#modal-title').text(title);
-    $('#modal-img').hide();
-    $('#modal-text').html(htmlContent).show();
-    $('#modal-overlay').addClass('active');
-}}
-function tableToXLSX(tableSelector, numericCols, fullGeneSetsMap, leadEdgeMap, filename, onlyFiltered) {{
-    var $table = $(tableSelector);
-    if ($table.length === 0) return;
-
-    var headers = [];
-    $table.find('thead tr').first().find('th').each(function() {{
-        var $clone = $(this).clone();
-        $clone.find('.col-tip').remove();
-        headers.push($clone.text().trim());
-    }});
-    var goIdCol     = headers.indexOf('GO ID');
-    var fullSetCol  = headers.indexOf('Full gene set');
-    var leadEdgeCol = headers.indexOf('Leading edge');
-
-    var dt       = $table.DataTable();
-    var selector = onlyFiltered ? {{ search: 'applied' }} : {{}};
-    var rows     = dt.rows(selector).nodes();
-    var aoa      = [headers];
-
-    $(rows).each(function() {{
-        var cells   = $(this).find('td');
-        var goId    = goIdCol >= 0 ? $(cells[goIdCol]).text().trim() : null;
-        var rowData = [];
-        cells.each(function(i) {{
-            var text = $(this).text().trim();
-            if (i === fullSetCol && goId && fullGeneSetsMap &&
-                fullGeneSetsMap[goId] !== undefined) {{
-                rowData.push(fullGeneSetsMap[goId].split('\\n').join('; '));
-            }} else if (i === leadEdgeCol && goId && leadEdgeMap &&
-                       leadEdgeMap[goId] !== undefined) {{
-                rowData.push(leadEdgeMap[goId].split('\\n').join('; '));
-            }} else if (numericCols.indexOf(i) !== -1) {{
-                var v = parseFloat(text);
-                rowData.push(isNaN(v) ? text : v);
-            }} else {{
-                rowData.push(text);
-            }}
-        }});
-        aoa.push(rowData);
-    }});
-
-    var ws = XLSX.utils.aoa_to_sheet(aoa);
-    var wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Enrichment results');
-    XLSX.writeFile(wb, filename);
-}}
-$(document).ready(function() {{
-    var svgTip = document.getElementById('svg-tooltip');
-    document.querySelectorAll('[data-tip]').forEach(function(el) {{
-        el.addEventListener('mousemove', function(e) {{
-            svgTip.innerHTML     = this.getAttribute('data-tip');
-            svgTip.style.display = 'block';
-            svgTip.style.left    = (e.clientX + 15) + 'px';
-            svgTip.style.top     = (e.clientY + 15) + 'px';
-        }});
-        el.addEventListener('mouseleave', function() {{ svgTip.style.display = 'none'; }});
-    }});
-    document.querySelectorAll('.tab-btn').forEach(function(btn) {{
-        btn.addEventListener('click', function() {{
-            var metric = this.dataset.metric;
-            document.querySelectorAll('.tab-btn').forEach(function(b) {{
-                b.classList.remove('active');
-            }});
-            document.querySelectorAll('.tab-panel').forEach(function(p) {{
-                p.classList.remove('active');
-            }});
-            this.classList.add('active');
-            document.getElementById('tab-' + metric).classList.add('active');
-            if (metric === 'filtering-summary') {{
-                initFilteringSummaryTables();
-            }} else if (numericColsMap.hasOwnProperty(metric)) {{
-                initTable(metric);
-            }}
-        }});
-    }});
-    var alignFilterInput = document.getElementById('aln-tree-filter');
-    if (alignFilterInput) {{
-        alignFilterInput.addEventListener('input', function() {{
-            var q = this.value.trim().toLowerCase();
-            document.querySelectorAll('#aln-tree .aln-tree-term').forEach(function(term) {{
-                var termMatch = (term.getAttribute('data-term-search') || '').indexOf(q) !== -1;
-                var rows = term.querySelectorAll('.aln-tree-row');
-                var anyRowMatch = false;
-                rows.forEach(function(row) {{
-                    var rowMatch = !q || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
-                    row.style.display = rowMatch ? '' : 'none';
-                    if (rowMatch) anyRowMatch = true;
-                }});
-                var show = !q || termMatch || anyRowMatch;
-                term.style.display = show ? '' : 'none';
-                if (q && show) {{ term.open = true; }}
-                if (!q) {{ term.open = false; }}
-            }});
-        }});
-    }}
-    $(document).on('click', '.go-link', function(e) {{
-        e.preventDefault();
-        var goId   = $(this).data('goid');
-        var metric = $(this).data('metric');
-        var plots  = metric ? enrichmentPlotsMap[metric] : undefined;
-        var uri    = plots ? plots[goId] : undefined;
-        if (uri) showImageModal(goId, uri);
-    }});
-    $(document).on('click', '.geneset-link', function(e) {{
-        e.preventDefault();
-        var goId = $(this).data('goid');
-        var htmlContent = fullGeneSetsHtml[goId];
-        if (htmlContent !== undefined) {{
-            showHtmlModal(goId + ' \u2014 full gene set', htmlContent);
-        }}
-    }});
-    $(document).on('click', '.leadedge-link', function(e) {{
-        e.preventDefault();
-        var goId   = $(this).data('goid');
-        var metric = $(this).data('metric');
-        var map    = metric ? leadingEdgeHtmlMap[metric] : undefined;
-        var htmlContent = map ? map[goId] : undefined;
-        if (htmlContent !== undefined) {{
-            showHtmlModal(goId + ' \u2014 leading edge genes (' + metric + ')', htmlContent);
-        }}
-    }});
-    $(document).on('click', '.redundant-link', function(e) {{
-        e.preventDefault();
-        var goId = $(this).data('goid');
-        var htmlContent = redundantClustersHtml[goId];
-        if (htmlContent !== undefined) {{
-            showHtmlModal(goId + ' \u2014 redundant gene sets', htmlContent);
-        }}
-    }});
-    $(document).on('click', '.sig-toggle-btn', function() {{
-        var metric = $(this).data('metric');
-        sigOnlyMap[metric] = !sigOnlyMap[metric];
-        $(this).toggleClass('active', sigOnlyMap[metric]);
-        $(this).text(sigOnlyMap[metric] ? 'Showing significant only \u2713' : 'Show only significant');
-        if (dtInstances[metric]) dtInstances[metric].draw();
-    }});
-    $(document).on('click', '.nonredundant-toggle-btn', function() {{
-        var metric = $(this).data('metric');
-        nonRedundantOnlyMap[metric] = !nonRedundantOnlyMap[metric];
-        $(this).toggleClass('active', nonRedundantOnlyMap[metric]);
-        $(this).text(nonRedundantOnlyMap[metric]
-            ? 'Showing non-redundant only \u2713' : 'Show non-redundant only');
-        if (dtInstances[metric]) dtInstances[metric].draw();
-    }});
-    $(document).on('click', '.export-xlsx-btn', function() {{
-        var metric      = $(this).data('metric');
-        var numericCols = numericColsMap[metric] || [];
-        var leadMap     = leadingEdgeMap[metric] || {{}};
-        tableToXLSX('#results-table-' + metric, numericCols, fullGeneSets, leadMap,
-                   'enrichment_results_' + metric + '.xlsx', true);
-    }});
-    $(document).on('click', '.export-xlsx-all-btn', function() {{
-        var metric      = $(this).data('metric');
-        var numericCols = numericColsMap[metric] || [];
-        var leadMap     = leadingEdgeMap[metric] || {{}};
-        tableToXLSX('#results-table-' + metric, numericCols, fullGeneSets, leadMap,
-                   'enrichment_results_' + metric + '_all.xlsx', false);
-    }});
-    $('#modal-close, #modal-overlay').on('click', function(e) {{
-        if (e.target === this) $('#modal-overlay').removeClass('active');
-    }});
-    var firstBtn = document.querySelector('.tab-btn');
-    if (firstBtn) firstBtn.click();
-}});
-</script>
-</body>
-</html>"""
+# Tools ENHYDRA's own code_config format recognises (see
+# io.read_config_file()). mafft and trimal are required for every run
+# (see utils.check_parameters()); muscle and prank are optional, only
+# required if --aligner selects them. Order here controls the order they
+# appear in an auto-generated code_config file (see _init_code_config()).
+_AUTO_DETECTED_TOOLS = ("mafft", "trimal", "muscle", "prank")
+_REQUIRED_TOOLS = ("mafft", "trimal")
 
 
-# ---------------------------------------------------------------------------
-# Standalone drop-details pages (one per drop-reasons/skipped-groups TSV)
-# ---------------------------------------------------------------------------
-# These intentionally do NOT depend on jQuery/DataTables — they are meant to
-# stay tiny even when a stage has thousands of dropped rows, and the main
-# report should not need to embed or fetch this data at all. Filtering is
-# done with plain JS string matching, which is more than sufficient for a
-# single-column reason filter plus a free-text search box.
+def _init_code_config(path: str, force: bool = False) -> None:
+    """Auto-detect external tool paths on $PATH and write a code_config file.
 
-_DETAILS_PAGE_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<title>{title}</title>
-<style>
-body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; background: #f5f5f5; }}
-h1 {{ color: #1a3a5c; font-size: 1.3em; }}
-.controls {{ margin-bottom: 14px; }}
-.controls input {{ padding: 6px 10px; font-size: 13px;
-    border: 1px solid #ccc; border-radius: 4px; margin-right: 8px; width: 260px; }}
-table {{ border-collapse: collapse; width: 100%; background: white; }}
-th, td {{ border: 1px solid #e0e0e0; padding: 6px 10px; font-size: 13px; text-align: left; }}
-th {{ background: #1a3a5c; color: white; position: sticky; top: 0; }}
-tr:nth-child(even) {{ background: #f9f9f9; }}
-.count {{ color: #555; font-size: 0.9em; margin-bottom: 10px; }}
-</style>
-</head>
-<body>
-<h1>{title}</h1>
-<p class="count"><span id="visible-count">{n_rows}</span> of {n_rows} rows shown</p>
-<div class="controls">
-  <input type="text" id="reason-filter" placeholder="Filter by reason (exact match)..."/>
-  <input type="text" id="text-filter" placeholder="Search all columns..."/>
-</div>
-<table id="details-table">
-<thead><tr>{header_html}</tr></thead>
-<tbody>
-{rows_html}
-</tbody>
-</table>
-<script>
-function getQueryParam(name) {{
-    var params = new URLSearchParams(window.location.search);
-    return params.get(name);
-}}
-function applyFilters() {{
-    var reasonVal = document.getElementById('reason-filter').value.trim().toLowerCase();
-    var textVal   = document.getElementById('text-filter').value.trim().toLowerCase();
-    var rows      = document.querySelectorAll('#details-table tbody tr');
-    var visible   = 0;
-    rows.forEach(function(row) {{
-        var reasonMatch = !reasonVal || (row.getAttribute('data-reason') || '').toLowerCase() === reasonVal;
-        var textMatch   = !textVal || row.textContent.toLowerCase().indexOf(textVal) !== -1;
-        var show = reasonMatch && textMatch;
-        row.style.display = show ? '' : 'none';
-        if (show) visible++;
-    }});
-    document.getElementById('visible-count').textContent = visible;
-}}
-document.getElementById('reason-filter').addEventListener('input', applyFilters);
-document.getElementById('text-filter').addEventListener('input', applyFilters);
-var initialReason = getQueryParam('reason');
-if (initialReason) {{
-    document.getElementById('reason-filter').value = initialReason;
-    applyFilters();
-}}
-</script>
-</body>
-</html>"""
+    Scans $PATH (via shutil.which()) for every tool ENHYDRA's code_config
+    format recognises and writes a ready-to-use code_config file at
+    `path`, so a fresh install needs no manual editing in the common case
+    where mafft/trimal are already installed and discoverable on $PATH.
+    This is the --init-code-config CLI entry point's implementation.
 
-
-def _tsv_to_details_html(tsv_path: str, html_path: str, title: str) -> bool:
-    """Render a drop-reasons-style TSV as a standalone, filterable HTML page.
-
-    Returns False (writing nothing) if the source TSV doesn't exist or is
-    empty (header-only), so callers can treat 'no page generated' as the
-    signal to omit the corresponding 'View list' link entirely.
-    """
-    if not os.path.isfile(tsv_path):
-        return False
-    with open(tsv_path) as fh:
-        lines = [l.rstrip("\n").split("\t") for l in fh if l.strip()]
-    if len(lines) < 2:   # header only, or empty
-        return False
-    header, rows = lines[0], lines[1:]
-    reason_idx = header.index("reason") if "reason" in header else None
-
-    header_html = "".join("<th>%s</th>" % h for h in header)
-    row_lines = []
-    for row in rows:
-        reason_val = row[reason_idx] if reason_idx is not None and reason_idx < len(row) else ""
-        cells = "".join("<td>%s</td>" % c for c in row)
-        row_lines.append('<tr data-reason="%s">%s</tr>' % (reason_val, cells))
-
-    html_content = _DETAILS_PAGE_TEMPLATE.format(
-        title=title, header_html=header_html,
-        rows_html="\n".join(row_lines), n_rows=len(rows),
-    )
-    with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(html_content)
-    return True
-
-
-def _generate_drop_details_pages(
-    listdir: str,
-    detail_files: dict,
-    report_dir: str,
-) -> dict[str, str | None]:
-    """Write a standalone details page next to each drop-reasons TSV.
+    A required tool (mafft, trimal) that cannot be found on $PATH still
+    gets an (empty) line in the written file, with a loud warning printed
+    to the console — rather than omitting the key entirely, which would
+    make the file's own structure a confusing source of "why doesn't
+    ENHYDRA see my tool path" questions later, since read_config_file()
+    treats a genuinely absent key the same as an empty one anyway. An
+    optional tool (muscle, prank) that isn't found is simply omitted,
+    since it is only ever required if --aligner actually selects it (see
+    utils.check_parameters()'s own conditional validation) — including an
+    empty line for every optional tool nobody uses would just be noise.
 
     Args:
-        listdir:      The list's root directory (dirname of its
-                      pipeline_stats.json), used to resolve the relative
-                      paths stored in detail_files.
-        detail_files: The 'detail_files' dict from pipeline_stats.json,
-                      mapping a stage key to a path relative to listdir
-                      (or null if that stage's file wasn't produced).
-        report_dir:   Directory the report.html itself will be written
-                      into, used as the base for the returned link paths
-                      (same convention as the enrichment-plot links).
+        path:  Destination path for the generated code_config file. The
+              parent directory is created if it does not already exist.
+        force: If True, overwrite an existing file at `path`. If False
+              (default) and a file already exists there, raises
+              EnhydraConfigError rather than silently overwriting a
+              person's existing, possibly hand-edited configuration.
 
-    Returns:
-        Dict with the same keys as detail_files, mapped to a path relative
-        to report_dir for the generated HTML page — or None if no page was
-        generated (source TSV missing/empty, or not applicable — e.g.
-        species_counts, which isn't a drop-reasons file and is rendered
-        inline instead, is passed through untouched as None here since
-        callers handle it separately).
+    Raises:
+        EnhydraConfigError: If a file already exists at `path` and
+                            force=False.
     """
-    out: dict[str, str | None] = {}
-    for key, rel_tsv in (detail_files or {}).items():
-        if key == "group_filter_species_counts":
-            continue
-        if not rel_tsv:
-            out[key] = None
-            continue
-        tsv_path  = os.path.join(listdir, rel_tsv)
-        html_path = os.path.splitext(tsv_path)[0] + ".html"
-        title     = key.replace("_", " ").title()
-        if _tsv_to_details_html(tsv_path, html_path, title):
-            out[key] = os.path.relpath(html_path, report_dir).replace(os.sep, "/")
+    if os.path.isfile(path) and not force:
+        raise EnhydraConfigError(
+            "A code configuration file already exists at: %s\n"
+            "Pass --init-code-config %s --force to overwrite it, or "
+            "choose a different destination with --init-code-config "
+            "<path>." % (path, path)
+        )
+
+    found: dict[str, str] = {}
+    missing: list[str] = []
+    for tool in _AUTO_DETECTED_TOOLS:
+        resolved = shutil.which(tool)
+        if resolved:
+            found[tool] = resolved
         else:
-            out[key] = None
-    return out
+            missing.append(tool)
 
+    parent_dir = os.path.dirname(path) or "."
+    os.makedirs(parent_dir, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Filtering summary tab content
-# ---------------------------------------------------------------------------
-
-def _load_json(path: str | None) -> dict | None:
-    if not path or not os.path.isfile(path):
-        return None
-    with open(path) as fh:
-        return json.load(fh)
-
-
-def _funnel_html(name: str, stats: dict) -> str:
-    steps = [
-        ("Input groups",         stats.get("n_input")),
-        ("After length filter",  stats.get("n_after_length_filter")),
-        ("After group filter",   stats.get("n_after_group_filter")),
+    lines = [
+        "# Auto-generated by 'enhydra --init-code-config'.\n",
+        "# Edit any path below if it is wrong, or add muscle/prank if you "
+        "plan to use them as --aligner.\n",
+        "\n",
     ]
-    # The divergence filter is optional and off by default (see
-    # stats.aggregate_pipeline_stats()'s doc comment on auto-detection).
-    # A run that never enabled it has no meaningful count to show here —
-    # inserting a permanently dashed/empty funnel step for every ordinary
-    # run would be clutter, not information, so the step is only added
-    # when it actually ran for this list.
-    if stats.get("n_after_divergence_filter") is not None:
-        steps.append((
-            "After divergence filter", stats.get("n_after_divergence_filter")
-        ))
-    steps.append(("Final groups",  stats.get("n_final_groups")))
-    steps.append(("Anchor-mapped", stats.get("n_anchor_mapped")))
+    for tool in _REQUIRED_TOOLS:
+        lines.append("%-6s = %s\n" % (tool, found.get(tool, "")))
+    for tool in _AUTO_DETECTED_TOOLS:
+        if tool in _REQUIRED_TOOLS:
+            continue
+        if tool in found:
+            lines.append("%-6s = %s\n" % (tool, found[tool]))
 
-    parts = []
-    for i, (label, val) in enumerate(steps):
-        if i > 0:
-            parts.append('<div class="funnel-arrow">&rarr;</div>')
-        parts.append(
-            '<div class="funnel-step"><div class="funnel-num">%s</div>'
-            '<div class="funnel-label">%s</div></div>'
-            % (val if val is not None else "\u2013", label)
-        )
-    return (
-        '<div class="funnel-block"><h4>%s</h4><div class="funnel-row">%s</div></div>'
-        % (name, "".join(parts))
-    )
+    with open(path, "w") as fh:
+        fh.writelines(lines)
 
-
-def _reason_table_html(
-    reason_counts: dict[str, int],
-    detail_html_rel: str | None,
-    empty_message: str,
-) -> str:
-    if not reason_counts:
-        return '<p class="no-drops">%s</p>' % empty_message
-    rows = ""
-    for reason, count in sorted(reason_counts.items(), key=lambda kv: -kv[1]):
-        if detail_html_rel:
-            link = (
-                '<a href="%s?reason=%s" target="_blank" class="detail-link">View list</a>'
-                % (detail_html_rel, _urlquote(reason))
-            )
+    print("Code configuration written to: %s" % path)
+    for tool in _AUTO_DETECTED_TOOLS:
+        if tool in found:
+            print("  found   %-6s -> %s" % (tool, found[tool]))
         else:
-            link = ""
-        rows += "<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (reason, count, link)
-    return (
-        '<table class="reason-table"><thead><tr><th>Reason</th><th>Count</th>'
-        '<th></th></tr></thead><tbody>%s</tbody></table>' % rows
-    )
+            print("  missing %-6s (not found on $PATH)" % tool)
+    missing_required = [t for t in missing if t in _REQUIRED_TOOLS]
+    if missing_required:
+        print(
+            "\nWarning: required tool(s) not found on $PATH: %s. Edit %s "
+            "to add their paths manually before running a pipeline."
+            % (", ".join(missing_required), path)
+        )
 
 
-def _species_counts_table_html(tsv_path: str | None, table_id: str) -> str:
-    if not tsv_path or not os.path.isfile(tsv_path):
-        return "<p>No species count data available.</p>"
-    with open(tsv_path) as fh:
-        lines = [l.rstrip("\n").split("\t") for l in fh if l.strip()]
-    if len(lines) < 2:
-        return "<p>No species count data available.</p>"
-    header, rows = lines[0], lines[1:]
-    header_html = "".join("<th>%s</th>" % h for h in header)
-    rows_html   = "".join(
-        "<tr>%s</tr>" % "".join("<td>%s</td>" % c for c in row)
-        for row in rows
-    )
-    return (
-        '<table id="%s" class="species-count-table display compact" style="width:100%%">'
-        '<thead><tr>%s</tr></thead><tbody>%s</tbody></table>'
-        % (table_id, header_html, rows_html)
-    )
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _setup_logging(outdir: str, quiet: bool = False):
+    log_path        = os.path.join(outdir, "enhydra.log")
+    fmt             = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    file_handler    = logging.FileHandler(log_path)
+    file_handler.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.ERROR if quiet else logging.INFO)
+    logging.basicConfig(level=logging.INFO, format=fmt,
+                        handlers=[file_handler, console_handler])
 
 
-def _divergence_filter_reasons_html(
-    ds: dict,
-    detail_links: dict[str, str | None],
-    heading_tag: str = "h5",
-) -> str:
-    """Build the two divergence-filter drop-reason subsections, if that
-    step ran for this list.
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
-    Both subsections ('sequences removed' and 'groups dropped') link to
-    the same drop_reasons.tsv details page — that file carries both
-    reasons in one 'reason' column, and the generic '?reason=' query-param
-    filtering already used by every other _reason_table_html() call (see
-    _generate_drop_details_pages()/_tsv_to_details_html()) narrows the
-    details page to just the relevant rows on click, with no special
-    handling needed here for this being a shared file.
+def _resolve(cli_val, config_val, default=None):
+    if cli_val is not None:
+        return cli_val
+    if config_val not in (None, ''):
+        return config_val
+    return default
+
+
+def _resolve_code_config_path(cli_value: str | None) -> str:
+    """Resolve which code_config file to use, so it needs to be specified
+    at most once per machine rather than on every invocation.
+
+    code_config records paths to external tools (mafft, trimal, etc.) that
+    rarely change once a machine is set up — unlike project_config, which
+    is expected to differ per analysis. Requiring it as a required
+    positional argument on every single invocation was pure friction for
+    the common case of "I already told ENHYDRA where mafft lives."
+
+    Resolution order (first match wins):
+        1. --code-config, if given explicitly on the command line. An
+           explicit path that does not exist raises immediately — if
+           someone bothered to type a path, silently falling through to
+           a different file would be more confusing than an upfront error.
+        2. The ENHYDRA_CODE_CONFIG environment variable, if set. Useful
+           for shared servers / CI / scripted pipelines where different
+           invocations might reasonably want different defaults without
+           modifying every call site.
+        3. The default path ~/.enhydra/code_config. This is the intended
+           steady-state for a person working on their own machine: create
+           the file once, then every future invocation just works.
 
     Args:
-        ds:            The 'drop_summary' dict from pipeline_stats.json.
-                      If it has no 'divergence_filter' key, the step did
-                      not run for this list and an empty string is
-                      returned — no heading, no placeholder text, since
-                      showing a permanently-empty divergence filter
-                      section on every ordinary run (where this filter is
-                      off by default) would be clutter.
-        detail_links:  Output of _generate_drop_details_pages(), used to
-                      resolve the 'divergence_filter_drop_reasons' link.
-        heading_tag:   'h4' in single-list mode, 'h5' in the two-list
-                      per-column blocks — matches the surrounding
-                      section's own heading level in each caller.
+        cli_value: The value passed via --code-config, or None if not given.
 
     Returns:
-        HTML string, or "" if the divergence filter did not run.
+        The resolved path to an existing code_config file.
+
+    Raises:
+        EnhydraConfigError: If an explicit --code-config path does not
+                            exist, or if none of the three locations above
+                            resolves to an existing file.
     """
-    if "divergence_filter" not in ds:
-        return ""
-    div_ds = ds["divergence_filter"]
-    detail_link = detail_links.get("divergence_filter_drop_reasons")
-    return (
-        "<%s>Divergence filter \u2014 sequences removed</%s>"
-        % (heading_tag, heading_tag)
-        + _reason_table_html(
-            div_ds.get("sequences_removed", {}),
-            detail_link,
-            "No sequences were removed by the divergence filter.",
-        )
-        + "<%s>Divergence filter \u2014 groups dropped</%s>"
-        % (heading_tag, heading_tag)
-        + _reason_table_html(
-            div_ds.get("groups_dropped", {}),
-            detail_link,
-            "No groups were dropped by the divergence filter.",
-        )
+    if cli_value is not None:
+        if not os.path.isfile(cli_value):
+            raise EnhydraConfigError(
+                "--code-config was given as '%s', but no file exists "
+                "there." % cli_value
+            )
+        return cli_value
+
+    env_value = os.environ.get(_CODE_CONFIG_ENV_VAR)
+    if env_value:
+        if not os.path.isfile(env_value):
+            raise EnhydraConfigError(
+                "%s is set to '%s', but no file exists there."
+                % (_CODE_CONFIG_ENV_VAR, env_value)
+            )
+        return env_value
+
+    if os.path.isfile(_DEFAULT_CODE_CONFIG_PATH):
+        return _DEFAULT_CODE_CONFIG_PATH
+
+    raise EnhydraConfigError(
+        "Could not find a code configuration file. Checked, in order:\n"
+        "  1. --code-config (not given)\n"
+        "  2. %s environment variable (not set)\n"
+        "  3. default location: %s (not found)\n\n"
+        "To fix this, do one of the following:\n"
+        "  - Create a code_config file at %s with your tool paths "
+        "(mafft, trimal, etc.), e.g.:\n"
+        "      mkdir -p %s\n"
+        "      printf 'mafft  = /usr/local/bin/mafft\\ntrimal = "
+        "/usr/local/bin/trimal\\n' > %s\n"
+        "  - Or pass --code-config /path/to/your/code_config explicitly.\n"
+        "  - Or set the %s environment variable to its path."
+        % (_CODE_CONFIG_ENV_VAR, _DEFAULT_CODE_CONFIG_PATH,
+           _DEFAULT_CODE_CONFIG_PATH,
+           os.path.dirname(_DEFAULT_CODE_CONFIG_PATH),
+           _DEFAULT_CODE_CONFIG_PATH, _CODE_CONFIG_ENV_VAR)
     )
 
 
-def _one_list_filtering_block(
-    name: str,
-    pipeline_stats_path: str | None,
-    report_dir: str,
-    table_id_prefix: str,
-) -> str:
-    stats = _load_json(pipeline_stats_path)
-    if stats is None:
-        return (
-            '<div class="filtering-col"><h4>%s</h4>'
-            '<p>No pipeline statistics available.</p></div>' % name
-        )
-    listdir       = os.path.dirname(os.path.abspath(pipeline_stats_path))
-    detail_files  = stats.get("detail_files", {})
-    detail_links  = _generate_drop_details_pages(listdir, detail_files, report_dir)
-    species_rel   = detail_files.get("group_filter_species_counts")
-    species_tsv   = os.path.join(listdir, species_rel) if species_rel else None
-    ds            = stats.get("drop_summary", {})
+def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bool:
+    """Legacy presence-only completion check.
 
-    funnel = _funnel_html(name, stats)
-    reasons_html = (
-        "<h5>Length filter \u2014 groups skipped entirely</h5>"
-        + _reason_table_html(
-            ds.get("length_filter", {}).get("groups_skipped", {}),
-            detail_links.get("length_filter_skipped_groups"),
-            "No groups were skipped entirely at this step.",
-        )
-        + "<h5>Length filter \u2014 sequences removed as outliers</h5>"
-        + _reason_table_html(
-            ds.get("length_filter", {}).get("sequences_removed", {}),
-            detail_links.get("length_filter_drop_reasons"),
-            "No individual sequences were removed as length outliers.",
-        )
-        + "<h5>Group filter \u2014 groups removed</h5>"
-        + _reason_table_html(
-            ds.get("group_filter", {}),
-            detail_links.get("group_filter_drop_reasons"),
-            "No groups were removed at the group filter step.",
-        )
-        + _divergence_filter_reasons_html(ds, detail_links, heading_tag="h5")
-        + "<h5>Tables step \u2014 anomalies</h5>"
-        + _reason_table_html(
-            ds.get("tables", {}),
-            detail_links.get("tables_drop_reasons"),
-            "No anomalies at the table generation step.",
-        )
-    )
-    species_html = (
-        "<h5>Groups per species (surviving groups)</h5>"
-        + _species_counts_table_html(species_tsv, table_id_prefix + "-species-counts")
-    )
-    return '<div class="filtering-col"><h4>%s</h4>%s%s%s</div>' % (
-        name, funnel, reasons_html, species_html,
-    )
-
-
-def _build_filtering_summary_tab_content(
-    mode: str,
-    label1: str,
-    label2: str,
-    pipeline_stats_path: str | None,
-    pipeline_stats_path1: str | None,
-    pipeline_stats_path2: str | None,
-    differential_stats_path: str | None,
-    report_dir: str,
-) -> str:
-    """Build the Filtering summary tab body.
-
-    mode == 'differential' corresponds exactly to two-list mode throughout
-    this module (see build_report()/build_multi_metric_report() call sites
-    in cli.py), so it doubles as the single-list vs two-list switch here —
-    no separate flag is needed.
+    Still used for the small number of downstream artefacts that sit
+    outside _run_single_list()'s own per-stage marker system (alignment
+    page rendering, GSEA results, differential scoring) — these are
+    single-shot outputs of one function call each, not a pipeline of
+    independently-parameterised stages, so the added bookkeeping of a
+    stage marker was judged not to carry its weight there. See
+    stage_markers.check_stage() for the parameter-aware version used
+    inside _run_single_list().
     """
-    if mode != "differential":
-        stats = _load_json(pipeline_stats_path)
-        if stats is None:
-            return "<p>No pipeline statistics available for this run.</p>"
-        listdir      = os.path.dirname(os.path.abspath(pipeline_stats_path))
-        detail_files = stats.get("detail_files", {})
-        detail_links = _generate_drop_details_pages(listdir, detail_files, report_dir)
-        species_rel  = detail_files.get("group_filter_species_counts")
-        species_tsv  = os.path.join(listdir, species_rel) if species_rel else None
-        ds           = stats.get("drop_summary", {})
-
-        funnel = _funnel_html("Groups", stats)
-        reasons_html = (
-            "<h4>Length filter \u2014 groups skipped entirely</h4>"
-            + _reason_table_html(
-                ds.get("length_filter", {}).get("groups_skipped", {}),
-                detail_links.get("length_filter_skipped_groups"),
-                "No groups were skipped entirely at this step.",
-            )
-            + "<h4>Length filter \u2014 sequences removed as outliers</h4>"
-            + _reason_table_html(
-                ds.get("length_filter", {}).get("sequences_removed", {}),
-                detail_links.get("length_filter_drop_reasons"),
-                "No individual sequences were removed as length outliers.",
-            )
-            + "<h4>Group filter \u2014 groups removed</h4>"
-            + _reason_table_html(
-                ds.get("group_filter", {}),
-                detail_links.get("group_filter_drop_reasons"),
-                "No groups were removed at the group filter step.",
-            )
-            + _divergence_filter_reasons_html(ds, detail_links, heading_tag="h4")
-            + "<h4>Tables step \u2014 anomalies</h4>"
-            + _reason_table_html(
-                ds.get("tables", {}),
-                detail_links.get("tables_drop_reasons"),
-                "No anomalies at the table generation step.",
-            )
+    if not os.path.isdir(step_dir):
+        return False
+    if sentinel_files:
+        return all(
+            os.path.isfile(os.path.join(step_dir, f)) and
+            os.path.getsize(os.path.join(step_dir, f)) > 0
+            for f in sentinel_files
         )
-        species_html = (
-            "<h4>Groups per species (surviving groups)</h4>"
-            + _species_counts_table_html(species_tsv, "species-counts")
-        )
-        return '<div class="filtering-summary">%s%s%s</div>' % (
-            funnel, reasons_html, species_html,
-        )
-
-    # Two-list mode: one column per list, plus an overlap summary on top.
-    diff_stats = _load_json(differential_stats_path)
-    if diff_stats:
-        overlap_html = (
-            '<div class="filtering-overlap"><h4>Overlap between lists '
-            '(used for differential scoring)</h4>'
-            '<div class="funnel-row">'
-            '<div class="funnel-step"><div class="funnel-num">%d</div>'
-            '<div class="funnel-label">%s groups</div></div>'
-            '<div class="funnel-arrow">&cap;</div>'
-            '<div class="funnel-step"><div class="funnel-num">%d</div>'
-            '<div class="funnel-label">%s groups</div></div>'
-            '<div class="funnel-arrow">=</div>'
-            '<div class="funnel-step"><div class="funnel-num">%d</div>'
-            '<div class="funnel-label">Common groups</div></div>'
-            '<div class="funnel-step"><div class="funnel-num">%d</div>'
-            '<div class="funnel-label">%s only</div></div>'
-            '<div class="funnel-step"><div class="funnel-num">%d</div>'
-            '<div class="funnel-label">%s only</div></div>'
-            '</div></div>'
-            % (diff_stats["n_groups_list1"], diff_stats["list1_name"],
-               diff_stats["n_groups_list2"], diff_stats["list2_name"],
-               diff_stats["n_common_groups"],
-               diff_stats["n_list1_only"], diff_stats["list1_name"],
-               diff_stats["n_list2_only"], diff_stats["list2_name"])
-        )
-    else:
-        overlap_html = "<p>No overlap statistics available.</p>"
-
-    col1 = _one_list_filtering_block(label1, pipeline_stats_path1, report_dir, "list1")
-    col2 = _one_list_filtering_block(label2, pipeline_stats_path2, report_dir, "list2")
-    return (
-        '<div class="filtering-summary-two-list">%s'
-        '<div class="filtering-cols">%s%s</div></div>'
-        % (overlap_html, col1, col2)
-    )
+    return len(os.listdir(step_dir)) > 0
 
 
-# ---------------------------------------------------------------------------
-# Run parameters tab
-# ---------------------------------------------------------------------------
-#
-# Presents the reproducibility record written by
-# provenance.write_run_parameters() (see cli.py) — the effective,
-# post-CLI-override parameter values actually used for this run, not the
-# raw config file contents (a CLI flag may have silently overridden a
-# config value; this tab shows what actually ran). Explicit (key, label)
-# field lists are used rather than a generic dict-key-to-label
-# transformation, since the underlying dict shape is small and fixed
-# (mirrors provenance.collect_run_parameters()'s own contract), and
-# hand-written labels read better than a mechanical snake_case conversion
-# (e.g. "FDR threshold" rather than "Fdr threshold").
-
-_RUN_INFO_FIELDS = [
-    ("enhydra_version",     "ENHYDRA version"),
-    ("timestamp",           "Run timestamp"),
-    ("code_config_path",    "Code config file"),
-    ("project_config_path", "Project config file"),
-    ("outdir",              "Output directory"),
-]
-
-_INPUT_FIELDS = [
-    ("inputdir",        "Input directory"),
-    ("orthofinder_dir", "OrthoFinder directory"),
-    ("anchor",          "Anchor species"),
-    ("two_list_mode",   "Two-list differential mode"),
-]
-
-_LIST_FIELDS = [
-    ("path",            "Species list file"),
-    ("name",            "Display name"),
-    ("n_species",       "Number of species"),
-    ("anchor_injected", "Anchor auto-injected into this list"),
-]
-
-_FILTERING_FIELDS = [
-    ("min_species",          "Minimum species per group"),
-    ("min_sequences",        "Minimum sequences per group"),
-    ("paralogs",             "Paralog handling"),
-    ("length_filter_sd",     "Length filter (SD threshold)"),
-    ("divergence_filter_sd", "Divergence filter (SD threshold)"),
-    ("trim",                 "Column trimming mode"),
-]
-
-_ALIGNMENT_FIELDS = [
-    ("aligner",    "Aligner"),
-    ("mafft_mode", "MAFFT mode"),
-]
-
-_RANKING_FIELDS = [
-    ("all_metrics", "All metrics run (--all-metrics)"),
-    ("metrics_run", "Metric(s) run"),
-]
-
-_GSEA_FIELDS = [
-    ("permutations",            "Permutations"),
-    ("min_size",                "Minimum gene set size"),
-    ("max_size",                "Maximum gene set size"),
-    ("seed",                    "Random seed"),
-    ("fdr_threshold",           "FDR threshold"),
-    ("gene_list_fdr_threshold", "Gene list embed FDR threshold "
-                                 "(blank = same as FDR threshold)"),
-    ("top_n",                   "Top N gene sets (plots)"),
-]
-
-_GENE_SETS_FIELDS = [
-    ("gene_sets_path", "Local GMT file"),
-    ("organism",       "g:Profiler organism"),
-    ("sources",        "g:Profiler data sources"),
-]
+def _filter_length_star(args):
+    return filter_length(*args)
 
 
-def get_run_parameter_field_specs() -> dict[str, list[tuple[str, str]]]:
-    """Return the (key, label) field specs for each run_parameters.json
-    section, grouped by section name.
+def _reconstruct_alignment_pages(pages_dir: str) -> dict[str, str]:
+    """Rebuild a {group_id: page_path} map from an existing alignments/ dir.
 
-    Single source of truth for field ordering/labelling, shared by this
-    module's own Run parameters tab (_build_run_parameters_tab_content())
-    and by compare_runs.py's cross-run parameter diff table, so the two
-    presentations of the same underlying provenance record never drift
-    out of sync with each other.
-
-    Returns:
-        Dict mapping section name to its ordered list of (key, label)
-        pairs. 'run_info' fields live at the top level of a
-        run_parameters.json record; 'list' fields are nested under
-        input.list1 / input.list2 (two-list mode only) rather than under
-        a top-level 'list' key — callers extract the relevant sub-dict
-        themselves. All other section names match a top-level key in the
-        record directly (e.g. record['filtering']).
+    Used when a --resume/--replot run skips regenerating alignment pages
+    because pages_dir already has content from a prior run. Downstream
+    steps (report building) still need this mapping populated regardless
+    of which branch ran, so it is reconstructed from whatever HTML files
+    are already on disk rather than left undefined.
     """
+    if not os.path.isdir(pages_dir):
+        return {}
     return {
-        "run_info":  _RUN_INFO_FIELDS,
-        "input":     _INPUT_FIELDS,
-        "list":      _LIST_FIELDS,
-        "filtering": _FILTERING_FIELDS,
-        "alignment": _ALIGNMENT_FIELDS,
-        "ranking":   _RANKING_FIELDS,
-        "gsea":      _GSEA_FIELDS,
-        "gene_sets": _GENE_SETS_FIELDS,
+        os.path.splitext(f)[0]: os.path.abspath(os.path.join(pages_dir, f))
+        for f in os.listdir(pages_dir)
+        if f.endswith(".html")
     }
 
 
-def format_provenance_value(value) -> str:
-    """Format a single run_parameters.json value for HTML display.
-
-    Public (not module-private) since it is reused outside this module by
-    compare_runs.py's cross-run parameter diff table, in addition to this
-    module's own _fields_table_html().
-    """
-    if value is None:
-        return '<span style="color:#999;">not set</span>'
-    if isinstance(value, bool):
-        return "Yes" if value else "No"
-    if isinstance(value, list):
-        if not value:
-            return '<span style="color:#999;">none</span>'
-        return html.escape(", ".join(str(v) for v in value))
-    return html.escape(str(value))
-
-
-def _fields_table_html(d: dict, fields: list[tuple[str, str]]) -> str:
-    rows = "".join(
-        "<tr><td>%s</td><td>%s</td></tr>"
-        % (html.escape(label), format_provenance_value(d.get(key)))
-        for key, label in fields
-    )
-    return '<table class="reason-table"><tbody>%s</tbody></table>' % rows
+# Every subdirectory _run_single_list() itself creates directly under a
+# single list's root directory (i.e. 'outdir' in single-list mode, or
+# 'outdir/list1' / 'outdir/list2' in two-list mode). Kept as an explicit
+# list, cross-referenced against _run_single_list()'s own local directory
+# variables, rather than derived dynamically — --fork-from's seeding step
+# (see _seed_fork_source() below) needs to know exactly which
+# subdirectories are pipeline *stage* output (eligible for reuse across a
+# fork) as opposed to report-facing artefacts that always regenerate
+# fresh (alignments/, enrichment*/, plots*/, report.html,
+# run_parameters.json, pipeline_stats.json — none of which
+# _run_single_list() itself writes; see _seed_fork_source()'s own
+# docstring for why those are deliberately excluded).
+_FORK_SEEDABLE_STAGE_DIRS = (
+    "subset",
+    "length_stats", "length_filter", "length_filter_stats",
+    "group_filter", "group_filter_stats",
+    "alignment", "alignment_stripped",
+    "divergence_sident", "alignment_divergence_filtered",
+    "divergence_realign_input", "divergence_filter_stats",
+    "alignment_trimmed", "alignment_trimmed_colnumbering",
+    "ident_alignment", "tables",
+)
 
 
-def _build_run_parameters_tab_content(
-    run_parameters_path: str | None,
-    report_dir: str,
-) -> str:
-    """Build the Run parameters tab body from run_parameters.json.
+def _seed_fork_source(fork_from_listdir: str, dest_listdir: str, label: str = "") -> None:
+    """Copy every known pipeline-stage subdirectory (with its resume marker)
+    from a prior completed run into a fresh destination list directory.
 
-    Args:
-        run_parameters_path: Path to run_parameters.json, as written by
-                             provenance.write_run_parameters(). None or a
-                             missing file returns a placeholder message
-                             rather than raising — a report may be
-                             regenerated (e.g. via --replot on an output
-                             directory) from a run predating this feature.
-        report_dir:          Directory report.html itself will be written
-                             into, used to compute a relative link to the
-                             raw JSON file for download.
+    This is the mechanism behind --fork-from: rather than recomputing an
+    entire pipeline from scratch just to change one downstream parameter
+    (e.g. trim from 'strict' to 'strictplus'), every stage subdirectory
+    present in the fork source is copied wholesale into the new
+    (previously nonexistent) destination directory. _run_single_list()'s
+    own per-stage marker mechanism (stage_markers.check_stage(), via
+    _must_run()) then takes over exactly as it would for an ordinary
+    --resume: a copied stage whose marker still matches the current
+    invocation's parameters is reused as-is; the first stage whose marker
+    does not match is recomputed, which automatically cascades to every
+    stage after it regardless of whether *their* own parameters also
+    changed — a stage downstream of a changed one is stale via its input
+    even if its own configuration did not change.
 
-    Returns:
-        HTML string.
-    """
-    if not run_parameters_path or not os.path.isfile(run_parameters_path):
-        return (
-            "<p>No run parameters record is available for this run "
-            "(run_parameters.json not found \u2014 this report may have "
-            "been generated by an older version of ENHYDRA).</p>"
-        )
+    Blindly copying every stage — even ones that will turn out to be
+    invalidated by the parameter change — is deliberate and safe: a
+    stage whose copied-over output later fails its marker check is simply
+    recomputed and overwritten in place, exactly as for a same-directory
+    --resume that detects a mid-pipeline parameter change. There is no
+    need to compute the fork point in advance; the existing cascade does
+    it implicitly.
 
-    with open(run_parameters_path) as fh:
-        params = json.load(fh)
-
-    rel_json = os.path.relpath(run_parameters_path, report_dir).replace(os.sep, "/")
-
-    cmd = params.get("command_line") or []
-    try:
-        cmd_str = shlex.join(str(c) for c in cmd)
-    except Exception:
-        cmd_str = " ".join(str(c) for c in cmd)
-
-    input_section = params.get("input", {}) or {}
-    two_list      = bool(input_section.get("two_list_mode"))
-
-    parts = []
-    parts.append("<h4>Run info</h4>")
-    parts.append(_fields_table_html(params, _RUN_INFO_FIELDS))
-
-    parts.append("<h4>Command line</h4>")
-    cmd_display = html.escape(cmd_str) if cmd_str else \
-        '<span style="color:#999;">unavailable</span>'
-    parts.append(
-        '<table class="reason-table"><tbody><tr><td>Invocation</td>'
-        '<td style="font-family:\'Courier New\',monospace;">%s</td>'
-        "</tr></tbody></table>" % cmd_display
-    )
-
-    parts.append("<h4>Input</h4>")
-    parts.append(_fields_table_html(input_section, _INPUT_FIELDS))
-    if two_list:
-        list1 = input_section.get("list1", {}) or {}
-        list2 = input_section.get("list2", {}) or {}
-        list1_heading = "List 1"
-        if list1.get("name"):
-            list1_heading += " \u2014 %s" % html.escape(str(list1["name"]))
-        list2_heading = "List 2"
-        if list2.get("name"):
-            list2_heading += " \u2014 %s" % html.escape(str(list2["name"]))
-        parts.append("<h5>%s</h5>" % list1_heading)
-        parts.append(_fields_table_html(list1, _LIST_FIELDS))
-        parts.append("<h5>%s</h5>" % list2_heading)
-        parts.append(_fields_table_html(list2, _LIST_FIELDS))
-
-    parts.append("<h4>Filtering</h4>")
-    parts.append(_fields_table_html(params.get("filtering", {}) or {}, _FILTERING_FIELDS))
-
-    parts.append("<h4>Alignment</h4>")
-    parts.append(_fields_table_html(params.get("alignment", {}) or {}, _ALIGNMENT_FIELDS))
-
-    parts.append("<h4>Ranking</h4>")
-    parts.append(_fields_table_html(params.get("ranking", {}) or {}, _RANKING_FIELDS))
-
-    parts.append("<h4>GSEA</h4>")
-    parts.append(_fields_table_html(params.get("gsea", {}) or {}, _GSEA_FIELDS))
-
-    parts.append("<h4>Gene sets</h4>")
-    parts.append(_fields_table_html(params.get("gene_sets", {}) or {}, _GENE_SETS_FIELDS))
-
-    parts.append(
-        '<p style="margin-top:18px;"><a href="%s" target="_blank" '
-        'class="detail-link">Download raw run_parameters.json</a></p>' % rel_json
-    )
-
-    return "".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Alignments tab (GO-term-nested alignment page browser)
-# ---------------------------------------------------------------------------
-
-def _load_group_to_genes(tables_dir: str) -> dict[str, list[str]]:
-    """Load group2anchor.tsv as {group_id: [anchor_gene_id, ...]}.
-
-    Unlike msa_viewer.load_group_anchor() (which keeps only the last
-    gene_id per group_id, sufficient for single-line page metadata), this
-    preserves every row for a group — a group can map to more than one
-    anchor gene under --paralogs all, and GO-term membership needs to be
-    checked against all of them, not just whichever row happened to be
-    read last.
-    """
-    path = os.path.join(tables_dir, "group2anchor.tsv")
-    result: dict[str, list[str]] = {}
-    if not os.path.isfile(path):
-        return result
-    with open(path) as fh:
-        for line in fh:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) < 2:
-                continue
-            result.setdefault(fields[0], []).append(fields[1])
-    return result
-
-
-def _load_group_identity(tables_dir: str | None) -> dict[str, float]:
-    """Load group2mean.tsv as {group_id: mean_identity}."""
-    if not tables_dir:
-        return {}
-    path = os.path.join(tables_dir, "group2mean.tsv")
-    result: dict[str, float] = {}
-    if not os.path.isfile(path):
-        return result
-    with open(path) as fh:
-        for line in fh:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) < 2:
-                continue
-            try:
-                result[fields[0]] = float(fields[1])
-            except ValueError:
-                continue
-    return result
-
-
-def _build_alignment_tree_html(
-    gmt_gene_sets: dict[str, list[str]],
-    tables_dir1: str | None,
-    obo_names: dict[str, str],
-    alignment_pages1: dict[str, str] | None,
-    alignment_pages2: dict[str, str] | None,
-    report_dir: str,
-    label1: str = "List 1",
-    label2: str = "List 2",
-    tables_dir2: str | None = None,
-) -> str:
-    """Build the Alignments tab body: a GO-term-nested tree of alignment pages.
-
-    Membership is determined by list1's (or the single list's)
-    group2anchor.tsv — the only source of anchor-gene -> GMT mapping that
-    exists — intersected with whichever groups actually received a
-    rendered page in alignment_pages1. In two-list mode, alignment_pages1
-    is already restricted by cli.py to the group_id column of
-    differential_scores.tsv (i.e. bucket 3: groups that actually fed
-    GSEA), so no separate intersection check against that file is needed
-    here.
-
-    A GO term is only listed if at least one of its genes maps to a group
-    with a rendered page; terms are sorted by matched-group count
-    descending. If a group has more than one anchor gene under
-    --paralogs all and more than one of those genes falls under the same
-    term, the group is still listed only once for that term (paired with
-    the first gene, in sorted order, that matched) — this is a documented
-    simplification to avoid confusing duplicate rows for one group under
-    a single term.
-
-    In two-list mode (tables_dir2 given), each row shows both lists'
-    mean identity for that group (from each list's own group2mean.tsv)
-    plus their signed difference (list1 - list2). Rows within a term are
-    sorted by that signed difference descending: groups where list1 is
-    more conserved / list2 is more variable (positive diff) appear
-    first, sliding down through zero to groups where list2 is more
-    conserved / list1 is more variable (negative diff) at the bottom.
-    Deliberately signed rather than by |diff| — the direction of the
-    difference is the point, not just its magnitude. Rows missing a
-    score in either list sort to the end regardless of sign. In
-    single-list mode, each row shows a single plain identity value, and
-    rows are sorted by group_id (there is nothing to diff against).
+    Deliberately NOT copied here (always regenerated fresh by the normal
+    post-_run_single_list() pipeline in main(), regardless of
+    --fork-from): rendered alignment pages, GSEA results, plots, and the
+    HTML report, since these are report-facing artefacts derived from
+    whichever stage output ends up active after _run_single_list()
+    returns — potentially including output freshly recomputed because of
+    the very parameter change --fork-from exists to apply — rather than
+    independently-parameterised pipeline stages of their own.
 
     Args:
-        gmt_gene_sets:     {term_id: [gene_id, ...]}, as returned by
-                          _gmt_gene_sets().
-        tables_dir1:       list1's (or the single list's) tables/
-                          directory. None disables the tab content
-                          (returns an explanatory message) rather than
-                          raising.
-        obo_names:         {term_id: term_name}, for display alongside
-                          each GO ID.
-        alignment_pages1:  {group_id: absolute_path}, as returned by
-                          build_alignment_pages() for the single list /
-                          list1. None or empty disables the tab content.
-        alignment_pages2:  {group_id: absolute_path} for list2, or None
-                          in single-list mode. When given, each leaf
-                          shows a second link labelled with label2,
-                          shown only for groups that also have a list2
-                          page.
-        report_dir:        Directory report.html itself will be written
-                          into, used to convert the absolute paths in
-                          alignment_pages1/2 into report-relative links
-                          (same convention as enrichment plot linking).
-        label1:            Display label for the first link/score column
-                          (the list name in two-list mode). In
-                          single-list mode (alignment_pages2 is None)
-                          the link label falls back to plain "View
-                          alignment", since naming it after a list would
-                          be meaningless with only one list.
-        label2:            Display label for the second link/score
-                          column (two-list mode only).
-        tables_dir2:       list2's tables/ directory, used to load its
-                          own group2mean.tsv for the per-row identity
-                          comparison. None in single-list mode, or if
-                          two-list identity comparison should be skipped
-                          (falls back to the single plain-identity
-                          display even if alignment_pages2 is given).
+        fork_from_listdir: A single list's root directory from the prior
+                           completed run (the old --outdir in single-list
+                           mode, or its 'list1'/'list2' subdirectory in
+                           two-list mode).
+        dest_listdir:      The corresponding directory in the new run.
+                           Any individual stage subdirectory within it
+                           must not already exist — the caller (main())
+                           is responsible for having verified the overall
+                           destination outdir was freshly created for
+                           this invocation.
+        label:             Optional list name for log messages (two-list
+                           mode).
 
-    Returns:
-        HTML string: a filter input plus the nested <details> tree, or a
-        placeholder message if no data is available to build it from.
+    Raises:
+        EnhydraIOError: If fork_from_listdir does not exist.
     """
-    if not tables_dir1 or not alignment_pages1:
-        return "<p>No alignment pages were generated for this run.</p>"
-
-    group_to_genes = _load_group_to_genes(tables_dir1)
-    identity1 = _load_group_identity(tables_dir1)
-    identity2 = _load_group_identity(tables_dir2) if tables_dir2 else {}
-
-    gene_to_groups: dict[str, list[str]] = {}
-    for gid, genes in group_to_genes.items():
-        for gene in genes:
-            gene_to_groups.setdefault(gene, []).append(gid)
-
-    rel_pages1 = {
-        gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
-        for gid, p in alignment_pages1.items()
-    }
-    rel_pages2 = (
-        {gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
-         for gid, p in alignment_pages2.items()}
-        if alignment_pages2 else {}
-    )
-    two_list = bool(alignment_pages2) and tables_dir2 is not None
-
-    term_entries: dict[str, list[dict]] = {}
-    for term_id, genes in gmt_gene_sets.items():
-        seen_groups: set[str] = set()
-        entries: list[dict] = []
-        for gene in sorted(genes):
-            for group_id in gene_to_groups.get(gene, []):
-                if group_id in seen_groups or group_id not in rel_pages1:
-                    continue
-                seen_groups.add(group_id)
-                id1 = identity1.get(group_id)
-                id2 = identity2.get(group_id) if two_list else None
-                diff = (id1 - id2) if (id1 is not None and id2 is not None) else None
-                entries.append({
-                    "group_id": group_id, "gene_id": gene,
-                    "id1": id1, "id2": id2, "diff": diff,
-                })
-        if entries:
-            if two_list:
-                entries.sort(key=lambda e: (e["diff"] is None,
-                                            -e["diff"] if e["diff"] is not None else 0))
-            else:
-                entries.sort(key=lambda e: e["group_id"])
-            term_entries[term_id] = entries
-
-    if not term_entries:
-        return "<p>No GO terms could be matched to rendered alignment pages.</p>"
-
-    sorted_terms = sorted(term_entries.items(), key=lambda kv: -len(kv[1]))
-
-    blocks = []
-    for term_id, entries in sorted_terms:
-        term_name = obo_names.get(term_id, "")
-        summary_label = "%s%s (%d group%s)" % (
-            html.escape(term_id),
-            " \u2014 %s" % html.escape(term_name) if term_name else "",
-            len(entries), "" if len(entries) == 1 else "s",
+    logger = logging.getLogger(__name__)
+    prefix = ("%s: " % label) if label else ""
+    if not os.path.isdir(fork_from_listdir):
+        raise EnhydraIOError(
+            "%sFork source directory not found: %s" % (prefix, fork_from_listdir)
         )
-        rows_html = []
-        for e in entries:
-            group_id, gene_id = e["group_id"], e["gene_id"]
-            link1_label = html.escape(label1) if two_list else "View alignment"
-            links = '<a href="%s" target="_blank" class="aln-link">%s</a>' % (
-                rel_pages1[group_id], link1_label,
-            )
-            if two_list and group_id in rel_pages2:
-                links += ' <a href="%s" target="_blank" class="aln-link">%s</a>' % (
-                    rel_pages2[group_id], html.escape(label2),
-                )
-
-            if two_list:
-                id1_str = "%.4f" % e["id1"] if e["id1"] is not None else "N/A"
-                id2_str = "%.4f" % e["id2"] if e["id2"] is not None else "N/A"
-                diff_str = "%+.4f" % e["diff"] if e["diff"] is not None else "N/A"
-                score_html = (
-                    '<span class="aln-tree-identity">%s: %s</span>'
-                    '<span class="aln-tree-identity">%s: %s</span>'
-                    '<span class="aln-tree-diff">\u0394: %s</span>'
-                    % (html.escape(label1), id1_str,
-                       html.escape(label2), id2_str, diff_str)
-                )
-            else:
-                id1_str = "%.4f" % e["id1"] if e["id1"] is not None else "N/A"
-                score_html = '<span class="aln-tree-identity">identity: %s</span>' % id1_str
-
-            search_key = html.escape(
-                ("%s %s %s %s" % (group_id, gene_id, term_id, term_name)).lower()
-            )
-            rows_html.append(
-                '<div class="aln-tree-row" data-search="%s">'
-                '<span class="aln-tree-group">%s</span>'
-                '<span class="aln-tree-gene">anchor: %s</span>'
-                '%s'
-                '<span class="aln-tree-links">%s</span>'
-                "</div>"
-                % (search_key, html.escape(display_group_id(group_id)),
-                   html.escape(gene_id), score_html, links)
-            )
-        term_search_key = html.escape(("%s %s" % (term_id, term_name)).lower())
-        blocks.append(
-            '<details class="aln-tree-term" data-term-search="%s">'
-            "<summary>%s</summary>%s</details>"
-            % (term_search_key, summary_label, "".join(rows_html))
-        )
-
-    return (
-        '<div class="aln-tree-controls">'
-        '<input type="text" id="aln-tree-filter" '
-        'placeholder="Filter by GO ID, term name, group ID, or gene ID..."/>'
-        "</div>"
-        '<div id="aln-tree">%s</div>' % "".join(blocks)
-    )
-
-
-def _build_gene_to_page_links(
-    tables_dir1: str | None,
-    alignment_pages1: dict[str, str] | None,
-    alignment_pages2: dict[str, str] | None,
-    report_dir: str,
-) -> dict[str, tuple[str | None, str | None]]:
-    """Build {gene_id: (list1_relpath_or_None, list2_relpath_or_None)}.
-
-    Used to turn plain gene IDs in the "Full gene set" / "Leading edge"
-    modals into links to their pre-rendered alignment page, alongside the
-    GO-term tree (Alignments tab) which serves the same underlying data
-    but organised by GO term rather than by gene.
-
-    If a gene's group (from list1's group2anchor.tsv) has no rendered
-    page in alignment_pages1, that gene is simply absent from the
-    returned dict — callers should render it as plain, non-linked text.
-    If a gene happens to map to more than one group (possible under
-    --paralogs all, though unusual), the first matching group encountered
-    is used — a documented simplification, consistent with the same
-    choice already made in _build_alignment_tree_html().
-
-    Args:
-        tables_dir1:       list1's (or the single list's) tables/
-                          directory. None returns an empty dict.
-        alignment_pages1:  {group_id: absolute_path} for the single list
-                          or list1. None or empty returns an empty dict.
-        alignment_pages2:  {group_id: absolute_path} for list2, or None
-                          in single-list mode.
-        report_dir:        Directory report.html will be written into,
-                          used to compute relative link paths.
-
-    Returns:
-        Dict mapping gene_id to a (list1_link, list2_link) tuple, where
-        each element is a report-relative path string or None if that
-        list has no page for this gene's group.
-    """
-    if not tables_dir1 or not alignment_pages1:
-        return {}
-
-    group_to_genes = _load_group_to_genes(tables_dir1)
-    rel_pages1 = {
-        gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
-        for gid, p in alignment_pages1.items()
-    }
-    rel_pages2 = (
-        {gid: os.path.relpath(p, report_dir).replace(os.sep, "/")
-         for gid, p in alignment_pages2.items()}
-        if alignment_pages2 else {}
-    )
-
-    gene_to_page: dict[str, tuple[str | None, str | None]] = {}
-    for group_id, genes in group_to_genes.items():
-        if group_id not in rel_pages1:
-            continue
-        link1 = rel_pages1[group_id]
-        link2 = rel_pages2.get(group_id)
-        for gene in genes:
-            if gene not in gene_to_page:
-                gene_to_page[gene] = (link1, link2)
-    return gene_to_page
-
-
-def _gene_chip_list_html(
-    gene_ids: list[str],
-    gene_to_page: dict[str, tuple[str | None, str | None]],
-) -> str:
-    """Render a list of gene IDs as chips, linked to alignment pages where
-    a mapping exists in gene_to_page, plain text otherwise.
-
-    Each linked gene shows small 'L1'/'L2' badge links (rather than full
-    list-name labels, which would be too cramped at chip scale) opening
-    that list's alignment page in a new tab. A gene with only a list1
-    link (single-list mode, or a two-list gene whose group has no list2
-    page) shows only the L1 badge.
-    """
-    chips = []
-    for gene in gene_ids:
-        link1, link2 = gene_to_page.get(gene, (None, None))
-        badges = ""
-        if link1:
-            badges += (
-                '<a href="%s" target="_blank" class="gene-chip-badge" '
-                'title="View alignment">L1</a>' % link1
-            )
-        if link2:
-            badges += (
-                '<a href="%s" target="_blank" class="gene-chip-badge" '
-                'title="View alignment">L2</a>' % link2
-            )
-        chips.append(
-            '<span class="gene-chip">%s%s</span>'
-            % (html.escape(gene), (" " + badges) if badges else "")
-        )
-    return '<div class="gene-chip-list">%s</div>' % "".join(chips)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers (GMT / GSEA results / enrichment table)
-# ---------------------------------------------------------------------------
-
-def _gmt_term_names(gmt_path: str | None) -> dict[str, str]:
-    if not gmt_path or not os.path.isfile(gmt_path):
-        return {}
-    names: dict[str, str] = {}
-    with open(gmt_path) as fh:
-        for line in fh:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) >= 2 and fields[0] and fields[1]:
-                names[fields[0]] = fields[1]
-    return names
-
-
-def _gmt_gene_sets(gmt_path: str | None) -> dict[str, list[str]]:
-    """Return term_id -> full list of member gene IDs, read from a GMT file."""
-    if not gmt_path or not os.path.isfile(gmt_path):
-        return {}
-    sets: dict[str, list[str]] = {}
-    with open(gmt_path) as fh:
-        for line in fh:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) >= 3 and fields[0]:
-                sets[fields[0]] = [g for g in fields[2:] if g]
-    return sets
-
-
-def _find_gmt_in_dir(directory: str) -> str | None:
-    if not os.path.isdir(directory):
-        return None
-    for fname in os.listdir(directory):
-        if fname.endswith(".gmt"):
-            return os.path.join(directory, fname)
-    return None
-
-
-def _resolve_term_names(
-    results_dir: str,
-    obo_path: str | None,
-    gmt_path: str | None,
-) -> dict[str, str]:
-    effective_gmt = gmt_path or _find_gmt_in_dir(results_dir)
-    gmt_names     = _gmt_term_names(effective_gmt)
-    if effective_gmt and not gmt_names:
-        logger.warning("GMT at '%s' had no parseable term names.", effective_gmt)
-    elif not effective_gmt:
-        logger.warning("No GMT file found; term names will show as GO IDs.")
-    else:
-        logger.info("Loaded %d term names from GMT.", len(gmt_names))
-    obo_names: dict[str, str] = {}
-    if obo_path and os.path.isfile(obo_path):
-        obo_names = _parse_obo_names(obo_path)
-        logger.info("Loaded %d GO term names from OBO.", len(obo_names))
-    return {**gmt_names, **obo_names}
-
-
-def _normalise_series(scores: pd.Series, metric: str) -> pd.Series:
-    if metric == "identity":
-        return scores
-    elif metric == "zscore":
-        return (scores - scores.mean()) / scores.std()
-    elif metric == "rank":
-        return scores.rank(ascending=True) / len(scores)
-    return scores
-
-
-def _per_term_scores(
-    gmt_path: str,
-    tables_dir1: str,
-    tables_dir2: str | None,
-    term_ids: list[str],
-    metric: str = "identity",
-) -> pd.DataFrame:
-    """Compute mean metric scores per GO term.
-
-    Single-list mode (tables_dir2=None) → "Mean score" column.
-    Two-list mode → "List 1 score", "List 2 score", "Score diff".
-    """
-    def _load_anchor2mean(tables_dir: str) -> dict[str, float]:
-        path = os.path.join(tables_dir, "anchor2mean.tsv")
-        if not os.path.isfile(path):
-            return {}
-        df = pd.read_csv(path, sep="\t", header=None,
-                         names=["gene_id", "score"],
-                         dtype={"gene_id": str})
-        df["score"] = pd.to_numeric(df["score"], errors="coerce")
-        df = df.dropna(subset=["score"]).drop_duplicates("gene_id")
-        return dict(_normalise_series(df.set_index("gene_id")["score"], metric))
-
-    def _load_via_group_mapping(tables_dir_scores: str,
-                                tables_dir_mapping: str) -> dict[str, float]:
-        g2m_path = os.path.join(tables_dir_scores,  "group2mean.tsv")
-        g2a_path = os.path.join(tables_dir_mapping, "group2anchor.tsv")
-        if not os.path.isfile(g2m_path) or not os.path.isfile(g2a_path):
-            return {}
-        g2m = pd.read_csv(g2m_path, sep="\t", header=None,
-                          names=["group_id", "score"],
-                          dtype={"group_id": str})
-        g2m["score"] = pd.to_numeric(g2m["score"], errors="coerce")
-        g2m = (g2m.dropna(subset=["score"])
-                  .drop_duplicates("group_id")
-                  .set_index("group_id")["score"])
-        g2m = _normalise_series(g2m, metric)
-
-        g2a = pd.read_csv(g2a_path, sep="\t", header=None,
-                          names=["group_id", "gene_id"],
-                          dtype={"group_id": str, "gene_id": str})
-        g2a = (g2a.dropna()
-                  .drop_duplicates("group_id")
-                  .set_index("group_id")["gene_id"])
-
-        merged = (g2m.rename("score")
-                     .reset_index()
-                     .merge(g2a.reset_index(), on="group_id", how="inner")
-                     .dropna(subset=["gene_id", "score"]))
-        return dict(zip(merged["gene_id"], merged["score"]))
-
-    scores1 = _load_anchor2mean(tables_dir1)
-    if tables_dir2 is not None:
-        scores2 = _load_anchor2mean(tables_dir2)
-        if not scores2:
-            scores2 = _load_via_group_mapping(tables_dir2, tables_dir1)
-    else:
-        scores2 = None
-
-    if not scores1:
-        logger.warning("No anchor scores loaded from %s.", tables_dir1)
-        return pd.DataFrame()
-
-    term_id_set = set(term_ids)
-    gmt: dict[str, set[str]] = {}
-    with open(gmt_path) as fh:
-        for line in fh:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) >= 3 and fields[0] in term_id_set:
-                gmt[fields[0]] = set(fields[2:])
-
-    rows = []
-    for tid in term_ids:
-        genes = gmt.get(tid, set())
-        s1    = [scores1[g] for g in genes if g in scores1]
-        mean1 = round(sum(s1) / len(s1), 4) if s1 else None
-        if scores2 is None:
-            rows.append({"Term": tid, "Mean score": mean1})
-        else:
-            s2    = [scores2[g] for g in genes if g in scores2]
-            mean2 = round(sum(s2) / len(s2), 4) if s2 else None
-            diff  = (round(mean1 - mean2, 4)
-                     if mean1 is not None and mean2 is not None else None)
-            rows.append({"Term": tid,
-                         "List 1 score": mean1,
-                         "List 2 score": mean2,
-                         "Score diff":   diff})
-    return pd.DataFrame(rows).set_index("Term")
-
-
-def _fetch(url: str) -> str:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0 (compatible; ENHYDRA)"}
-    )
-    with urllib.request.urlopen(req, context=ctx) as r:
-        return r.read().decode("utf-8", errors="replace")
-
-
-def _fetch_cached(url: str, cache_dir: str | None, filename: str) -> str:
-    if cache_dir:
-        local_path = os.path.join(cache_dir, filename)
-        if os.path.isfile(local_path):
-            with open(local_path, encoding="utf-8") as fh:
-                return fh.read()
-    content = _fetch(url)
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-        with open(local_path, "w", encoding="utf-8") as fh:
-            fh.write(content)
-    return content
-
-
-def _img_to_base64(img_path: str) -> str:
-    with open(img_path, "rb") as fh:
-        data = base64.b64encode(fh.read()).decode("utf-8")
-    return "data:image/png;base64,%s" % data
-
-
-def _load_gsea_results(results_dir: str) -> pd.DataFrame | None:
-    path = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
-    if not os.path.isfile(path):
-        logger.warning("GSEA results not found: %s", path)
-        return None
-    df = pd.read_csv(path)
-    if "Tag %" in df.columns:
-        def _tag(v):
-            try:
-                v = str(v).strip()
-                if "/" in v:
-                    a, b = v.split("/")
-                    return round(float(a) / float(b), 4)
-                return round(float(v), 4)
-            except Exception:
-                return None
-        df["Tag %"] = df["Tag %"].apply(_tag)
-    if "Gene %" in df.columns:
-        def _gene(v):
-            try:
-                return round(float(str(v).strip().rstrip("%")) / 100.0, 4)
-            except Exception:
-                return None
-        df["Gene %"] = df["Gene %"].apply(_gene)
-    df.to_csv(os.path.join(results_dir, "gsea_results_processed.tsv"),
-              sep="\t", index=False)
-    return df
-
-
-def _build_enrichment_plot_index(results_dir: str, report_dir: str) -> dict[str, str]:
-    """Build a mapping of GO ID -> image path for per-gene-set enrichment plots.
-
-    Records a path relative to the report's own directory rather than
-    base64-embedding every PNG, so the browser loads each plot from disk on
-    demand and the HTML stays small even with hundreds of significant sets.
-    """
-    prerank_dir = os.path.join(results_dir, "prerank")
-    if not os.path.isdir(prerank_dir):
-        return {}
-    index = {}
-    for filename in os.listdir(prerank_dir):
-        if not filename.endswith(".png"):
-            continue
-        go_id    = filename.replace(".png", "").replace("_", ":", 1)
-        abs_path = os.path.abspath(os.path.join(prerank_dir, filename))
-        rel_path = os.path.relpath(abs_path, start=report_dir)
-        index[go_id] = rel_path.replace(os.sep, "/")
+    n_copied = 0
+    for stage_name in _FORK_SEEDABLE_STAGE_DIRS:
+        src = os.path.join(fork_from_listdir, stage_name)
+        dst = os.path.join(dest_listdir, stage_name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+            n_copied += 1
     logger.info(
-        "Indexed %d enrichment plot(s) as on-disk links (not embedded).",
-        len(index),
-    )
-    return index
-
-
-def _augment_with_per_term_scores(
-    df: pd.DataFrame,
-    gmt_path: str | None,
-    tables_dir1: str | None,
-    tables_dir2: str | None,
-    metric: str,
-) -> pd.DataFrame:
-    if not (gmt_path and tables_dir1):
-        return df
-    if not os.path.isfile(gmt_path):
-        return df
-    try:
-        per_term = _per_term_scores(
-            gmt_path=gmt_path,
-            tables_dir1=tables_dir1,
-            tables_dir2=tables_dir2,
-            term_ids=df["Term"].tolist(),
-            metric=metric,
-        )
-        if per_term.empty:
-            return df
-        df = df.set_index("Term").join(per_term).reset_index()
-    except Exception:
-        import traceback
-        logger.warning("Could not compute per-term scores:\n%s",
-                       traceback.format_exc())
-    return df
-
-
-_LEAD_GENES_COL_ALIASES = ("lead_genes", "lead genes", "leading_edge_genes")
-
-
-def _find_lead_genes_col(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        if c.strip().lower() in _LEAD_GENES_COL_ALIASES:
-            return c
-    return None
-
-
-# ---------------------------------------------------------------------------
-# GO term redundancy clustering
-# ---------------------------------------------------------------------------
-#
-# Post-hoc redundancy reduction: GSEA itself is run unchanged against the
-# full GMT (no pipeline/CLI change), and clustering is applied purely as a
-# display-layer step over the (typically small) set of already-significant
-# terms in a rendered results table. See the "Redundant with" column and
-# "Show non-redundant only" toggle in _results_table_html()/_TEMPLATE.
-
-def _overlap_coefficient(a: set[str], b: set[str]) -> float:
-    """Overlap coefficient |A \u2229 B| / min(|A|, |B|).
-
-    Unlike Jaccard similarity (|A \u2229 B| / |A \u222a B|), this correctly
-    scores a small term fully contained within a much larger one (e.g. a
-    specific GO child term nested inside a broad parent term) as maximally
-    redundant (1.0) regardless of the size difference between the two —
-    exactly the containment relationship that makes GO terms redundant in
-    practice. Jaccard would score the same pair near 0 whenever the larger
-    set dwarfs the smaller one, systematically under-flagging this case.
-
-    Returns 0.0 if either set is empty (rather than raising a
-    division-by-zero error), so a term with no resolvable gene-set
-    membership simply never clusters with anything instead of crashing
-    the whole table build.
-    """
-    if not a or not b:
-        return 0.0
-    return len(a & b) / min(len(a), len(b))
-
-
-def _cluster_redundant_terms(
-    df: pd.DataFrame,
-    gene_sets: dict[str, list[str]],
-    fdr_threshold: float,
-    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
-) -> dict[str, dict]:
-    """Greedily cluster significant, redundant gene sets by member overlap.
-
-    Only terms significant at fdr_threshold are considered. This keeps the
-    all-pairs overlap computation cheap — a full GO:BP GMT can have
-    thousands of terms, but after FDR filtering there are typically tens
-    to a few hundred, where an O(k^2) comparison is trivial — and matches
-    the intent of this feature: reducing redundancy in the *actionable*
-    result set, not in every term that merely happened to be tested.
-
-    Similarity is the overlap coefficient (see _overlap_coefficient()) on
-    each term's full GMT gene-set membership, not its leading-edge genes:
-    full membership is a fixed, always-available property of the GMT and
-    matches the intuitive notion of "these two terms are basically the
-    same gene set", whereas leading-edge overlap would only be defined for
-    already-significant terms (true here anyway, since only significant
-    terms are considered) but would measure a subtly different thing —
-    "these two terms are significant because of the same specific genes
-    in this particular ranking" — which is a legitimate alternative
-    definition of redundancy but not the one implemented here.
-
-    Terms are processed most-significant-first (ascending FDR). Each term
-    is greedily assigned to whichever already-chosen representative it has
-    the highest overlap coefficient with, provided that value meets or
-    exceeds overlap_threshold; otherwise the term becomes a new
-    representative itself. Processing in FDR order guarantees the most
-    significant member of any redundant cluster is always the one
-    reported as its representative — the intuitive choice for a reader
-    scanning down a table already sorted by significance.
-
-    A term absent from gene_sets (e.g. a GMT/results mismatch) is treated
-    as having an empty gene set: _overlap_coefficient() returns 0.0
-    against every other term, so it always becomes its own representative
-    with no satellites — a graceful degradation rather than an error.
-
-    Args:
-        df:                GSEA results with a 'Term' column and a
-                           *numeric* 'FDR q-val' column — this must be
-                           called before any stringifying/formatting pass
-                           over 'FDR q-val' (see _results_table_html(),
-                           which calls this before its own display
-                           formatting loop).
-        gene_sets:         {term_id: [gene_id, ...]}, the full GMT
-                           gene-set membership (as returned by
-                           _gmt_gene_sets()).
-        fdr_threshold:     Significance cutoff determining which terms are
-                           considered for clustering at all.
-        overlap_threshold: Overlap coefficient at or above which two terms
-                           are considered redundant.
-
-    Returns:
-        Dict keyed by term_id, present only for terms significant at
-        fdr_threshold. Each value is:
-            {"role": "representative" | "satellite",
-             "representative": the term_id of this term's cluster
-                               representative (equal to the key itself
-                               when role is "representative"),
-             "satellites": [term_id, ...] folded into this term — only
-                           ever populated when role is "representative";
-                           empty for satellite entries and for
-                           representatives with no cluster-mates.}
-    """
-    fdr_numeric = pd.to_numeric(df["FDR q-val"], errors="coerce")
-    sig_df = df.loc[fdr_numeric < fdr_threshold].copy()
-    sig_df["_fdr_numeric"] = fdr_numeric.loc[sig_df.index]
-    sig_terms = sig_df.sort_values("_fdr_numeric")["Term"].tolist()
-
-    term_sets = {t: set(gene_sets.get(t, [])) for t in sig_terms}
-    representatives: list[str] = []
-    result: dict[str, dict] = {}
-
-    for term in sig_terms:
-        best_rep, best_score = None, 0.0
-        for rep in representatives:
-            score = _overlap_coefficient(term_sets[term], term_sets[rep])
-            if score > best_score:
-                best_rep, best_score = rep, score
-        if best_rep is not None and best_score >= overlap_threshold:
-            result[term] = {
-                "role": "satellite", "representative": best_rep, "satellites": [],
-            }
-            result[best_rep]["satellites"].append(term)
-        else:
-            representatives.append(term)
-            result[term] = {
-                "role": "representative", "representative": term, "satellites": [],
-            }
-
-    return result
-
-
-def _results_table_html(
-    df: pd.DataFrame,
-    obo_names: dict[str, str],
-    plot_index: dict[str, str],
-    fdr_threshold: float = 0.25,
-    metric: str | None = None,
-    col1_label: str = "List 1",
-    col2_label: str = "List 2",
-    gene_sets: dict[str, list[str]] | None = None,
-    gene_to_page: dict[str, tuple[str | None, str | None]] | None = None,
-    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
-    gene_list_fdr_threshold: float | None = None,
-) -> tuple[str, list[int], dict[str, str], dict[str, str],
-          dict[str, str], dict[str, str], dict[str, str]]:
-    """Build the enrichment results DataTable HTML for one metric.
-
-    Returns a 7-tuple:
-        (table_html, numeric_col_indices,
-         full_gene_sets_text, leading_edge_text,
-         full_gene_sets_html, leading_edge_html,
-         redundant_clusters_html)
-
-    The *_text dicts are unchanged plain newline-joined gene lists, used
-    for the Excel export (tableToXLSX() splits these on newline — turning
-    them into HTML would corrupt the exported cells). The *_html dicts are
-    a parallel rendering of the same gene lists as clickable chips (via
-    _gene_chip_list_html()), used only for the on-screen modal display.
-    redundant_clusters_html has no plain-text counterpart: the "Redundant
-    with" column is not given special handling in the Excel export, so
-    only the HTML-modal rendering is needed.
-
-    Only gene sets with FDR < gene_list_fdr_threshold (defaulting to
-    fdr_threshold itself if not given) have their full/leading-edge gene
-    lists populated in these dicts at all — see the gene_list_fdr_threshold
-    arg below. A gene set that doesn't qualify still gets a "Full gene
-    set"/"Leading edge" cell showing a plain gene count, just with nothing
-    added to these dicts (and therefore nothing embedded in the report's
-    JSON payload for it). This matters for large, genome-scale GMTs: with
-    tens of thousands of tested gene sets, embedding every one's full
-    membership (plus a second, HTML-chip-rendered copy of the same list)
-    previously caused multi-GB browser memory usage when the report was
-    opened.
-
-    Args:
-        overlap_threshold: Passed through to _cluster_redundant_terms()
-                           for computing the "Redundant with" column. See
-                           that function's own docstring for the full
-                           rationale.
-        gene_list_fdr_threshold: FDR threshold below which a gene set's
-                           full gene list / leading-edge gene list is
-                           embedded (as a clickable "View" link) rather
-                           than shown as a plain count. None (the
-                           default) means "use fdr_threshold" — i.e. only
-                           gene sets significant at the table's own
-                           significance cutoff get embedded gene lists.
-                           Set higher than fdr_threshold (e.g. 1.0) to
-                           embed gene lists for virtually all tested gene
-                           sets, restoring the original, unrestricted
-                           behaviour (can produce very large reports for
-                           genome-scale GMTs).
-
-    Note on sorting: the "Full gene set" and "Leading edge" cells
-    sometimes wrap their visible count in an <a> link (when that term
-    qualifies for embedding). DataTables' numeric sort type parses a
-    cell's own rendered content, so an anchor tag around the number
-    otherwise breaks numeric sorting specifically for whichever rows
-    happen to be clickable. Every cell in these two columns therefore
-    carries an explicit data-sort="<count>" attribute (a built-in
-    DataTables feature — see "Orthogonal data" in the DataTables manual)
-    so sorting is driven by that attribute rather than the cell's own
-    markup, regardless of whether it's wrapped in a link.
-    """
-    df = df.copy()
-    if "Term" not in df.columns:
-        logger.warning("'Term' column not found in GSEA results.")
-        return "<p>No results to display.</p>", [], {}, {}, {}, {}, {}
-
-    df["GO Term"] = df["Term"].map(obo_names).fillna(df["Term"])
-
-    # Computed here, before the stringification loop just below, while
-    # 'FDR q-val' is still numeric — see _cluster_redundant_terms()'s own
-    # docstring note on this ordering requirement.
-    cluster_info: dict[str, dict] = {}
-    if gene_sets:
-        cluster_info = _cluster_redundant_terms(
-            df, gene_sets, fdr_threshold, overlap_threshold,
-        )
-
-    # Also computed here, before stringification, for the same reason:
-    # the embedding-gate check below (in _full_set_cell/_leadedge_cell)
-    # needs a numeric FDR comparison, not the "%.4f"-formatted string the
-    # stringification loop below produces.
-    effective_gene_list_threshold = (
-        gene_list_fdr_threshold if gene_list_fdr_threshold is not None
-        else fdr_threshold
-    )
-    fdr_numeric_by_term: dict[str, float] = dict(
-        zip(df["Term"], pd.to_numeric(df["FDR q-val"], errors="coerce"))
+        "%sSeeded %d stage director%s from fork source: %s",
+        prefix, n_copied, "y" if n_copied == 1 else "ies", fork_from_listdir,
     )
 
-    for col in ["ES", "NES", "NOM p-val", "FDR q-val", "FWER p-val",
-                "Tag %", "Gene %", "Mean score",
-                "List 1 score", "List 2 score", "Score diff"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").apply(
-                lambda x: "%.4f" % x if pd.notna(x) else ""
-            )
 
-    df["Significant"] = df["FDR q-val"].apply(
-        lambda x: "✓" if x != "" and float(x) < fdr_threshold else ""
-    )
+def _normalise_anchor2mean(raw_path: str, metric: str, tables_dir: str) -> str:
+    """Normalise anchor2mean.tsv scores for a given metric; return scored path."""
+    logger = logging.getLogger(__name__)
+    if metric == "identity":
+        return raw_path
 
-    gene_to_page = gene_to_page or {}
-    full_sets_js: dict[str, str] = {}
-    leadedge_js:  dict[str, str] = {}
-    full_sets_html_js: dict[str, str] = {}
-    leadedge_html_js:  dict[str, str] = {}
-    redundant_html_js: dict[str, str] = {}
+    import pandas as _pd
+    df = _pd.read_csv(raw_path, sep="\t", header=None, names=["gene_id", "score"])
+    df["score"] = _pd.to_numeric(df["score"], errors="coerce")
+    df = df.dropna(subset=["score"])
+    series = df.set_index("gene_id")["score"]
 
-    if gene_sets:
-        def _full_set_cell(term_id):
-            genes = gene_sets.get(term_id)
-            if not genes:
-                return ""
-            fdr = fdr_numeric_by_term.get(term_id)
-            if fdr is not None and fdr < effective_gene_list_threshold:
-                full_sets_js[term_id] = "\n".join(genes)
-                full_sets_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
-            # Bare count only (not "View (N)" / "N genes") so the column
-            # sorts numerically in DataTables — clickability is signalled
-            # separately via membership in full_sets_js, not by the text
-            # of this cell. See the row-rendering loop below, which also
-            # attaches a data-sort attribute so DataTables sorts on this
-            # raw count regardless of whether the cell ends up wrapped in
-            # a link.
-            return len(genes)
-        df["Full gene set"] = df["Term"].apply(_full_set_cell)
-
-    lead_col = _find_lead_genes_col(df)
-    if lead_col:
-        def _leadedge_cell(row):
-            raw = row[lead_col]
-            if pd.isna(raw) or not str(raw).strip():
-                return ""
-            genes = [g.strip() for g in str(raw).split(";") if g.strip()]
-            if not genes:
-                return ""
-            term_id = row["Term"]
-            fdr = fdr_numeric_by_term.get(term_id)
-            if fdr is not None and fdr < effective_gene_list_threshold:
-                leadedge_js[term_id] = "\n".join(genes)
-                leadedge_html_js[term_id] = _gene_chip_list_html(genes, gene_to_page)
-            # Bare count only — see _full_set_cell()'s comment above.
-            return len(genes)
-        df["Leading edge"] = df.apply(_leadedge_cell, axis=1)
-
-    if cluster_info:
-        def _redundant_cell(term_id):
-            info = cluster_info.get(term_id)
-            if info is None:
-                # Not significant at fdr_threshold — redundancy was never
-                # evaluated for this term.
-                return ""
-            if info["role"] == "satellite":
-                return "\u2192 %s" % html.escape(info["representative"])
-            satellites = info["satellites"]
-            if not satellites:
-                return "\u2014"
-            items = "".join(
-                "<li>%s%s</li>" % (
-                    html.escape(s),
-                    (" \u2014 %s" % html.escape(obo_names[s]))
-                    if obo_names.get(s) else "",
-                )
-                for s in satellites
-            )
-            redundant_html_js[term_id] = "<ul>%s</ul>" % items
-            return "View (%d)" % len(satellites)
-        df["Redundant with"] = df["Term"].apply(_redundant_cell)
-
-    diff_label = "%s \u2212 %s" % (col1_label, col2_label)
-    col_defs = [
-        ("Term",         "GO ID",
-         "Gene Ontology term identifier."),
-        ("GO Term",      "Term name",
-         "Human-readable name of the GO term."),
-        ("Mean score",   "Mean score",
-         "Mean metric score for genes in this gene set."),
-        ("List 1 score", "%s score" % col1_label,
-         "Mean metric score for genes in this set in %s." % col1_label),
-        ("List 2 score", "%s score" % col2_label,
-         "Mean metric score for genes in this set in %s." % col2_label),
-        ("Score diff",   diff_label,
-         "Difference in mean score (%s \u2212 %s)." % (col1_label, col2_label)),
-        ("NES",          "NES",
-         "Normalised Enrichment Score."),
-        ("NOM p-val",    "p-value",
-         "Nominal p-value from permutation testing."),
-        ("FDR q-val",    "FDR",
-         "False Discovery Rate q-value. Significant below %.2f." % fdr_threshold),
-        ("Tag %",        "Tag %",
-         "Fraction of gene set genes in the leading edge (0-1)."),
-        ("Gene %",       "Gene %",
-         "Fraction of all ranked genes in the leading edge (0-1)."),
-        ("Full gene set", "Full gene set",
-         "Number of genes annotated to this gene set. Click the number to "
-         "view the full list as text (only clickable for gene sets with "
-         "FDR < %.2f, to limit report size \u2014 other counts are plain "
-         "text)." % effective_gene_list_threshold),
-        ("Leading edge", "Leading edge",
-         "Number of genes from this set found in the leading edge of the "
-         "ranked list (i.e. driving the enrichment score). Click the "
-         "number to view the full list as text (only clickable for gene "
-         "sets with FDR < %.2f, to limit report size \u2014 other counts "
-         "are plain text)." % effective_gene_list_threshold),
-        ("Redundant with", "Redundant with",
-         "Among significant gene sets (FDR < %.2f), this gene set shares "
-         "an overlap coefficient of \u2265 %.2f with the listed gene "
-         "set(s) \u2014 click \u201cView\u201d to see them. \u201c\u2014\u201d "
-         "means no redundant gene set was found among the significant "
-         "results; \u201c\u2192 GO ID\u201d means this gene set was folded "
-         "into that (more significant) gene set instead; blank means this "
-         "gene set was not significant, so redundancy was not evaluated "
-         "for it." % (fdr_threshold, overlap_threshold)),
-        ("Significant",  "Sig.",
-         "Significant at FDR < %.2f." % fdr_threshold),
-    ]
-    col_defs = [(s, d, t) for s, d, t in col_defs
-                if s in df.columns or s in ("GO Term", "Significant")]
-
-    table_df      = df[[s for s, _, _ in col_defs]].copy()
-    display_names = [d for _, d, _ in col_defs]
-    tooltips      = [t for _, _, t in col_defs]
-    table_df.columns = display_names
-
-    numeric_names       = {"NES", "p-value", "FDR", "Tag %", "Gene %",
-                           "Mean score", diff_label,
-                           "%s score" % col1_label, "%s score" % col2_label,
-                           "Full gene set", "Leading edge"}
-    numeric_col_indices = [i for i, n in enumerate(display_names)
-                           if n in numeric_names]
-
-    header_cells = "".join(
-        '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
-        % (name, tip)
-        for name, tip in zip(display_names, tooltips)
-    )
-    filter_cells = "<th></th>" * len(display_names)
-    table_id     = ("results-table-%s" % metric) if metric else "results-table"
-    metric_attr  = (' data-metric="%s"' % metric) if metric else ""
-
-    rows = ""
-    for _, row in table_df.iterrows():
-        sig_class = ' class="sig-row"' if row.get("Sig.") == "✓" else ""
-        go_id     = row.get("GO ID", "")
-        cells     = ""
-        for col, val in row.items():
-            # Full gene set / Leading edge cells are sometimes wrapped in
-            # an <a> link (when that term qualifies for embedding — see
-            # _full_set_cell()/_leadedge_cell() above). DataTables' numeric
-            # sort type parses a cell's own displayed content directly, so
-            # an anchor tag around the count breaks numeric sorting for
-            # exactly the (often most interesting, most significant) rows
-            # that happen to be clickable. A `data-sort` attribute on the
-            # <td> tells DataTables to sort on that explicit value instead
-            # of the cell's displayed HTML, regardless of markup inside it
-            # — this is a built-in DataTables feature requiring no extra
-            # JS (see "Orthogonal data" / HTML5 data-* attributes in the
-            # DataTables manual). Applied uniformly to both the clickable
-            # and plain-text cases for these two columns, so sorting is
-            # correct and consistent either way.
-            sort_attr = ""
-            if col in ("Full gene set", "Leading edge") and val != "":
-                sort_attr = ' data-sort="%s"' % val
-
-            if col == "GO ID" and go_id in plot_index:
-                cells += (
-                    '<td><a href="#" class="go-link" data-goid="%s"%s>%s</a></td>'
-                    % (go_id, metric_attr, val)
-                )
-            elif col == "Full gene set" and go_id in full_sets_js:
-                cells += (
-                    '<td%s><a href="#" class="geneset-link" data-goid="%s">%s</a></td>'
-                    % (sort_attr, go_id, val)
-                )
-            elif col == "Leading edge" and go_id in leadedge_js:
-                cells += (
-                    '<td%s><a href="#" class="leadedge-link" data-goid="%s"%s>%s</a></td>'
-                    % (sort_attr, go_id, metric_attr, val)
-                )
-            elif col == "Redundant with" and isinstance(val, str) and val.startswith("View ("):
-                cells += (
-                    '<td><a href="#" class="redundant-link" data-goid="%s">%s</a></td>'
-                    % (go_id, val)
-                )
-            elif col in ("Full gene set", "Leading edge"):
-                cells += "<td%s>%s</td>" % (sort_attr, str(val))
-            else:
-                cells += "<td>%s</td>" % str(val)
-        rows += "<tr%s>%s</tr>\n" % (sig_class, cells)
-
-    html_content = (
-        '<table id="%s" class="display compact" style="width:100%%">'
-        '<thead><tr>%s</tr><tr class="filter-row">%s</tr></thead>'
-        "<tbody>%s</tbody></table>"
-    ) % (table_id, header_cells, filter_cells, rows)
-
-    return (html_content, numeric_col_indices,
-            full_sets_js, leadedge_js,
-            full_sets_html_js, leadedge_html_js,
-            redundant_html_js)
-
-
-def build_significance_agreement_table_html(
-    column_dfs: dict[str, pd.DataFrame],
-    column_labels: dict[str, str],
-    obo_names: dict[str, str],
-    fdr_threshold: float,
-    enrichment_plots_map: dict[str, dict[str, str]] | None = None,
-    table_id: str = "results-table-consensus",
-    direction_labels: dict[int, str] | None = None,
-) -> tuple[str, list[int] | None]:
-    """Build a cross-column significance agreement table.
-
-    Originally written specifically for this module's own Cross-metric
-    consensus tab (comparing identity/zscore/rank rankings within one
-    run), this is now a general-purpose utility: a "column" is any axis
-    of comparison whose GSEA output can be expressed as a
-    {Term, NES, FDR q-val} DataFrame. That covers both the original use
-    (columns = ranking metrics within one run) and a new one
-    (columns = different runs, for the same metric — see
-    compare_runs.py's cross-run comparison report), without either caller
-    needing its own copy of this logic.
-
-    A gene set qualifies for inclusion if it is significant
-    (FDR < fdr_threshold) in a *majority* of the columns given — for 3
-    columns this means 2 of 3, not requiring unanimous agreement. This
-    directly matches the intent of a consensus view: surfacing results
-    that hold up under more than one arbitrary choice of comparison axis,
-    without demanding unrealistic universal agreement.
-
-    Beyond the raw significance count, each qualifying row's direction is
-    also checked: among the columns where it is significant, do they
-    agree on the *sign* of NES (positive = more conserved, negative =
-    faster evolving)? A gene set significant in two columns with
-    opposite-signed NES is not a genuine consensus finding — it is
-    contradictory — so this is surfaced explicitly as 'Mixed direction'
-    rather than silently lumped in with genuine agreement.
-
-    Deliberately excludes the "Full gene set" / "Leading edge" columns
-    present in the per-metric enrichment tables: this view is meant to be
-    a compact cross-check, and that level of per-gene detail remains
-    available in whichever original per-column report produced each
-    column's own data.
-
-    Args:
-        column_dfs:  {column_key: DataFrame} with at least 'Term', 'NES',
-                    and 'FDR q-val' columns (numeric dtypes, not yet
-                    stringified for display). Only columns with usable
-                    data are expected to be included; callers are
-                    responsible for that filtering.
-        column_labels: {column_key: display_label} — e.g. metric display
-                    names (METRIC_LABELS) or run display names.
-        obo_names:   {term_id: term_name}, for display alongside each GO ID.
-        fdr_threshold: Significance cutoff applied per column.
-        enrichment_plots_map: {column_key: {go_id: plot_path}}, used to make
-                    a qualifying gene set's per-column NES cell clickable
-                    (emits a '.go-link' anchor with data-goid and
-                    data-metric="<column_key>" attributes; the consuming
-                    page's own JS is responsible for wiring that click to
-                    an actual plot viewer — see this module's own
-                    _TEMPLATE JS for one such wiring, keyed by metric, and
-                    compare_runs.py for a second, independent wiring keyed
-                    by (table_id, run_name)). None or an empty dict
-                    disables clickable NES cells entirely (plain text
-                    values only).
-        table_id:    HTML id for the rendered <table>, so more than one
-                    such table can appear on the same page without id
-                    collisions (e.g. one table per metric in
-                    compare_runs.py's Significance agreement tab).
-        direction_labels: Optional {1: label_for_positive_sign,
-                    -1: label_for_negative_sign} overriding the default
-                    'Conserved' / 'Faster-evolving' wording, which is
-                    only correct when NES sign means "more/less conserved
-                    than the genome-wide average" (single-list mode).
-                    Two-list/differential callers must override this — a
-                    positive NES there means genes are more conserved in
-                    one specific list relative to the other (see
-                    differential.compute_differential()'s own docstring),
-                    not conserved relative to a shared baseline, so both
-                    label values need to name a *list*, not describe an
-                    absolute rate of evolution — e.g.
-                    {1: "Faster-evolving in <list2>",
-                     -1: "Faster-evolving in <list1>"}. Values are
-                    inserted as-is (not escaped by this function), the
-                    same convention already used for column_labels above.
-                    Defaults to {1: "Conserved", -1: "Faster-evolving"}
-                    if not given.
-
-    Returns:
-        Tuple of (html, numeric_col_indices). If no gene set reaches
-        majority significance, html is an explanatory <p> message and
-        numeric_col_indices is None — callers should treat a None second
-        element as "do not register this table with the DataTables JS",
-        since no <table> element is present in that case.
-
-    Note on sorting: every per-column NES and FDR cell below carries an
-    explicit data-sort attribute, independent of that cell's own visible
-    markup (which may wrap the NES value in a '.go-link' anchor, or the
-    FDR value in <strong>). DataTables' numeric sort type parses a cell's
-    rendered HTML content directly, so without this attribute, sorting
-    silently breaks for exactly the rows most likely to be interesting
-    (plot-linked and/or significant) — the same class of bug already
-    fixed for the "Full gene set"/"Leading edge" columns in
-    _results_table_html().
-    """
-    columns   = list(column_dfs.keys())
-    n_columns = len(columns)
-    majority  = n_columns // 2 + 1
-    enrichment_plots_map = enrichment_plots_map or {}
-    _direction_labels = direction_labels or {1: "Conserved", -1: "Faster-evolving"}
-
-    term_data: dict[str, dict[str, tuple[float, float]]] = {}
-    for col, df in column_dfs.items():
-        for _, row in df.iterrows():
-            term = row.get("Term")
-            nes, fdr = row.get("NES"), row.get("FDR q-val")
-            if term is None or pd.isna(nes) or pd.isna(fdr):
-                continue
-            term_data.setdefault(term, {})[col] = (float(nes), float(fdr))
-
-    rows_data: list[tuple[str, dict, int, str]] = []
-    for term, per_col in term_data.items():
-        sig_cols = [
-            c for c in columns
-            if c in per_col and per_col[c][1] < fdr_threshold
-        ]
-        n_sig = len(sig_cols)
-        if n_sig < majority:
-            continue
-        signs = {(1 if per_col[c][0] > 0 else -1) for c in sig_cols}
-        if len(signs) == 1:
-            direction = _direction_labels[next(iter(signs))]
-        else:
-            direction = "Mixed direction"
-        rows_data.append((term, per_col, n_sig, direction))
-
-    if not rows_data:
-        return (
-            "<p>No gene sets reached majority significance "
-            "(significant in \u2265 %d of %d columns at "
-            "FDR &lt; %.2f).</p>"
-            % (majority, n_columns, fdr_threshold)
-        ), None
-
-    # Full agreement first, then by term ID for a stable secondary order.
-    rows_data.sort(key=lambda r: (-r[2], r[0]))
-
-    headers  = ["GO ID", "Term name"]
-    tooltips = [
-        "Gene Ontology term identifier.",
-        "Human-readable name of the GO term.",
-    ]
-    for c in columns:
-        label = column_labels.get(c, str(c))
-        headers += ["%s NES" % label, "%s FDR" % label]
-        tooltips += [
-            "Normalised Enrichment Score for %s." % label,
-            "FDR q-value for %s (bold if significant, FDR < %.2f)."
-            % (label, fdr_threshold),
-        ]
-    headers += ["Significant in", "Direction"]
-    tooltips += [
-        "Number of columns (out of %d) in which this gene set was "
-        "significant." % n_columns,
-        "Whether the direction of enrichment (%s vs. %s) agrees across "
-        "the columns in which this gene set was significant."
-        % (_direction_labels[1], _direction_labels[-1]),
-    ]
-
-    numeric_col_indices = [
-        i for i, h in enumerate(headers)
-        if h.endswith("NES") or h.endswith("FDR")
-    ]
-
-    header_cells = "".join(
-        '<th>%s <span class="col-tip">?<span class="tip-text">%s</span></span></th>'
-        % (h, t) for h, t in zip(headers, tooltips)
-    )
-    filter_cells = "<th></th>" * len(headers)
-
-    body_rows = []
-    for term, per_col, n_sig, direction in rows_data:
-        term_name = obo_names.get(term, term)
-        row_cells = "<td>%s</td><td>%s</td>" % (
-            html.escape(term), html.escape(term_name),
-        )
-        for c in columns:
-            if c in per_col:
-                nes, fdr = per_col[c]
-                is_sig  = fdr < fdr_threshold
-                nes_str = "%.4f" % nes
-                fdr_str = "%.4f" % fdr
-                # data-sort carries the raw numeric value so DataTables
-                # sorts correctly regardless of whichever HTML wrapper (if
-                # any) the visible cell content below uses — see this
-                # function's own docstring note on sorting.
-                if enrichment_plots_map.get(c, {}).get(term):
-                    nes_cell = (
-                        '<a href="#" class="go-link" data-goid="%s" '
-                        'data-metric="%s">%s</a>' % (term, c, nes_str)
-                    )
-                else:
-                    nes_cell = nes_str
-                fdr_cell = ("<strong>%s</strong>" % fdr_str) if is_sig else fdr_str
-                row_cells += (
-                    '<td data-sort="%s">%s</td><td data-sort="%s">%s</td>'
-                    % (nes, nes_cell, fdr, fdr_cell)
-                )
-            else:
-                # '\u2014' (em dash) has no numeric value — sort it to one
-                # extreme end regardless of sort direction, below/above
-                # every real numeric cell, rather than DataTables trying
-                # (and failing) to parse it as 0 or NaN.
-                row_cells += (
-                    '<td data-sort="-Infinity">\u2014</td>'
-                    '<td data-sort="Infinity">\u2014</td>'
-                )
-        row_cells += "<td>%d / %d</td><td>%s</td>" % (n_sig, n_columns, direction)
-        row_class = ' class="sig-row"' if n_sig == n_columns else ""
-        body_rows.append("<tr%s>%s</tr>" % (row_class, row_cells))
-
-    table_html = (
-        '<table id="%s" class="display compact" style="width:100%%">'
-        '<thead><tr>%s</tr><tr class="filter-row">%s</tr></thead>'
-        "<tbody>%s</tbody></table>"
-    ) % (table_id, header_cells, filter_cells, "".join(body_rows))
-
-    return table_html, numeric_col_indices
-
-
-def _plot_section(plots_dir: str, names: list[tuple[str, str]]) -> str:
-    html_content = ""
-    for stem, caption in names:
-        svg_path = os.path.join(plots_dir, stem + ".svg")
-        png_path = os.path.join(plots_dir, stem + ".png")
-        if os.path.isfile(svg_path):
-            with open(svg_path, encoding="utf-8") as fh:
-                svg_content = fh.read()
-            html_content += (
-                '<div class="plot-block">'
-                '<p class="plot-caption">%s (hover for details)</p>'
-                '%s</div>'
-            ) % (caption, svg_content)
-        elif os.path.isfile(png_path):
-            uri = _img_to_base64(png_path)
-            html_content += (
-                '<div class="plot-block">'
-                '<p class="plot-caption">%s</p>'
-                '<img src="%s" alt="%s"/></div>'
-            ) % (caption, uri, caption)
-    return html_content
-
-
-# ---------------------------------------------------------------------------
-# Shared report builder
-# ---------------------------------------------------------------------------
-
-def _build_report_impl(
-    metric_data: dict,
-    report_path: str,
-    obo_path: str | None,
-    fdr_threshold: float,
-    mode: str,
-    gmt_path: str | None,
-    tables_dir1: str | None,
-    tables_dir2: str | None,
-    label1: str,
-    label2: str,
-    pipeline_stats_path: str | None,
-    pipeline_stats_path1: str | None,
-    pipeline_stats_path2: str | None,
-    differential_stats_path: str | None,
-    alignment_pages1: dict[str, str] | None = None,
-    alignment_pages2: dict[str, str] | None = None,
-    run_parameters_path: str | None = None,
-    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
-    gene_list_fdr_threshold: float | None = None,
-):
-    logger.info("Building HTML report (%d metric tab(s))...", len(metric_data))
-    first_results = next(iter(metric_data.values()))["results_dir"] if metric_data else ""
-    effective_gmt = gmt_path or _find_gmt_in_dir(first_results)
-    term_names    = _resolve_term_names(first_results, obo_path, effective_gmt)
-    gene_sets_all = _gmt_gene_sets(effective_gmt)
-    cache_dir = os.path.dirname(obo_path) if obo_path else None
-    jquery_js = _fetch_cached(_JQUERY_URL,         cache_dir, "jquery.min.js")
-    dt_js     = _fetch_cached(_DATATABLES_JS_URL,  cache_dir, "datatables.min.js")
-    dt_css    = _fetch_cached(_DATATABLES_CSS_URL, cache_dir, "datatables.min.css")
-    xlsx_js   = _fetch_cached(_XLSX_JS_URL,        cache_dir, "xlsx.full.min.js")
-
-    # Threshold below which a gene set's full gene list / leading-edge
-    # gene list is embedded in the report (see _results_table_html()). A
-    # single global value shared by every metric tab, since it controls
-    # report size/scope rather than anything metric-specific; defaults to
-    # fdr_threshold itself so "only significant gene sets get embedded
-    # gene lists" is the default with no config change required.
-    effective_gene_list_threshold = (
-        gene_list_fdr_threshold if gene_list_fdr_threshold is not None
-        else fdr_threshold
-    )
-
-    single_metric = len(metric_data) == 1
-    if mode == "differential":
-        title = ("ENHYDRA Differential Enrichment Report" if single_metric
-                  else "ENHYDRA Multi-Metric Differential Enrichment Report")
-        plot_names = [
-            ("identity_scatter",          "Identity comparison between lists"),
-            ("differential_distribution", "Differential conservation score distribution"),
-            ("gsea_barplot",              "Top differentially enriched gene sets (NES)"),
-        ]
+    if metric == "zscore":
+        normed = normalise_scores(series, "zscore")
     else:
-        title = ("ENHYDRA Single-List Enrichment Report" if single_metric
-                  else "ENHYDRA Multi-Metric Enrichment Report")
-        plot_names = [
-            ("identity_distribution", "Distribution of mean alignment identity"),
-            ("gsea_barplot",          "Top enriched gene sets (NES)"),
+        n      = len(series)
+        normed = series.rank(ascending=True) / n
+
+    df = df.set_index("gene_id")
+    df["score"] = normed
+    df = df.reset_index()
+    out_path = os.path.join(tables_dir, "anchor2mean_%s.tsv" % metric)
+    df.to_csv(out_path, sep="\t", index=False, header=False)
+    logger.info("Normalised anchor2mean [%s] → %s", metric, out_path)
+    return out_path
+
+
+def _gsea_weight(two_list_mode: bool, metric: str) -> float:
+    """Determine the GSEA prerank 'weight' parameter for a run mode/metric pair.
+
+    weight=0 makes GSEA's running-sum enrichment statistic purely
+    rank-based (equivalent to the classic, unweighted Kolmogorov-Smirnov
+    statistic) — genes contribute to the running sum based only on their
+    position in the ranking, ignoring the magnitude of their score.
+    weight=1 (GSEApy/GSEA's standard) instead weights each gene's
+    contribution by the magnitude of its own ranking-metric value, so
+    genes with larger scores pull the running sum more strongly.
+
+    Current policy: weight=0 only for single-list 'identity' and 'rank'
+    metrics; weight=1 for every other combination (single-list 'zscore',
+    and all three metrics in two-list/differential mode).
+
+    Args:
+        two_list_mode: Whether this is a two-list/differential run.
+        metric:        The ranking metric ('identity', 'zscore', 'rank').
+
+    Returns:
+        0.0 or 1.0.
+    """
+    if not two_list_mode and metric in ("identity", "rank"):
+        return 0.0
+    return 1.0
+
+
+def _log_summary(
+    stats: dict,
+    results_dir: str,
+    fdr_threshold: float,
+    label: str = "",
+):
+    logger = logging.getLogger(__name__)
+    prefix = ("[%s] " % label) if label else ""
+    n_tested = n_sig = 0
+    gsea_csv = os.path.join(results_dir, "gseapy.gene_set.prerank.report.csv")
+    if os.path.isfile(gsea_csv):
+        import pandas as _pd
+        df       = _pd.read_csv(gsea_csv)
+        n_tested = len(df)
+        n_sig    = int((df["FDR q-val"] < fdr_threshold).sum())
+    logger.info("")
+    logger.info("=" * 52)
+    logger.info("%sENHYDRA RUN SUMMARY", prefix)
+    logger.info("=" * 52)
+    logger.info("  Input groups:             %d", stats["n_input"])
+    logger.info("  After length filter:      %d", stats["n_length_filter"])
+    logger.info("  After group filter:       %d", stats["n_group_filter"])
+    logger.info("  Gene sets tested:         %d", n_tested)
+    logger.info("  Significant (FDR < %.2f): %d", fdr_threshold, n_sig)
+    logger.info("=" * 52)
+
+
+# ---------------------------------------------------------------------------
+# Core pipeline: filter → align → (divergence filter) → (trim) → identity → tables
+# ---------------------------------------------------------------------------
+
+def _run_single_list(
+    inputdir: str,
+    listdir: str,
+    anchor: str,
+    min_species: int,
+    min_sequences: int,
+    mafft_path: str,
+    trimal_path: str,
+    max_process: int,
+    paralog_mode: str,
+    require_anchor: bool,
+    resume: bool,
+    sd_multiplier: float = 2.0,
+    aligner: str = "mafft",
+    mafft_mode: str = "auto",
+    parameters: dict = None,
+    species: list[str] | None = None,
+    show_progress: bool = False,
+    label: str = "",
+    exclude_from_identity: set[str] | None = None,
+    trim_args: list[str] | None = None,
+    divergence_filter_sd: float | None = None,
+    require_anchor_in_tables: bool | None = None,
+) -> tuple[str, dict]:
+    logger = logging.getLogger(__name__)
+
+    def _desc(step):
+        return ("%s: %s" % (label, step)) if label else step
+
+    subset_dir           = os.path.join(listdir, "subset")
+    length_stats_dir      = os.path.join(listdir, "length_stats")
+    length_filter_dir     = os.path.join(listdir, "length_filter")
+    group_filter_dir      = os.path.join(listdir, "group_filter")
+    group_stats_dir       = os.path.join(listdir, "group_filter_stats")
+    alignment_dir         = os.path.join(listdir, "alignment")
+    stripped_dir          = os.path.join(listdir, "alignment_stripped")
+    # Divergent-sequence filter (see filtering.filter_divergent_sequences()):
+    # a scratch trimAl -sident pass, the filter's own pruned/passthrough
+    # output, the de-gapped survivors awaiting realignment, and this step's
+    # own drop-reason log. Positioned after anchor-stripping (so an
+    # injected anchor is never itself a candidate for removal here) and
+    # before column trimming (so trimming subsequently operates on the
+    # corrected, post-pruning alignment rather than one still distorted by
+    # a divergent sequence's spurious gap placement).
+    divergence_sident_dir   = os.path.join(listdir, "divergence_sident")
+    divergence_filtered_dir = os.path.join(listdir, "alignment_divergence_filtered")
+    divergence_realign_dir  = os.path.join(listdir, "divergence_realign_input")
+    divergence_stats_dir    = os.path.join(listdir, "divergence_filter_stats")
+    trimmed_dir           = os.path.join(listdir, "alignment_trimmed")
+    # Sidecar directory for trimAl's -colnumbering output, capturing which
+    # original alignment columns survive trimming. Populated only when
+    # trim_args is set (see the trim_args block below). cli.py's main()
+    # recomputes this exact same path independently — using the same
+    # listdir-based naming convention — when building alignment pages, so
+    # the two must be kept in sync if this naming ever changes.
+    trim_colnumbering_dir = os.path.join(listdir, "alignment_trimmed_colnumbering")
+    ident_dir              = os.path.join(listdir, "ident_alignment")
+    tables_dir             = os.path.join(listdir, "tables")
+
+    # These two flags answer genuinely different questions and must not be
+    # conflated: 'require_anchor' controls whether filter_groups() *drops*
+    # groups lacking the anchor sequence entirely (correctly False for both
+    # lists in two-list mode, since most groups won't contain the anchor's
+    # own species). 'require_anchor_in_tables' controls whether make_tables()
+    # *flags* a missing anchor as an anomaly worth recording in
+    # tables/drop_reasons.tsv. For list1 specifically, a group reaching the
+    # tables step without an anchor sequence IS worth flagging even though
+    # it wasn't dropped upstream — that group will later be silently
+    # excluded from anchor2mean.tsv/group2anchor.tsv, and list1's
+    # group2anchor.tsv is exactly what compute_differential() reads to map
+    # groups to anchor gene IDs. For list2, the same absence is fully
+    # expected (list2 never contains the anchor's own species) and should
+    # stay silent. Defaulting to require_anchor when not given preserves
+    # single-list mode's existing behaviour unchanged.
+    #
+    # Note this is independent of the divergence filter potentially
+    # removing the anchor sequence from the *identity computation*: this
+    # step's make_tables() call always reads gene-ID mapping from the
+    # original alignment_dir (see below), which the divergence filter
+    # never modifies in place, so a group whose anchor happened to be its
+    # divergent outlier still resolves to the correct anchor gene ID here
+    # — only the identity score itself reflects the outlier's removal.
+    if require_anchor_in_tables is None:
+        require_anchor_in_tables = require_anchor
+
+    os.makedirs(listdir, exist_ok=True)
+    n_steps = (5 + (species is not None) + bool(exclude_from_identity)
+               + bool(divergence_filter_sd) + bool(trim_args))
+
+    # ------------------------------------------------------------------ #
+    # Per-stage resume-safety: force_recompute cascades forward the       #
+    # instant any stage's existing output can't be verified as matching   #
+    # this invocation's parameters (stage_markers.check_stage() status    #
+    # 'mismatch' or 'missing_marker'), or the instant any stage simply    #
+    # has no output yet ('not_run'). Once set, every later stage in this  #
+    # list's pipeline runs unconditionally regardless of its own marker,  #
+    # since its input has now changed even if its own parameters have    #
+    # not. See stage_markers.py's module docstring for the full design.  #
+    # ------------------------------------------------------------------ #
+    force_recompute = False
+
+    def _must_run(dir_specs, marker_dir, stage_name, stage_params):
+        nonlocal force_recompute
+        if not resume:
+            return True
+        if force_recompute:
+            return True
+        result = check_stage(dir_specs, marker_dir, stage_params)
+        if result.status == "ok":
+            logger.info(
+                "Skipping %s (parameters unchanged, output exists: %s)",
+                _desc(stage_name), marker_dir,
+            )
+            return False
+        if result.status == "mismatch":
+            changes = "; ".join(
+                "%s: %r -> %r" % (k, old, new)
+                for k, (old, new) in result.changed_parameters.items()
+            )
+            logger.warning(
+                "%s: parameters changed since the run that produced its "
+                "existing output (%s) — recomputing this stage and every "
+                "stage downstream of it.", _desc(stage_name), changes,
+            )
+            force_recompute = True
+            return True
+        if result.status == "missing_marker":
+            logger.warning(
+                "%s: output exists but has no parameter marker (likely "
+                "produced by a run from before this feature, or a "
+                "corrupted marker file) — cannot verify its parameters "
+                "match this invocation; recomputing this stage and every "
+                "stage downstream of it to be safe.", _desc(stage_name),
+            )
+            force_recompute = True
+            return True
+        # 'not_run' — first time this stage has ever produced output here.
+        force_recompute = True
+        return True
+
+    with tqdm(total=n_steps, desc=_desc("starting"),
+              unit="step", disable=not show_progress, leave=True) as sbar:
+
+        if species is not None:
+            sbar.set_description(_desc("subsetting"))
+            subset_params = {"species": sorted(species)}
+            if _must_run([(subset_dir, None)], subset_dir, "subsetting", subset_params):
+                subset_groups(inputdir, subset_dir, species,
+                              show_progress=show_progress)
+                write_stage_marker(subset_dir, "subset", subset_params)
+            source_dir = subset_dir
+            sbar.update(1)
+        else:
+            source_dir = inputdir
+
+        sbar.set_description(_desc("length filter"))
+        logger.info("Step 1: Length filtering")
+        length_filter_params = {"length_filter_sd": sd_multiplier}
+        if _must_run([(length_filter_dir, None)], length_filter_dir,
+                     "length filter", length_filter_params):
+            os.makedirs(length_stats_dir, exist_ok=True)
+            os.makedirs(length_filter_dir, exist_ok=True)
+            args_list = [
+                (os.path.join(source_dir, f), length_stats_dir,
+                 length_filter_dir, sd_multiplier)
+                for f in os.listdir(source_dir)
+            ]
+            pool = multiprocessing.Pool(processes=max_process)
+            try:
+                list(tqdm(
+                    pool.imap_unordered(_filter_length_star, args_list),
+                    total=len(args_list), desc="  groups", unit="group",
+                    leave=False, disable=not show_progress,
+                ))
+            except Exception as e:
+                raise EnhydraToolError("Length filtering failed: %s" % e) from e
+            finally:
+                pool.terminate()
+                pool.join()
+            write_stage_marker(length_filter_dir, "length_filter", length_filter_params)
+        # Runs unconditionally, whether or not the filtering above was just
+        # skipped via --resume. This is deliberate: aggregation is a cheap,
+        # idempotent read of whatever per-group '_lengthstats' files already
+        # exist in length_stats_dir — it is not tied to whether filtering
+        # happened in *this* invocation. Nesting it inside the `if
+        # _must_run(...)` block would silently produce empty/stale summary
+        # files on any run that resumes past an already-completed length
+        # filter step, even though the underlying per-group stats files are
+        # present and complete on disk.
+        aggregate_length_filter_stats(
+            length_stats_dir=length_stats_dir,
+            length_filter_stats_dir=os.path.join(listdir, "length_filter_stats"),
+        )
+        sbar.update(1)
+
+        sbar.set_description(_desc("group filter"))
+        logger.info("Step 2: Group filtering")
+        group_filter_params = {
+            "min_species":    min_species,
+            "min_sequences":  min_sequences,
+            "paralog_mode":   paralog_mode,
+            "anchor":         anchor,
+            "require_anchor": require_anchor,
+        }
+        if _must_run([(group_filter_dir, None)], group_filter_dir,
+                     "group filter", group_filter_params):
+            filter_groups(
+                length_filter_dir=length_filter_dir,
+                group_filter_dir=group_filter_dir,
+                group_stats_dir=group_stats_dir,
+                anchor=anchor,
+                min_species=min_species,
+                min_sequences=min_sequences,
+                paralog_mode=paralog_mode,
+                require_anchor=require_anchor,
+                show_progress=show_progress,
+            )
+            write_stage_marker(group_filter_dir, "group_filter", group_filter_params)
+        sbar.update(1)
+
+        sbar.set_description(_desc("alignment"))
+        logger.info("Step 3: Alignment with %s", aligner.upper())
+        alignment_params = {"aligner": aligner, "mafft_mode": mafft_mode}
+        if _must_run([(alignment_dir, None)], alignment_dir,
+                     "alignment", alignment_params):
+            run_aligner(
+                group_filter_dir=group_filter_dir,
+                alignment_dir=alignment_dir,
+                aligner=aligner,
+                parameters=parameters,
+                show_progress=show_progress,
+            )
+            write_stage_marker(alignment_dir, "alignment", alignment_params)
+        sbar.update(1)
+
+        trimal_input_dir = alignment_dir
+
+        if exclude_from_identity:
+            sbar.set_description(_desc("stripping anchor"))
+            logger.info("Step 3b: Stripping injected species from alignments: %s",
+                        exclude_from_identity)
+            strip_params = {"exclude_from_identity": sorted(exclude_from_identity)}
+            if _must_run([(stripped_dir, None)], stripped_dir,
+                         "anchor stripping", strip_params):
+                strip_species_from_alignments(
+                    alignment_dir=alignment_dir,
+                    stripped_dir=stripped_dir,
+                    exclude=exclude_from_identity,
+                    show_progress=show_progress,
+                )
+                write_stage_marker(stripped_dir, "anchor_stripping", strip_params)
+            trimal_input_dir = stripped_dir
+            sbar.update(1)
+
+        if divergence_filter_sd:
+            sbar.set_description(_desc("divergence filter"))
+            logger.info(
+                "Step 3c: Filtering highly divergent sequences "
+                "(sd_multiplier=%s)", divergence_filter_sd,
+            )
+            divergence_params = {
+                "divergence_filter_sd": divergence_filter_sd,
+                "min_species":          min_species,
+                "min_sequences":        min_sequences,
+            }
+            divergence_dir_specs = [
+                (divergence_filtered_dir, None),
+                (divergence_stats_dir, ["drop_reasons.tsv"]),
+            ]
+            if _must_run(divergence_dir_specs, divergence_filtered_dir,
+                        "divergence filter", divergence_params):
+                os.makedirs(divergence_sident_dir, exist_ok=True)
+                run_trimal(
+                    alignment_dir=trimal_input_dir,
+                    ident_dir=divergence_sident_dir,
+                    trimal_path=trimal_path,
+                    n_proc=max_process,
+                    show_progress=show_progress,
+                )
+                filter_divergent_sequences(
+                    alignment_dir=trimal_input_dir,
+                    sident_dir=divergence_sident_dir,
+                    filtered_dir=divergence_filtered_dir,
+                    realign_input_dir=divergence_realign_dir,
+                    stats_dir=divergence_stats_dir,
+                    min_species=min_species,
+                    min_sequences=min_sequences,
+                    sd_multiplier=divergence_filter_sd,
+                    show_progress=show_progress,
+                )
+                n_to_realign = (
+                    len(os.listdir(divergence_realign_dir))
+                    if os.path.isdir(divergence_realign_dir) else 0
+                )
+                if n_to_realign:
+                    logger.info(
+                        "Realigning %d group(s) after divergent sequence "
+                        "removal...", n_to_realign,
+                    )
+                    run_aligner(
+                        group_filter_dir=divergence_realign_dir,
+                        alignment_dir=divergence_filtered_dir,
+                        aligner=aligner,
+                        parameters=parameters,
+                        show_progress=show_progress,
+                    )
+                write_stage_marker(divergence_filtered_dir, "divergence_filter",
+                                   divergence_params)
+            trimal_input_dir = divergence_filtered_dir
+            sbar.update(1)
+
+        if trim_args:
+            sbar.set_description(_desc("trimming columns"))
+            logger.info(
+                "Step 3d: Trimming alignment columns with trimAl (%s)",
+                " ".join(trim_args),
+            )
+            # Colnumbering capture rides along with the existing -out
+            # trimming call (trimAl supports both flags together — see
+            # msa_viewer module notes), so it is always captured whenever
+            # trimming is enabled at all; there is no separate opt-in flag.
+            trim_params = {"trim": trim_args}
+            trim_dir_specs = [
+                (trimmed_dir, None),
+                (trim_colnumbering_dir, None),
+            ]
+            if _must_run(trim_dir_specs, trimmed_dir,
+                        "column trimming", trim_params):
+                run_trimal_columns(
+                    alignment_dir=trimal_input_dir,
+                    trimmed_dir=trimmed_dir,
+                    trimal_path=trimal_path,
+                    trim_args=trim_args,
+                    n_proc=max_process,
+                    show_progress=show_progress,
+                    colnumbering_dir=trim_colnumbering_dir,
+                )
+                write_stage_marker(trimmed_dir, "column_trimming", trim_params)
+            trimal_input_dir = trimmed_dir
+            sbar.update(1)
+
+        sbar.set_description(_desc("identity"))
+        logger.info("Step 4: Identity estimation with trimAl")
+        # Identity estimation has no tunable parameters of its own — its
+        # correctness depends entirely on which alignment directory feeds
+        # it (trimal_input_dir, selected by the stages above). It is still
+        # tracked as its own marked stage purely so that force_recompute
+        # cascading from any upstream stage correctly forces this one to
+        # rerun too, even though its own parameter dict never changes.
+        identity_params: dict = {}
+        if _must_run([(ident_dir, None)], ident_dir,
+                     "identity estimation", identity_params):
+            run_trimal(
+                alignment_dir=trimal_input_dir,
+                ident_dir=ident_dir,
+                trimal_path=trimal_path,
+                n_proc=max_process,
+                show_progress=show_progress,
+            )
+            write_stage_marker(ident_dir, "identity", identity_params)
+        sbar.update(1)
+
+        sbar.set_description(_desc("tables"))
+        logger.info("Step 5: Generating tables")
+        tables_params = {
+            "anchor":                   anchor,
+            "require_anchor_in_tables": require_anchor_in_tables,
+        }
+        tables_dir_specs = [
+            (tables_dir, ["group2mean.tsv", "anchor2mean.tsv", "group2anchor.tsv"]),
         ]
+        if _must_run(tables_dir_specs, tables_dir, "table generation", tables_params):
+            make_tables(
+                alignment_dir=alignment_dir,
+                ident_dir=ident_dir,
+                tables_dir=tables_dir,
+                anchor=anchor,
+                require_anchor=require_anchor_in_tables,
+                show_progress=show_progress,
+            )
+            write_stage_marker(tables_dir, "tables", tables_params)
+        sbar.update(1)
+        sbar.set_description(_desc("done"))
 
-    report_dir = os.path.dirname(os.path.abspath(report_path))
+    stats = {
+        "n_input":         len(os.listdir(source_dir)),
+        "n_length_filter": len(os.listdir(length_filter_dir))
+                           if os.path.isdir(length_filter_dir) else 0,
+        "n_group_filter":  len(os.listdir(group_filter_dir))
+                           if os.path.isdir(group_filter_dir) else 0,
+    }
+    return tables_dir, stats
 
-    # Built once (not per metric) — feeds the "Full gene set" / "Leading
-    # edge" modal chip links below. Independent of which metric is being
-    # rendered, since it only depends on group2anchor.tsv + the rendered
-    # alignment page maps.
-    gene_to_page = _build_gene_to_page_links(
-        tables_dir1, alignment_pages1, alignment_pages2, report_dir,
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="enhydra",
+        description="Gene Set Enrichment Analysis for evolutionary genomics.",
+    )
+    parser.add_argument(
+        "project_config", nargs="?", default=None,
+        help="Path to the project configuration file. Not required when "
+             "using --init-code-config."
+    )
+    parser.add_argument(
+        "--code-config", default=None, metavar="FILE",
+        help="Path to the code configuration file (tool paths: mafft, "
+             "trimal, etc.). Optional — if not given, ENHYDRA looks for "
+             "the %s environment variable, then falls back to "
+             "~/.enhydra/code_config. Since this rarely changes between "
+             "analyses, setting it up once via either of those two "
+             "fallbacks means you don't need to pass this flag on every "
+             "invocation." % _CODE_CONFIG_ENV_VAR,
+    )
+    parser.add_argument(
+        "--init-code-config", nargs="?", const=_DEFAULT_CODE_CONFIG_PATH,
+        default=None, metavar="FILE",
+        help="Auto-detect mafft/trimal/muscle/prank on $PATH and write a "
+             "new code configuration file there, then exit without "
+             "running a pipeline — the recommended one-time setup step "
+             "for a fresh install. Defaults to %s if FILE is omitted. "
+             "Combine with --force to overwrite an existing file."
+             % _DEFAULT_CODE_CONFIG_PATH,
+    )
+    parser.add_argument(
+        "--force", action="store_true", default=False,
+        help="With --init-code-config, overwrite an existing file at the "
+             "target path instead of raising an error."
     )
 
-    tab_buttons_parts    = []
-    tab_panels_parts     = []
-    enrichment_plots_map = {}
-    numeric_cols_map      = {}
-    full_gene_sets_accum  = {}
-    leading_edge_map      = {}
-    full_gene_sets_html_accum = {}
-    leading_edge_html_map     = {}
-    redundant_clusters_html_accum = {}
-    # Raw (still-numeric) per-metric GSEA result frames, captured purely to
-    # feed the cross-metric consensus tab below — kept separate from the
-    # `df` variable inside the loop, which gets progressively mutated
-    # in-place-by-rebinding (augmented with per-term scores, then stringified
-    # inside _results_table_html()'s own internal copy) for that metric's
-    # own results table.
-    metric_raw_dfs: dict[str, pd.DataFrame] = {}
-    first = True
-    for metric, paths in metric_data.items():
-        label       = METRIC_LABELS.get(metric, metric.capitalize())
-        active_cls  = " active" if first else ""
-        results_dir = paths["results_dir"]
-        plots_dir   = paths["plots_dir"]
-        tab_buttons_parts.append(
-            '    <button class="tab-btn%s" data-metric="%s" '
-            'role="tab" aria-controls="tab-%s">%s</button>'
-            % (active_cls, metric, metric, label)
-        )
-        plot_idx = _build_enrichment_plot_index(results_dir, report_dir)
-        enrichment_plots_map[metric] = plot_idx
-        df = _load_gsea_results(results_dir)
-        if df is not None:
-            metric_raw_dfs[metric] = df[["Term", "NES", "FDR q-val"]].copy()
-            df = _augment_with_per_term_scores(
-                df, effective_gmt, tables_dir1, tables_dir2, metric
-            )
-            (tbl_html, num_cols, full_sets_js, leadedge_js,
-             full_sets_html_js, leadedge_html_js,
-             redundant_html_js) = _results_table_html(
-                df, term_names, plot_idx, fdr_threshold,
-                metric=metric, col1_label=label1, col2_label=label2,
-                gene_sets=gene_sets_all, gene_to_page=gene_to_page,
-                overlap_threshold=overlap_threshold,
-                gene_list_fdr_threshold=gene_list_fdr_threshold,
-            )
-            numeric_cols_map[metric] = num_cols
-            full_gene_sets_accum.update(full_sets_js)
-            leading_edge_map[metric] = leadedge_js
-            full_gene_sets_html_accum.update(full_sets_html_js)
-            leading_edge_html_map[metric] = leadedge_html_js
-            redundant_clusters_html_accum.update(redundant_html_js)
-        else:
-            tbl_html = "<p>No GSEA results found for this metric.</p>"
-            numeric_cols_map[metric] = []
-            leading_edge_map[metric] = {}
-            leading_edge_html_map[metric] = {}
-        plots_html = _plot_section(plots_dir, plot_names)
-        desc       = "" if single_metric else _METRIC_DESCS.get(metric, "")
-        desc_html  = ('<p class="metric-desc">%s</p>' % desc) if desc else ""
-        tab_panels_parts.append(
-            '<div id="tab-{m}" class="tab-panel{ac}" role="tabpanel">\n'
-            '  {desc_html}\n'
-            '  <h3>Plots</h3>\n'
-            '  <div class="plot-grid">{plots}</div>\n'
-            '  <h3>Enrichment results</h3>\n'
-            '  <p>Significant gene sets (FDR&nbsp;&lt;&nbsp;{fdr}) highlighted '
-            'in blue. Click a GO ID to view its enrichment plot, or "View" '
-            'under Full&nbsp;gene&nbsp;set / Leading&nbsp;edge / '
-            'Redundant&nbsp;with to see the associated gene/gene-set '
-            'lists, with links to alignment pages where available. To keep '
-            'report size manageable, full gene and leading-edge lists are '
-            'only embedded for gene sets with FDR&nbsp;&lt;&nbsp;{gl_fdr}; '
-            'other gene sets show a count only.</p>\n'
-            '  <p>'
-            '<button class="sig-toggle-btn" data-metric="{m}">Show only significant</button> '
-            '<button class="nonredundant-toggle-btn" data-metric="{m}">Show non-redundant only</button> '
-            '<button class="export-btn export-xlsx-btn" data-metric="{m}">'
-            '&#8681; Export table to Excel (.xlsx)</button> '
-            '<button class="export-btn export-xlsx-all-btn" data-metric="{m}">'
-            '&#8681; Export all rows (ignore filters)</button>'
-            '</p>\n'
-            '  {tbl}\n'
-            '</div>\n'.format(
-                m=metric, ac=active_cls, desc_html=desc_html,
-                plots=plots_html, fdr=fdr_threshold,
-                gl_fdr=effective_gene_list_threshold, tbl=tbl_html,
-            )
-        )
-        first = False
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument("--orthofinder-dir", default=None,
+                             help="Path to an OrthoFinder 3 output directory. "
+                                  "Can also be set via 'orthofinder_dir' in "
+                                  "the project config.")
 
-    # Cross-metric consensus tab — only meaningful with 2+ metrics that
-    # each produced usable GSEA results (i.e. an --all-metrics run; a
-    # single-metric report has nothing to be consensus about). Surfaces
-    # gene sets significant in a majority of the ranking metrics run, so a
-    # result can be trusted as more than an artifact of one particular
-    # ranking choice (identity vs. zscore vs. rank). See
-    # build_significance_agreement_table_html() for the full
-    # significance/direction rules.
-    if len(metric_raw_dfs) >= 2:
-        column_labels = {
-            m: METRIC_LABELS.get(m, m.capitalize()) for m in metric_raw_dfs
-        }
-        # In two-list/differential mode, NES sign reflects which list a
-        # gene set is relatively more conserved in (see
-        # differential.compute_differential()'s own docstring: a positive
-        # differential score means higher conservation in list 1), not
-        # "more/less conserved than the genome-wide average" the way
-        # single-list mode's NES sign does. Reusing single-list mode's
-        # "Conserved" / "Faster-evolving" wording here would misrepresent
-        # what a positive or negative NES actually means for a
-        # differential run — both direction values need to name a
-        # *list*, not describe an absolute rate of evolution. Sign
-        # convention matches plotting.plot_differential_distribution()'s
-        # own histogram, which labels scores >= 0 as "More variable in
-        # <list2>".
-        if mode == "differential":
-            esc_label1, esc_label2 = html.escape(label1), html.escape(label2)
-            direction_labels = {
-                1:  "Faster-evolving in %s" % esc_label2,
-                -1: "Faster-evolving in %s" % esc_label1,
-            }
-            direction_desc = (
-                "\u201cDirection\u201d reports, for gene sets significant "
-                "under a majority of metrics, whether %s or %s appears "
-                "faster-evolving for that gene set (i.e. which list shows "
-                "lower relative conservation) \u2014 \u201cMixed "
-                "direction\u201d means the metrics disagree on which "
-                "list, and the result should be treated with caution "
-                "rather than as consensus support."
-                % (esc_label1, esc_label2)
-            )
-        else:
-            direction_labels = None
-            direction_desc = (
-                "\u201cDirection\u201d reports whether the sign of "
-                "enrichment (conserved vs. faster-evolving) agrees "
-                "across the metrics in which the gene set was "
-                "significant \u2014 \u201cMixed direction\u201d means "
-                "the metrics disagree and the result should be treated "
-                "with caution rather than as consensus support."
-            )
-        consensus_html, consensus_numeric_cols = build_significance_agreement_table_html(
-            column_dfs=metric_raw_dfs,
-            column_labels=column_labels,
-            obo_names=term_names,
-            fdr_threshold=fdr_threshold,
-            enrichment_plots_map=enrichment_plots_map,
-            table_id="results-table-consensus",
-            direction_labels=direction_labels,
+    parser.add_argument("--resume",  action="store_true", default=None,
+                        help="Resume a previously interrupted run. Each "
+                             "pipeline stage's existing output is reused "
+                             "only if a per-stage marker confirms it was "
+                             "produced with the same parameters as this "
+                             "invocation; otherwise that stage and every "
+                             "stage downstream of it are recomputed, with "
+                             "a warning. Can also be set via 'resume' in "
+                             "the project config.")
+    parser.add_argument(
+        "--fork-from", default=None, metavar="OUTDIR",
+        help="Seed a new output directory from a prior completed run's "
+             "pipeline-stage outputs, to change a parameter from some "
+             "stage onward without recomputing everything before it "
+             "(e.g. changing --trim from 'strict' to 'strictplus' reuses "
+             "length/group filtering and alignment, and only recomputes "
+             "trimming, identity estimation, and tables). Every stage "
+             "whose parameters are unchanged from the fork source is "
+             "reused as-is; the first stage whose parameters differ, and "
+             "every stage after it, is recomputed. The destination "
+             "'outdir' (in the project config) must not already exist. "
+             "Implies --resume. Can also be set via 'fork_from' in the "
+             "project config."
+    )
+    parser.add_argument("--replot",  action="store_true", default=None,
+                        help="Re-run GSEA, plots, and the HTML report without "
+                             "repeating alignment. Implies --resume. Can also "
+                             "be set via 'replot' in the project config.")
+    parser.add_argument("--quiet",   action="store_true", default=None,
+                        help="Suppress INFO/WARNING on the console; show progress "
+                             "bars instead. Can also be set via 'quiet' in the "
+                             "project config.")
+    parser.add_argument("--paralogs", choices=["all", "remove", "longest"], default=None)
+    parser.add_argument("--min-species", type=int, default=None)
+    parser.add_argument("--length-filter-sd", type=float, default=None,
+                        help="Number of standard deviations from a group's "
+                             "mean sequence length beyond which a sequence "
+                             "is removed by the length filter (default: "
+                             "2.0, or the value of 'length_filter_sd' in "
+                             "the project config).")
+    parser.add_argument("--trim", default=None,
+                        help="Trim alignment columns with trimAl before "
+                             "identity estimation. Accepts a number between "
+                             "0 and 1 (used as trimAl's -gt gap threshold), "
+                             "or one of: strict, strictplus, automated "
+                             "(mapped to trimAl's -strict, -strictplus, "
+                             "-automated1 respectively). If unset (default), "
+                             "no column trimming is performed.")
+    parser.add_argument("--divergence-filter-sd", type=float, default=None,
+                        help="Remove sequences whose trimAl -sident identity "
+                             "to their closest match falls more than this "
+                             "many standard deviations below the group's "
+                             "mean, then realign the group without them. "
+                             "Runs after alignment (and after anchor "
+                             "stripping in two-list mode) but before column "
+                             "trimming. Groups with fewer than min_species "
+                             "sequences are exempt from this check, since "
+                             "too few sequences make the mean/SD unreliable. "
+                             "If unset (default), no divergence filtering is "
+                             "performed.")
+    parser.add_argument("--all-metrics", action="store_true", default=None,
+                        help="Run GSEA for all three ranking metrics and produce "
+                             "a tabbed HTML report. Can also be set via "
+                             "'all_metrics' in the project config.")
+
+    diff_group = parser.add_argument_group("two-list differential mode")
+    diff_group.add_argument("--list1",   default=None)
+    diff_group.add_argument("--list2",   default=None)
+    diff_group.add_argument("--metric",  choices=["zscore", "identity", "rank"],
+                            default=None)
+
+    gmt_group = parser.add_mutually_exclusive_group()
+    gmt_group.add_argument("--organism",  default=None)
+    gmt_group.add_argument("--gene-sets", default=None)
+
+    parser.add_argument("--sources",       nargs="+", default=None)
+    parser.add_argument("--permutations",  type=int,   default=None)
+    parser.add_argument("--min-size",      type=int,   default=None)
+    parser.add_argument("--max-size",      type=int,   default=None)
+    parser.add_argument("--seed",          type=int,   default=None)
+    parser.add_argument("--fdr-threshold", type=float, default=None)
+    parser.add_argument(
+        "--gene-list-fdr-threshold", type=float, default=None, metavar="FDR",
+        help="(Advanced) FDR threshold below which a gene set's full gene "
+             "list and leading-edge gene list are embedded in the HTML "
+             "report as clickable 'View' links; gene sets at or above "
+             "this threshold show a count only, to keep report size "
+             "manageable for large (e.g. genome-scale) gene set "
+             "collections. Defaults to the same value as --fdr-threshold "
+             "(i.e. only significant gene sets get embedded gene lists). "
+             "Set to 1.0 or higher to embed gene lists for virtually all "
+             "tested gene sets (restores the original, unrestricted "
+             "behaviour — can produce very large reports). Can also be "
+             "set via 'gene_list_fdr_threshold' in the project config."
+    )
+    parser.add_argument("--top-n",         type=int,   default=None)
+    parser.add_argument("--obo-cache",     default=None)
+    parser.add_argument(
+        "--package-dir", default=None, metavar="DIR",
+        help="After a successful run, copy only the files needed to view "
+             "the report (report.html, enrichment plot images, alignment "
+             "pages, and filtering-detail pages) into this directory, as "
+             "a single self-contained folder suitable for sharing without "
+             "any intermediate pipeline files. Can also be set via "
+             "'package_dir' in the project config."
+    )
+    parser.add_argument(
+        "--package-overwrite", action="store_true", default=None,
+        help="If --package-dir already exists, replace it rather than "
+             "raising an error. Can also be set via 'package_overwrite' "
+             "in the project config."
+    )
+
+    return parser
+
+
+def main():
+    parser = _build_arg_parser()
+    args   = parser.parse_args()
+
+    if args.init_code_config is not None:
+        try:
+            _init_code_config(args.init_code_config, force=args.force)
+        except EnhydraConfigError as e:
+            sys.exit("Configuration error: %s" % e)
+        return
+
+    if args.project_config is None:
+        parser.error("the following arguments are required: project_config")
+
+    try:
+        code_config_path = _resolve_code_config_path(args.code_config)
+    except EnhydraConfigError as e:
+        sys.exit("Configuration error: %s" % e)
+
+    try:
+        with open(args.project_config) as fh_project, \
+             open(code_config_path)    as fh_code:
+            parameters = read_config_file(fh_project, fh_code)
+    except OSError as e:
+        sys.exit("Could not open configuration file: %s" % e)
+
+    try:
+        check_parameters(parameters, code_config_path)
+    except (EnhydraConfigError, EnhydraIOError, EnhydraToolError) as e:
+        sys.exit("Configuration error: %s" % e)
+
+    min_species   = _resolve(args.min_species,   parameters['min_species'],   4)
+    min_sequences = parameters['min_sequences']
+    paralogs      = _resolve(args.paralogs,      parameters['paralogs'],      'all')
+    trim          = _resolve(args.trim,          parameters['trim'],          '')
+    divergence_filter_sd_raw = _resolve(
+        args.divergence_filter_sd, parameters['divergence_filter_sd'], '')
+    metric        = _resolve(args.metric,        parameters['metric'],        'zscore')
+    gene_sets     = _resolve(args.gene_sets,     parameters['gene_sets'],     None)
+    organism      = _resolve(args.organism,      parameters['organism'],      None)
+    permutations  = _resolve(args.permutations,  parameters['permutations'],  1000)
+    min_size      = _resolve(args.min_size,      parameters['min_size'],      5)
+    max_size      = _resolve(args.max_size,      parameters['max_size'],      500)
+    seed          = _resolve(args.seed,          parameters['seed'],          42)
+    fdr_threshold = _resolve(args.fdr_threshold, parameters['fdr_threshold'], 0.25)
+
+    # (Advanced) Independent FDR cutoff controlling which gene sets get
+    # their full gene / leading-edge gene lists embedded in the report
+    # (see report._results_table_html()). Kept separate from
+    # fdr_threshold itself (which still governs significance everywhere
+    # else) so a person can keep a lenient --fdr-threshold for the results
+    # table while still capping report size. '' / unset means "use
+    # fdr_threshold" — i.e. only significant gene sets get embedded gene
+    # lists, which is the default, restricted behaviour.
+    gene_list_fdr_threshold_raw = _resolve(
+        args.gene_list_fdr_threshold, parameters['gene_list_fdr_threshold'], '')
+    try:
+        gene_list_fdr_threshold = (
+            float(gene_list_fdr_threshold_raw)
+            if gene_list_fdr_threshold_raw not in (None, '') else None
         )
-        tab_buttons_parts.append(
-            '    <button class="tab-btn" data-metric="consensus" '
-            'role="tab" aria-controls="tab-consensus">Cross-metric consensus</button>'
-        )
-        if consensus_numeric_cols is not None:
-            numeric_cols_map["consensus"] = consensus_numeric_cols
-        n_metrics_run = len(metric_raw_dfs)
-        majority_n    = n_metrics_run // 2 + 1
-        tab_panels_parts.append(
-            '<div id="tab-consensus" class="tab-panel" role="tabpanel">\n'
-            '  <p class="metric-desc">Gene sets reaching significance '
-            '(FDR&nbsp;&lt;&nbsp;{fdr}) in at least {maj} of the {n} ranking '
-            'metrics run. Rows highlighted in blue are significant across '
-            'all {n} metrics. {ddesc} Full per-gene detail for any of '
-            'these gene sets remains available in that metric\u2019s own '
-            'tab.</p>\n'
-            '  {tbl}\n'
-            '</div>\n'.format(
-                fdr=fdr_threshold, maj=majority_n, n=n_metrics_run,
-                ddesc=direction_desc, tbl=consensus_html,
-            )
+    except (TypeError, ValueError):
+        sys.exit(
+            "Configuration error: invalid 'gene_list_fdr_threshold' value: "
+            "%r. Must be a number." % (gene_list_fdr_threshold_raw,)
         )
 
-    # Alignments tab — appended after the metric tabs (and the consensus
-    # tab, if present), before Filtering summary. Built from list1's (or
-    # the single list's) group2anchor.tsv plus whichever groups actually
-    # received a rendered alignment page; see _build_alignment_tree_html()
-    # for the full membership rules.
-    #
-    # Restricted here to GO terms significant (FDR < fdr_threshold) in at
-    # least one of the metrics run, rather than every term in the full
-    # GMT. With a genome-scale GMT, most terms are not significant but
-    # still happen to match at least one rendered alignment page purely
-    # by chance overlap with the (typically large) ranked gene list —
-    # _build_alignment_tree_html() previously built one permanent,
-    # un-deferred <details> DOM block per such term regardless of
-    # significance, which for e.g. a mammalian GO:BP GMT can mean
-    # thousands of expandable blocks present in the page at load time.
-    # This was found to be the single largest remaining driver of browser
-    # memory after gene-list embedding was already gated by
-    # fdr_threshold/gene_list_fdr_threshold elsewhere in this function —
-    # restricting this tab the same way (reusing fdr_threshold directly,
-    # not a separate configurable cutoff) is the matching fix.
-    significant_terms: set[str] = set()
-    for df_raw in metric_raw_dfs.values():
-        fdr_numeric = pd.to_numeric(df_raw["FDR q-val"], errors="coerce")
-        significant_terms.update(df_raw.loc[fdr_numeric < fdr_threshold, "Term"])
-    gene_sets_for_alignments = {
-        t: genes for t, genes in gene_sets_all.items() if t in significant_terms
+    top_n         = _resolve(args.top_n,         parameters['top_n'],         20)
+    list1_path    = _resolve(args.list1,         parameters['list1'],         None)
+    list2_path    = _resolve(args.list2,         parameters['list2'],         None)
+    list1_name    = parameters['list1_name']
+    list2_name    = parameters['list2_name']
+    sources_raw   = _resolve(args.sources,       parameters['sources'],
+                             'GO:BP GO:MF GO:CC KEGG REAC')
+    sources       = sources_raw if isinstance(sources_raw, list) \
+                    else sources_raw.split()
+    sd_multiplier = _resolve(args.length_filter_sd, parameters['length_filter_sd'], 2.0)
+    aligner       = parameters['aligner']
+    mafft_mode    = parameters['mafft_mode']
+    obo_cache     = _resolve(args.obo_cache, parameters['obo_cache'], None)
+
+    # Run-mode flags: previously CLI-only (argparse defaults of False/None
+    # with no config fallback). All seven now accept a project-config value
+    # too — argparse's store_true flags use default=None (not False) so
+    # that "flag not passed on the CLI" can be distinguished from
+    # "explicitly disabled", letting _resolve() fall through to the config
+    # value in the former case. An explicit CLI flag always wins over the
+    # config file, consistent with every other parameter in this function.
+    orthofinder_dir = _resolve(args.orthofinder_dir, parameters['orthofinder_dir'], None) or None
+    fork_from       = _resolve(args.fork_from,       parameters['fork_from'],       None) or None
+    resume_flag     = _resolve(args.resume,          parameters['resume'],          False)
+    replot          = _resolve(args.replot,          parameters['replot'],          False)
+    quiet           = _resolve(args.quiet,           parameters['quiet'],           False)
+    all_metrics     = _resolve(args.all_metrics,     parameters['all_metrics'],     False)
+    package_dir       = _resolve(args.package_dir,       parameters['package_dir'],       None) or None
+    package_overwrite = _resolve(args.package_overwrite, parameters['package_overwrite'], False)
+    resume          = resume_flag or replot
+
+    try:
+        trim_args = resolve_trim_args(trim)
+    except EnhydraConfigError as e:
+        sys.exit("Configuration error: %s" % e)
+
+    try:
+        divergence_filter_sd = resolve_divergence_filter_sd(divergence_filter_sd_raw)
+    except EnhydraConfigError as e:
+        sys.exit("Configuration error: %s" % e)
+
+    # Snapshot of every effective (post-resolution) parameter value, for the
+    # reproducibility record written via provenance.collect_run_parameters()
+    # below. Built once, right after all _resolve()/resolve_*() calls above
+    # have settled, so it reflects exactly what this run actually used —
+    # not the raw config file contents, which a CLI flag may have silently
+    # overridden. Keys match collect_run_parameters()'s resolved_params
+    # contract exactly.
+    resolved_params_for_provenance = {
+        "min_species":          min_species,
+        "min_sequences":        min_sequences,
+        "paralogs":             paralogs,
+        "length_filter_sd":     sd_multiplier,
+        "divergence_filter_sd": divergence_filter_sd,
+        "trim":                 trim,
+        "aligner":              aligner,
+        "mafft_mode":           mafft_mode,
+        "metric":               metric,
+        "permutations":         permutations,
+        "min_size":             min_size,
+        "max_size":             max_size,
+        "seed":                 seed,
+        "fdr_threshold":        fdr_threshold,
+        "gene_list_fdr_threshold": gene_list_fdr_threshold,
+        "top_n":                top_n,
+        "gene_sets":            gene_sets,
+        "organism":             organism,
+        "sources":              sources,
     }
 
-    tab_buttons_parts.append(
-        '    <button class="tab-btn" data-metric="alignments" '
-        'role="tab" aria-controls="tab-alignments">Alignments</button>'
-    )
-    alignment_tree_html = _build_alignment_tree_html(
-        gmt_gene_sets=gene_sets_for_alignments,
-        tables_dir1=tables_dir1,
-        obo_names=term_names,
-        alignment_pages1=alignment_pages1,
-        alignment_pages2=alignment_pages2,
-        report_dir=report_dir,
-        label1=label1,
-        label2=label2,
-        tables_dir2=tables_dir2,
-    )
-    tab_panels_parts.append(
-        '<div id="tab-alignments" class="tab-panel" role="tabpanel">\n'
-        '  <p class="metric-desc">Alignments for every orthogroup that fed '
-        'GSEA, nested by GO term. Only GO terms significant at '
-        'FDR&nbsp;&lt;&nbsp;{fdr} in at least one ranking metric are shown '
-        'here, to keep report size manageable \u2014 non-significant terms\u2019 '
-        'alignments are not listed in this tab, though the underlying '
-        'alignment pages themselves are still generated and linked from '
-        'significant terms that share the same orthogroup. Columns shown '
-        'hatched/dimmed, if any, were removed by trimAl before identity '
-        'estimation.</p>\n'
-        '  %s\n'
-        '</div>\n'.format(fdr=fdr_threshold) % alignment_tree_html
+    if not gene_sets and not organism:
+        parser.error(
+            "A gene set source is required. Set 'gene_sets' or 'organism' in "
+            "your project config, or use --gene-sets / --organism."
+        )
+
+    two_list_mode = bool(list1_path or list2_path)
+    if two_list_mode and not (list1_path and list2_path):
+        parser.error("Two-list mode requires both list1 and list2.")
+
+    outdir = parameters['outdir']
+
+    if fork_from:
+        if os.path.isdir(outdir):
+            sys.exit(
+                "--fork-from requires a new output directory: '%s' already "
+                "exists. Choose a fresh 'outdir' in your project config, or "
+                "omit --fork-from and use --resume instead if you intend to "
+                "continue this existing directory in place." % outdir
+            )
+        if not os.path.isdir(fork_from):
+            sys.exit("--fork-from directory not found: %s" % fork_from)
+        fork_run_params_path = os.path.join(fork_from, "run_parameters.json")
+        if os.path.isfile(fork_run_params_path):
+            with open(fork_run_params_path) as fh:
+                fork_run_params = json.load(fh)
+            fork_inputdir = (fork_run_params.get("input") or {}).get("inputdir")
+            this_inputdir = os.path.abspath(parameters['inputdir'])
+            if fork_inputdir and os.path.abspath(fork_inputdir) != this_inputdir:
+                sys.exit(
+                    "--fork-from source was run with a different inputdir "
+                    "('%s') than this invocation's ('%s'). Forking across "
+                    "different input data is not supported — the "
+                    "per-stage markers this feature relies on do not "
+                    "themselves track inputdir." % (fork_inputdir, this_inputdir)
+                )
+        else:
+            sys.stderr.write(
+                "Warning: --fork-from source has no run_parameters.json "
+                "(it predates that feature) — cannot verify it used the "
+                "same inputdir as this invocation.\n"
+            )
+        # The seeded stage directories are only useful if the normal
+        # pipeline actually consults their markers instead of blindly
+        # recomputing everything — i.e. this must behave as a resumed
+        # run regardless of whether the user also passed --resume.
+        resume = True
+    elif os.path.isdir(outdir) and not resume:
+        sys.exit(
+            "Output directory '%s' already exists. Use --resume to continue "
+            "a previous run, --replot to re-run GSEA and regenerate plots, "
+            "--fork-from <path> to seed a new outdir from that run's "
+            "outputs while changing selected parameters, or change "
+            "'outdir' in your project config." % outdir
+        )
+    os.makedirs(outdir, exist_ok=True)
+
+    _setup_logging(outdir, quiet=quiet)
+    logger = logging.getLogger(__name__)
+    logger.info("Welcome to Enhydra")
+    logger.info("Using code configuration: %s", code_config_path)
+    logger.info(
+        "Resolved parameters: metric=%s, all_metrics=%s, replot=%s, "
+        "paralogs=%s, trim=%s, divergence_filter_sd=%s, min_species=%d, "
+        "permutations=%d, fdr_threshold=%.2f, gene_list_fdr_threshold=%s",
+        metric, all_metrics, replot, paralogs, (trim or "none"),
+        (divergence_filter_sd if divergence_filter_sd else "none"),
+        min_species, permutations, fdr_threshold,
+        (gene_list_fdr_threshold if gene_list_fdr_threshold is not None
+         else "same as fdr_threshold"),
     )
 
-    # Filtering summary tab — appended after Alignments.
-    tab_buttons_parts.append(
-        '    <button class="tab-btn" data-metric="filtering-summary" '
-        'role="tab" aria-controls="tab-filtering-summary">Filtering summary</button>'
-    )
-    filtering_html = _build_filtering_summary_tab_content(
-        mode=mode, label1=label1, label2=label2,
-        pipeline_stats_path=pipeline_stats_path,
-        pipeline_stats_path1=pipeline_stats_path1,
-        pipeline_stats_path2=pipeline_stats_path2,
-        differential_stats_path=differential_stats_path,
-        report_dir=report_dir,
-    )
-    tab_panels_parts.append(
-        '<div id="tab-filtering-summary" class="tab-panel" role="tabpanel">\n'
-        '  <p class="metric-desc">Counts of input groups and sequences '
-        'retained or excluded at each pipeline stage, and why. "View list" '
-        'links open a separate page listing the affected group or sequence '
-        'IDs.</p>\n'
-        '  %s\n'
-        '</div>\n' % filtering_html
-    )
+    if orthofinder_dir:
+        logger.info("OrthoFinder mode: preprocessing Orthogroup_Sequences/")
+        preprocess_orthofinder(
+            orthofinder_dir=orthofinder_dir,
+            inputdir=parameters['inputdir'],
+        )
 
-    # Run parameters tab — always appended last, after Filtering summary.
-    # Presents the reproducibility record written by
-    # provenance.write_run_parameters() (see cli.py): the effective
-    # parameters used to produce this exact report. Never the
-    # default-active tab, matching Filtering summary's own placement, and
-    # requires no DataTables/JS registration since it has no <table>
-    # element of its own (aside from the plain, unsorted key/value tables
-    # rendered inline).
-    tab_buttons_parts.append(
-        '    <button class="tab-btn" data-metric="run-parameters" '
-        'role="tab" aria-controls="tab-run-parameters">Run parameters</button>'
-    )
-    run_parameters_html = _build_run_parameters_tab_content(
-        run_parameters_path=run_parameters_path,
-        report_dir=report_dir,
-    )
-    tab_panels_parts.append(
-        '<div id="tab-run-parameters" class="tab-panel" role="tabpanel">\n'
-        '  <p class="metric-desc">Effective parameters used to produce this '
-        'report, captured after any command-line overrides were applied to '
-        'the configuration files \u2014 for reproducibility.</p>\n'
-        '  %s\n'
-        '</div>\n' % run_parameters_html
+    if fork_from:
+        logger.info("Seeding pipeline-stage outputs from fork source: %s", fork_from)
+        try:
+            if two_list_mode:
+                _seed_fork_source(os.path.join(fork_from, "list1"),
+                                  os.path.join(outdir, "list1"), label=list1_name)
+                _seed_fork_source(os.path.join(fork_from, "list2"),
+                                  os.path.join(outdir, "list2"), label=list2_name)
+            else:
+                _seed_fork_source(fork_from, outdir)
+        except EnhydraIOError as e:
+            sys.exit("--fork-from error: %s" % e)
+
+    obo_path  = os.path.join(obo_cache, "go-basic.obo") if obo_cache else None
+    obo_names = parse_obo_names(obo_path) \
+                if obo_path and os.path.isfile(obo_path) else {}
+
+    common_kwargs = dict(
+        inputdir=parameters['inputdir'],
+        min_species=min_species,
+        min_sequences=min_sequences,
+        mafft_path=parameters['mafft'],
+        trimal_path=parameters['trimal'],
+        max_process=parameters['max_process'],
+        paralog_mode=paralogs,
+        sd_multiplier=sd_multiplier,
+        aligner=aligner,
+        mafft_mode=mafft_mode,
+        parameters=parameters,
+        resume=resume,
+        show_progress=quiet,
+        trim_args=trim_args,
+        divergence_filter_sd=divergence_filter_sd,
     )
 
-    html_content = _TEMPLATE.format(
-        title=title, dt_css=dt_css,
-        tab_buttons="\n".join(tab_buttons_parts),
-        tab_panels="\n".join(tab_panels_parts),
-        jquery_js=jquery_js, dt_js=dt_js, xlsx_js=xlsx_js,
-        enrichment_plots_map=json.dumps(enrichment_plots_map),
-        full_gene_sets_js=json.dumps(full_gene_sets_accum),
-        leading_edge_map_js=json.dumps(leading_edge_map),
-        full_gene_sets_html_js=json.dumps(full_gene_sets_html_accum),
-        leading_edge_html_map_js=json.dumps(leading_edge_html_map),
-        redundant_clusters_html_js=json.dumps(redundant_clusters_html_accum),
-        numeric_cols_map=json.dumps(numeric_cols_map),
-    )
-    with open(report_path, "w", encoding="utf-8") as fh:
-        fh.write(html_content)
-    logger.info("HTML report written to: %s", report_path)
+    # In two-list mode, default to all three metrics for a tabbed comparison.
+    # An explicit --metric flag overrides this.
+    if two_list_mode and not all_metrics and args.metric is None:
+        all_metrics = True
+        logger.info(
+            "Two-list mode: defaulting to --all-metrics for a tabbed report. "
+            "Pass an explicit --metric flag to run a single metric instead."
+        )
 
+    metrics_to_run = ALL_METRICS if all_metrics else (metric,)
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def build_report(
-    results_dir: str,
-    plots_dir: str,
-    report_path: str,
-    obo_path: str | None = None,
-    mode: str = "single",
-    metric: str = "zscore",
-    fdr_threshold: float = 0.25,
-    gmt_path: str | None = None,
-    tables_dir1: str | None = None,
-    tables_dir2: str | None = None,
-    label1: str = "List 1",
-    label2: str = "List 2",
-    pipeline_stats_path: str | None = None,
-    pipeline_stats_path1: str | None = None,
-    pipeline_stats_path2: str | None = None,
-    differential_stats_path: str | None = None,
-    alignment_pages1: dict[str, str] | None = None,
-    alignment_pages2: dict[str, str] | None = None,
-    run_parameters_path: str | None = None,
-    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
-    gene_list_fdr_threshold: float | None = None,
-):
-    """Build a single-metric HTML report (one enrichment tab + Alignments +
-    Filtering summary + Run parameters).
-
-    Thin wrapper around _build_report_impl() with a one-entry metric_data
-    dict, so single-metric and multi-metric reports share one implementation
-    and one visual shell. With only one metric, _build_report_impl() never
-    builds a Cross-metric consensus tab (that requires 2+ metrics), so
-    single-metric reports are unaffected by that feature.
-
-    Args:
-        run_parameters_path: Path to run_parameters.json (see
-                             provenance.write_run_parameters()), used to
-                             populate the Run parameters tab. None omits
-                             the record and shows a placeholder message
-                             instead of raising.
-        overlap_threshold:   Overlap coefficient at or above which two
-                             significant gene sets are considered
-                             redundant for the "Redundant with" column /
-                             "Show non-redundant only" toggle in each
-                             metric's enrichment table. See
-                             _cluster_redundant_terms() for the full
-                             algorithm.
-        gene_list_fdr_threshold: FDR threshold below which a gene set's
-                             full gene list / leading-edge gene list is
-                             embedded in the report as a clickable "View"
-                             link, rather than shown as a plain count.
-                             None (the default) means "use fdr_threshold"
-                             — i.e. only significant gene sets get
-                             embedded gene lists, which keeps report size
-                             manageable for large (e.g. genome-scale)
-                             gene set collections. See
-                             _results_table_html() for the full rationale.
-    """
-    metric_data = {metric: {"results_dir": results_dir, "plots_dir": plots_dir}}
-    _build_report_impl(
-        metric_data=metric_data, report_path=report_path, obo_path=obo_path,
-        fdr_threshold=fdr_threshold, mode=mode, gmt_path=gmt_path,
-        tables_dir1=tables_dir1, tables_dir2=tables_dir2,
-        label1=label1, label2=label2,
-        pipeline_stats_path=pipeline_stats_path,
-        pipeline_stats_path1=pipeline_stats_path1,
-        pipeline_stats_path2=pipeline_stats_path2,
-        differential_stats_path=differential_stats_path,
-        alignment_pages1=alignment_pages1,
-        alignment_pages2=alignment_pages2,
-        run_parameters_path=run_parameters_path,
-        overlap_threshold=overlap_threshold,
-        gene_list_fdr_threshold=gene_list_fdr_threshold,
+    gsea_kwargs = dict(
+        gene_sets=gene_sets, organism=organism, sources=sources,
+        permutations=permutations, min_size=min_size, max_size=max_size,
+        seed=seed, fdr_threshold=fdr_threshold,
     )
 
+    run_parameters_path = os.path.join(outdir, "run_parameters.json")
 
-def build_multi_metric_report(
-    metric_data: dict,
-    report_path: str,
-    obo_path: str | None = None,
-    fdr_threshold: float = 0.25,
-    mode: str = "single",
-    gmt_path: str | None = None,
-    tables_dir1: str | None = None,
-    tables_dir2: str | None = None,
-    label1: str = "List 1",
-    label2: str = "List 2",
-    pipeline_stats_path: str | None = None,
-    pipeline_stats_path1: str | None = None,
-    pipeline_stats_path2: str | None = None,
-    differential_stats_path: str | None = None,
-    alignment_pages1: dict[str, str] | None = None,
-    alignment_pages2: dict[str, str] | None = None,
-    run_parameters_path: str | None = None,
-    overlap_threshold: float = DEFAULT_REDUNDANCY_OVERLAP_THRESHOLD,
-    gene_list_fdr_threshold: float | None = None,
-):
-    """Build a multi-metric (identity/zscore/rank) tabbed HTML report,
-    including the Cross-metric consensus, Alignments, Filtering summary,
-    and Run parameters tabs appended after the per-metric tabs.
+    # ------------------------------------------------------------------ #
+    #  Single-list mode                                                    #
+    # ------------------------------------------------------------------ #
+    if not two_list_mode:
+        logger.info("Running in single-list mode.")
 
-    Args:
-        run_parameters_path: Path to run_parameters.json (see
-                             provenance.write_run_parameters()), used to
-                             populate the Run parameters tab. None omits
-                             the record and shows a placeholder message
-                             instead of raising.
-        overlap_threshold:   Overlap coefficient at or above which two
-                             significant gene sets are considered
-                             redundant for the "Redundant with" column /
-                             "Show non-redundant only" toggle in each
-                             metric's enrichment table. See
-                             _cluster_redundant_terms() for the full
-                             algorithm.
-        gene_list_fdr_threshold: FDR threshold below which a gene set's
-                             full gene list / leading-edge gene list is
-                             embedded in the report as a clickable "View"
-                             link, rather than shown as a plain count.
-                             None (the default) means "use fdr_threshold"
-                             — i.e. only significant gene sets get
-                             embedded gene lists, which keeps report size
-                             manageable for large (e.g. genome-scale)
-                             gene set collections. See
-                             _results_table_html() for the full rationale.
-    """
-    _build_report_impl(
-        metric_data=metric_data, report_path=report_path, obo_path=obo_path,
-        fdr_threshold=fdr_threshold, mode=mode, gmt_path=gmt_path,
-        tables_dir1=tables_dir1, tables_dir2=tables_dir2,
-        label1=label1, label2=label2,
-        pipeline_stats_path=pipeline_stats_path,
-        pipeline_stats_path1=pipeline_stats_path1,
-        pipeline_stats_path2=pipeline_stats_path2,
-        differential_stats_path=differential_stats_path,
-        alignment_pages1=alignment_pages1,
-        alignment_pages2=alignment_pages2,
-        run_parameters_path=run_parameters_path,
-        overlap_threshold=overlap_threshold,
-        gene_list_fdr_threshold=gene_list_fdr_threshold,
-    )
+        run_params = collect_run_parameters(
+            outdir=outdir,
+            code_config_path=code_config_path,
+            project_config_path=args.project_config,
+            command_line=sys.argv,
+            inputdir=parameters['inputdir'],
+            anchor=parameters['anchor'],
+            resolved_params=resolved_params_for_provenance,
+            two_list_mode=False,
+            orthofinder_dir=orthofinder_dir,
+            all_metrics=all_metrics,
+            metrics_run=metrics_to_run,
+        )
+        write_run_parameters(run_params, outdir)
+
+        tables_dir, stats = _run_single_list(
+            listdir=outdir,
+            anchor=parameters['anchor'],
+            require_anchor=True,
+            species=None,
+            label="",
+            **common_kwargs,
+        )
+        aggregate_pipeline_stats(outdir, n_input=stats["n_input"])
+
+        # Alignment pages (bucket 3 = every group in group2anchor.tsv).
+        # Rendered once here, not per metric — alignment pages don't
+        # depend on the ranking metric at all. Path naming mirrors the
+        # convention used inside _run_single_list() for trim_colnumbering_dir
+        # (listdir/alignment_trimmed_colnumbering); the two must stay in
+        # sync since this is recomputed independently rather than threaded
+        # through _run_single_list()'s return value.
+        # If the divergence filter ran, its output (post-removal, and
+        # re-aligned for affected groups) is the alignment that identity
+        # was actually computed from — rendering the raw pre-filter
+        # 'alignment' dir here would show a since-removed sequence still
+        # present, with a mean-identity figure in the metadata panel that
+        # no longer matches what's on screen. This mirrors the existing
+        # trim_colnumbering_dir naming duplication note just above: this
+        # path must stay in sync with _run_single_list()'s own
+        # divergence_filtered_dir naming if that ever changes.
+        alignment_dir_single   = os.path.join(
+            outdir,
+            "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
+        )
+        alignment_pages_dir    = os.path.join(outdir, "alignments")
+        colnumbering_dir_single = (
+            os.path.join(outdir, "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+        divergence_drop_reasons_path_single = (
+            os.path.join(outdir, "divergence_filter_stats", "drop_reasons.tsv")
+            if divergence_filter_sd else None
+        )
+        # Length filtering always runs (unlike the divergence filter), so
+        # this path is always populated — no conditional needed. The
+        # underlying file is written unconditionally by
+        # aggregate_length_filter_stats(), even when nothing was dropped.
+        length_filter_drop_reasons_path_single = os.path.join(
+            outdir, "length_filter_stats", "drop_reasons.tsv"
+        )
+        if not (resume and _step_complete(alignment_pages_dir)):
+            logger.info("Rendering alignment pages for report...")
+            alignment_pages = build_alignment_pages(
+                alignment_dir=alignment_dir_single,
+                tables_dir=tables_dir,
+                outdir=alignment_pages_dir,
+                anchor_species=parameters['anchor'],
+                colnumbering_dir=colnumbering_dir_single,
+                divergence_drop_reasons_path=divergence_drop_reasons_path_single,
+                length_filter_drop_reasons_path=length_filter_drop_reasons_path_single,
+                show_progress=quiet,
+            )
+        else:
+            logger.info(
+                "Skipping alignment page generation (output already exists: %s)",
+                alignment_pages_dir,
+            )
+            alignment_pages = _reconstruct_alignment_pages(alignment_pages_dir)
+
+        raw_anchor2mean = os.path.join(tables_dir, "anchor2mean.tsv")
+        metric_outputs  = {}
+
+        # Gene ID set is identical across identity/zscore/rank (only the
+        # score column differs — see _normalise_anchor2mean()), so this is
+        # computed once here rather than per metric. Used by the report's
+        # "Tested genes" column to show only genes that actually made it
+        # into the ranked list, as opposed to a gene set's full raw GMT
+        # membership (see report.load_ranked_gene_ids()).
+        ranked_gene_ids = load_ranked_gene_ids(raw_anchor2mean)
+
+        for m in metrics_to_run:
+            sfx           = ("_%s" % m) if all_metrics else ""
+            results_dir_m = os.path.join(outdir, "enrichment%s" % sfx)
+            plots_dir_m   = os.path.join(outdir, "plots%s" % sfx)
+            gsea_input    = _normalise_anchor2mean(raw_anchor2mean, m, tables_dir)
+
+            logger.info("Step 6 [%s]: Enrichment analysis", m)
+            if replot or not _step_complete(results_dir_m,
+                                            ["gseapy.gene_set.prerank.report.csv"]):
+                run_gsea(anchor2mean_path=gsea_input,
+                         results_dir=results_dir_m,
+                         weight=_gsea_weight(two_list_mode, m),
+                         **gsea_kwargs)
+            else:
+                logger.info("Skipping GSEA for metric '%s' (output exists).", m)
+
+            logger.info("Generating plots [%s]", m)
+            make_single_list_plots(
+                anchor2mean_path=raw_anchor2mean,
+                results_dir=results_dir_m,
+                plots_dir=plots_dir_m,
+                obo_names=obo_names,
+                fdr_threshold=fdr_threshold,
+                top_n=top_n,
+            )
+            metric_outputs[m] = {"results_dir": results_dir_m,
+                                  "plots_dir":   plots_dir_m}
+
+        logger.info("Building HTML report")
+        if all_metrics:
+            build_multi_metric_report(
+                metric_data=metric_outputs,
+                report_path=os.path.join(outdir, "report.html"),
+                obo_path=obo_path,
+                fdr_threshold=fdr_threshold,
+                mode="single",
+                gmt_path=gene_sets,
+                tables_dir1=tables_dir,
+                pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
+                alignment_pages1=alignment_pages,
+                run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
+            )
+        else:
+            build_report(
+                results_dir=metric_outputs[metric]["results_dir"],
+                plots_dir=metric_outputs[metric]["plots_dir"],
+                report_path=os.path.join(outdir, "report.html"),
+                obo_path=obo_path,
+                mode="single",
+                fdr_threshold=fdr_threshold,
+                gmt_path=gene_sets,
+                tables_dir1=tables_dir,
+                pipeline_stats_path=os.path.join(outdir, "pipeline_stats.json"),
+                alignment_pages1=alignment_pages,
+                run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
+            )
+
+        # Fold every stage marker produced under outdir into
+        # run_parameters.json's 'stages' section, for human/report-tab
+        # visibility only — see stage_markers.aggregate_stage_markers()
+        # and provenance.add_stage_summary() docstrings. This is purely
+        # additive bookkeeping and deliberately happens last, after every
+        # stage that could possibly run this invocation already has.
+        add_stage_summary(run_parameters_path, aggregate_stage_markers(outdir))
+
+        for m in metrics_to_run:
+            _log_summary(stats, metric_outputs[m]["results_dir"],
+                         fdr_threshold, label=m if all_metrics else "")
+
+    # ------------------------------------------------------------------ #
+    #  Two-list differential mode                                          #
+    # ------------------------------------------------------------------ #
+    else:
+        logger.info("Running in two-list differential mode.")
+        logger.info("List names: '%s' vs '%s'", list1_name, list2_name)
+        anchor   = parameters['anchor']
+        species1 = read_species_list(list1_path)
+        species2 = read_species_list(list2_path)
+        check_lists(species1, species2, anchor)
+
+        if anchor not in species1:
+            species1        = list(species1) + [anchor]
+            anchor_injected = True
+        else:
+            anchor_injected = False
+
+        logger.info(
+            "%s: %d species. %s: %d species. Anchor: %s",
+            list1_name, len(species1), list2_name, len(species2), anchor,
+        )
+
+        run_params = collect_run_parameters(
+            outdir=outdir,
+            code_config_path=code_config_path,
+            project_config_path=args.project_config,
+            command_line=sys.argv,
+            inputdir=parameters['inputdir'],
+            anchor=anchor,
+            resolved_params=resolved_params_for_provenance,
+            two_list_mode=True,
+            orthofinder_dir=orthofinder_dir,
+            list1_path=list1_path,
+            list2_path=list2_path,
+            list1_name=list1_name,
+            list2_name=list2_name,
+            species1=species1,
+            species2=species2,
+            anchor_injected=anchor_injected,
+            all_metrics=all_metrics,
+            metrics_run=metrics_to_run,
+        )
+        write_run_parameters(run_params, outdir)
+
+        logger.info("--- Processing %s ---", list1_name)
+        tables_dir1, stats1 = _run_single_list(
+            listdir=os.path.join(outdir, "list1"),
+            anchor=anchor, require_anchor=False,
+            species=species1, label=list1_name,
+            exclude_from_identity={anchor} if anchor_injected else None,
+            require_anchor_in_tables=True,
+            **common_kwargs,
+        )
+        aggregate_pipeline_stats(os.path.join(outdir, "list1"),
+                                 n_input=stats1["n_input"])
+
+        logger.info("--- Processing %s ---", list2_name)
+        tables_dir2, stats2 = _run_single_list(
+            listdir=os.path.join(outdir, "list2"),
+            anchor=anchor, require_anchor=False,
+            species=species2, label=list2_name,
+            **common_kwargs,
+        )
+        aggregate_pipeline_stats(os.path.join(outdir, "list2"),
+                                 n_input=stats2["n_input"])
+        compute_differential_stats(
+            tables_dir1, tables_dir2,
+            list1_name=list1_name, list2_name=list2_name,
+            output_path=os.path.join(outdir, "differential_stats.json"),
+        )
+
+        metric_outputs = {}
+
+        for m in metrics_to_run:
+            sfx           = ("_%s" % m) if all_metrics else ""
+            diff_dir_m    = os.path.join(outdir, "differential%s" % sfx)
+            results_dir_m = os.path.join(diff_dir_m, "enrichment")
+            plots_dir_m   = os.path.join(diff_dir_m, "plots")
+
+            logger.info("--- Computing differential scores [metric=%s] ---", m)
+            if replot or not _step_complete(diff_dir_m,
+                                            ["anchor2mean.tsv",
+                                             "differential_scores.tsv"]):
+                compute_differential(
+                    tables_dir1=tables_dir1,
+                    tables_dir2=tables_dir2,
+                    diff_dir=diff_dir_m,
+                    metric=m,
+                )
+            else:
+                logger.info("Skipping differential ranking for '%s' (output exists).", m)
+
+            logger.info("Step 6 [%s]: Enrichment analysis (differential)", m)
+            if replot or not _step_complete(results_dir_m,
+                                            ["gseapy.gene_set.prerank.report.csv"]):
+                run_gsea(
+                    anchor2mean_path=os.path.join(diff_dir_m, "anchor2mean.tsv"),
+                    results_dir=results_dir_m,
+                    weight=_gsea_weight(two_list_mode, m),
+                    **gsea_kwargs,
+                )
+            else:
+                logger.info("Skipping GSEA for metric '%s' (output exists).", m)
+
+            logger.info("Generating differential plots [%s]", m)
+            make_differential_plots(
+                tables_dir1=tables_dir1,
+                tables_dir2=tables_dir2,
+                diff_dir=diff_dir_m,
+                plots_dir=plots_dir_m,
+                metric=m,
+                obo_names=obo_names,
+                fdr_threshold=fdr_threshold,
+                top_n=top_n,
+                name1=list1_name,
+                name2=list2_name,
+            )
+            metric_outputs[m] = {"results_dir": results_dir_m,
+                                  "plots_dir":   plots_dir_m}
+
+        # Alignment pages (bucket 3 in two-list mode = every group_id in
+        # differential_scores.tsv, i.e. the intersection compute_differential()
+        # already computed). Built once here using metrics_to_run[0]'s
+        # differential_scores.tsv, not per metric — the group_id set is
+        # expected to be identical across metrics (same intersection of
+        # tables_dir1/tables_dir2, just a different score column), a
+        # simplifying assumption confirmed acceptable rather than
+        # re-validated against every metric's own output.
+        first_metric   = metrics_to_run[0]
+        first_diff_dir = os.path.join(
+            outdir, "differential%s" % (("_%s" % first_metric) if all_metrics else ""),
+        )
+        diff_scores_path = os.path.join(first_diff_dir, "differential_scores.tsv")
+
+        import pandas as _pd
+        diff_group_ids = list(
+            _pd.read_csv(diff_scores_path, sep="\t")["group_id"].astype(str)
+        )
+
+        # Gene ID set is identical across identity/zscore/rank for a given
+        # differential run (see compute_differential() — normalisation
+        # only transforms the score column), so this is computed once
+        # here using the first metric's own anchor2mean.tsv, not per
+        # metric. Note this is deliberately the differential run's own
+        # anchor2mean.tsv (post group-intersection, post anchor-gene-ID
+        # mapping via list1) — NOT tables_dir1/tables_dir2 directly, since
+        # those are pre-intersection and are not what GSEA actually ran
+        # against. See report.load_ranked_gene_ids().
+        ranked_gene_ids = load_ranked_gene_ids(
+            os.path.join(first_diff_dir, "anchor2mean.tsv")
+        )
+
+        list1_alignment_dir = os.path.join(
+            outdir, "list1",
+            "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
+        )
+        list1_pages_dir      = os.path.join(outdir, "list1", "alignments")
+        list1_colnum_dir     = (
+            os.path.join(outdir, "list1", "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+        list1_divergence_drop_reasons_path = (
+            os.path.join(outdir, "list1", "divergence_filter_stats", "drop_reasons.tsv")
+            if divergence_filter_sd else None
+        )
+        list1_length_filter_drop_reasons_path = os.path.join(
+            outdir, "list1", "length_filter_stats", "drop_reasons.tsv"
+        )
+        list2_alignment_dir = os.path.join(
+            outdir, "list2",
+            "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
+        )
+        list2_pages_dir      = os.path.join(outdir, "list2", "alignments")
+        list2_colnum_dir     = (
+            os.path.join(outdir, "list2", "alignment_trimmed_colnumbering")
+            if trim_args else None
+        )
+        list2_divergence_drop_reasons_path = (
+            os.path.join(outdir, "list2", "divergence_filter_stats", "drop_reasons.tsv")
+            if divergence_filter_sd else None
+        )
+        list2_length_filter_drop_reasons_path = os.path.join(
+            outdir, "list2", "length_filter_stats", "drop_reasons.tsv"
+        )
+
+        if not (resume and _step_complete(list1_pages_dir)):
+            logger.info("Rendering %s alignment pages for report...", list1_name)
+            alignment_pages1 = build_alignment_pages(
+                alignment_dir=list1_alignment_dir,
+                tables_dir=tables_dir1,
+                outdir=list1_pages_dir,
+                group_ids=diff_group_ids,
+                anchor_species=anchor,
+                colnumbering_dir=list1_colnum_dir,
+                divergence_drop_reasons_path=list1_divergence_drop_reasons_path,
+                length_filter_drop_reasons_path=list1_length_filter_drop_reasons_path,
+                show_progress=quiet,
+            )
+        else:
+            logger.info(
+                "Skipping %s alignment page generation (output already exists: %s)",
+                list1_name, list1_pages_dir,
+            )
+            alignment_pages1 = _reconstruct_alignment_pages(list1_pages_dir)
+
+        # list2 never contains the anchor species (anchor_species=None
+        # disables pinning), but list1's own anchor gene mapping is passed
+        # through as page context so list2 pages still show which anchor
+        # gene this group corresponds to.
+        list1_anchor_lookup = load_group_anchor(tables_dir1)
+        if not (resume and _step_complete(list2_pages_dir)):
+            logger.info("Rendering %s alignment pages for report...", list2_name)
+            alignment_pages2 = build_alignment_pages(
+                alignment_dir=list2_alignment_dir,
+                tables_dir=tables_dir2,
+                outdir=list2_pages_dir,
+                group_ids=diff_group_ids,
+                anchor_species=None,
+                anchor_gene_lookup=list1_anchor_lookup,
+                colnumbering_dir=list2_colnum_dir,
+                divergence_drop_reasons_path=list2_divergence_drop_reasons_path,
+                length_filter_drop_reasons_path=list2_length_filter_drop_reasons_path,
+                show_progress=quiet,
+            )
+        else:
+            logger.info(
+                "Skipping %s alignment page generation (output already exists: %s)",
+                list2_name, list2_pages_dir,
+            )
+            alignment_pages2 = _reconstruct_alignment_pages(list2_pages_dir)
+
+        logger.info("Building HTML report")
+        if all_metrics:
+            build_multi_metric_report(
+                metric_data=metric_outputs,
+                report_path=os.path.join(outdir, "report.html"),
+                obo_path=obo_path,
+                fdr_threshold=fdr_threshold,
+                mode="differential",
+                gmt_path=gene_sets,
+                tables_dir1=tables_dir1,
+                tables_dir2=tables_dir2,
+                label1=list1_name,
+                label2=list2_name,
+                pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
+                pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
+                differential_stats_path=os.path.join(outdir, "differential_stats.json"),
+                alignment_pages1=alignment_pages1,
+                alignment_pages2=alignment_pages2,
+                run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
+            )
+        else:
+            build_report(
+                results_dir=metric_outputs[metric]["results_dir"],
+                plots_dir=metric_outputs[metric]["plots_dir"],
+                report_path=os.path.join(outdir, "differential", "report.html"),
+                obo_path=obo_path,
+                mode="differential",
+                metric=metric,
+                fdr_threshold=fdr_threshold,
+                gmt_path=gene_sets,
+                tables_dir1=tables_dir1,
+                tables_dir2=tables_dir2,
+                label1=list1_name,
+                label2=list2_name,
+                pipeline_stats_path1=os.path.join(outdir, "list1", "pipeline_stats.json"),
+                pipeline_stats_path2=os.path.join(outdir, "list2", "pipeline_stats.json"),
+                differential_stats_path=os.path.join(outdir, "differential_stats.json"),
+                alignment_pages1=alignment_pages1,
+                alignment_pages2=alignment_pages2,
+                run_parameters_path=run_parameters_path,
+                gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
+            )
+
+        # See the single-list branch's identical call for the full
+        # rationale — folds both lists' stage markers into
+        # run_parameters.json's 'stages' section, nested per list since
+        # list1/list2 run their pipeline stages independently.
+        add_stage_summary(run_parameters_path, {
+            "list1": aggregate_stage_markers(os.path.join(outdir, "list1")),
+            "list2": aggregate_stage_markers(os.path.join(outdir, "list2")),
+        })
+
+        for m in metrics_to_run:
+            lbl1 = ("%s [%s]" % (list1_name, m)) if all_metrics else list1_name
+            lbl2 = ("%s [%s]" % (list2_name, m)) if all_metrics else list2_name
+            _log_summary(stats1, metric_outputs[m]["results_dir"],
+                         fdr_threshold, label=lbl1)
+            _log_summary(stats2, metric_outputs[m]["results_dir"],
+                         fdr_threshold, label=lbl2)
+
+    if package_dir:
+        logger.info("Packaging shareable report bundle...")
+        try:
+            packaged_report_path = package_report(
+                outdir, package_dir, overwrite=package_overwrite,
+            )
+            logger.info("Shareable report bundle ready: %s", packaged_report_path)
+        except EnhydraIOError as e:
+            logger.warning(
+                "Could not package shareable report bundle: %s. The full "
+                "run output is still available at: %s", e, outdir,
+            )
+
+    logger.info("Enhydra finished successfully.")

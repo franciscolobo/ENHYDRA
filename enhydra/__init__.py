@@ -18,4 +18,4 @@ from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 from .stats import aggregate_pipeline_stats, compute_differential_stats
 from .msa_viewer import parse_trimal_colnumbering, compute_column_stats, render_alignment_page, build_alignment_pages, load_group_anchor
 from .provenance import collect_run_parameters, write_run_parameters
-from .package_report import package_report, package_comparison_report
+from .report import build_report, build_multi_metric_report, build_significance_agreement_table_html, load_ranked_gene_ids
