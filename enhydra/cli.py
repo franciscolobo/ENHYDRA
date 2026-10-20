@@ -31,6 +31,16 @@ from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 ALL_METRICS = ("identity", "zscore", "rank")
 
+# Default location for the code configuration file (mafft/trimal/etc. paths),
+# used when --code-config is not given and ENHYDRA_CODE_CONFIG is not set.
+# See _resolve_code_config_path() for the full precedence order. A single,
+# per-machine code_config rarely needs to change between analyses (unlike
+# project_config, which is expected to differ per run), so requiring it to
+# be re-specified on every invocation was pure friction once a person has
+# it set up once.
+_DEFAULT_CODE_CONFIG_PATH = os.path.expanduser("~/.enhydra/code_config")
+_CODE_CONFIG_ENV_VAR = "ENHYDRA_CODE_CONFIG"
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -57,6 +67,80 @@ def _resolve(cli_val, config_val, default=None):
     if config_val not in (None, ''):
         return config_val
     return default
+
+
+def _resolve_code_config_path(cli_value: str | None) -> str:
+    """Resolve which code_config file to use, so it needs to be specified
+    at most once per machine rather than on every invocation.
+
+    code_config records paths to external tools (mafft, trimal, etc.) that
+    rarely change once a machine is set up — unlike project_config, which
+    is expected to differ per analysis. Requiring it as a required
+    positional argument on every single invocation was pure friction for
+    the common case of "I already told ENHYDRA where mafft lives."
+
+    Resolution order (first match wins):
+        1. --code-config, if given explicitly on the command line. An
+           explicit path that does not exist raises immediately — if
+           someone bothered to type a path, silently falling through to
+           a different file would be more confusing than an upfront error.
+        2. The ENHYDRA_CODE_CONFIG environment variable, if set. Useful
+           for shared servers / CI / scripted pipelines where different
+           invocations might reasonably want different defaults without
+           modifying every call site.
+        3. The default path ~/.enhydra/code_config. This is the intended
+           steady-state for a person working on their own machine: create
+           the file once, then every future invocation just works.
+
+    Args:
+        cli_value: The value passed via --code-config, or None if not given.
+
+    Returns:
+        The resolved path to an existing code_config file.
+
+    Raises:
+        EnhydraConfigError: If an explicit --code-config path does not
+                            exist, or if none of the three locations above
+                            resolves to an existing file.
+    """
+    if cli_value is not None:
+        if not os.path.isfile(cli_value):
+            raise EnhydraConfigError(
+                "--code-config was given as '%s', but no file exists "
+                "there." % cli_value
+            )
+        return cli_value
+
+    env_value = os.environ.get(_CODE_CONFIG_ENV_VAR)
+    if env_value:
+        if not os.path.isfile(env_value):
+            raise EnhydraConfigError(
+                "%s is set to '%s', but no file exists there."
+                % (_CODE_CONFIG_ENV_VAR, env_value)
+            )
+        return env_value
+
+    if os.path.isfile(_DEFAULT_CODE_CONFIG_PATH):
+        return _DEFAULT_CODE_CONFIG_PATH
+
+    raise EnhydraConfigError(
+        "Could not find a code configuration file. Checked, in order:\n"
+        "  1. --code-config (not given)\n"
+        "  2. %s environment variable (not set)\n"
+        "  3. default location: %s (not found)\n\n"
+        "To fix this, do one of the following:\n"
+        "  - Create a code_config file at %s with your tool paths "
+        "(mafft, trimal, etc.), e.g.:\n"
+        "      mkdir -p %s\n"
+        "      printf 'mafft  = /usr/local/bin/mafft\\ntrimal = "
+        "/usr/local/bin/trimal\\n' > %s\n"
+        "  - Or pass --code-config /path/to/your/code_config explicitly.\n"
+        "  - Or set the %s environment variable to its path."
+        % (_CODE_CONFIG_ENV_VAR, _DEFAULT_CODE_CONFIG_PATH,
+           _DEFAULT_CODE_CONFIG_PATH,
+           os.path.dirname(_DEFAULT_CODE_CONFIG_PATH),
+           _DEFAULT_CODE_CONFIG_PATH, _CODE_CONFIG_ENV_VAR)
+    )
 
 
 def _step_complete(step_dir: str, sentinel_files: list[str] | None = None) -> bool:
@@ -91,11 +175,9 @@ def _reconstruct_alignment_pages(pages_dir: str) -> dict[str, str]:
 
     Used when a --resume/--replot run skips regenerating alignment pages
     because pages_dir already has content from a prior run. Downstream
-    steps (report building, in a later commit) still need this mapping
-    populated regardless of which branch ran, so it is reconstructed from
-    whatever HTML files are already on disk rather than left undefined —
-    the same "must stay populated either way" concern already handled for
-    tables_dir/stats elsewhere in this module.
+    steps (report building) still need this mapping populated regardless
+    of which branch ran, so it is reconstructed from whatever HTML files
+    are already on disk rather than left undefined.
     """
     if not os.path.isdir(pages_dir):
         return {}
@@ -689,8 +771,17 @@ def _build_arg_parser():
         prog="enhydra",
         description="Gene Set Enrichment Analysis for evolutionary genomics.",
     )
-    parser.add_argument("code_config",    help="Path to the code configuration file.")
     parser.add_argument("project_config", help="Path to the project configuration file.")
+    parser.add_argument(
+        "--code-config", default=None, metavar="FILE",
+        help="Path to the code configuration file (tool paths: mafft, "
+             "trimal, etc.). Optional — if not given, ENHYDRA looks for "
+             "the %s environment variable, then falls back to "
+             "~/.enhydra/code_config. Since this rarely changes between "
+             "analyses, setting it up once via either of those two "
+             "fallbacks means you don't need to pass this flag on every "
+             "invocation." % _CODE_CONFIG_ENV_VAR,
+    )
 
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--orthofinder-dir", default=None,
@@ -795,7 +886,6 @@ def _build_arg_parser():
     )
     parser.add_argument("--top-n",         type=int,   default=None)
     parser.add_argument("--obo-cache",     default=None)
-
     parser.add_argument(
         "--package-dir", default=None, metavar="DIR",
         help="After a successful run, copy only the files needed to view "
@@ -812,8 +902,6 @@ def _build_arg_parser():
              "in the project config."
     )
 
-
-
     return parser
 
 
@@ -822,14 +910,19 @@ def main():
     args   = parser.parse_args()
 
     try:
+        code_config_path = _resolve_code_config_path(args.code_config)
+    except EnhydraConfigError as e:
+        sys.exit("Configuration error: %s" % e)
+
+    try:
         with open(args.project_config) as fh_project, \
-             open(args.code_config)    as fh_code:
+             open(code_config_path)    as fh_code:
             parameters = read_config_file(fh_project, fh_code)
     except OSError as e:
         sys.exit("Could not open configuration file: %s" % e)
 
     try:
-        check_parameters(parameters, args.code_config)
+        check_parameters(parameters, code_config_path)
     except (EnhydraConfigError, EnhydraIOError, EnhydraToolError) as e:
         sys.exit("Configuration error: %s" % e)
 
@@ -884,7 +977,7 @@ def main():
     obo_cache     = _resolve(args.obo_cache, parameters['obo_cache'], None)
 
     # Run-mode flags: previously CLI-only (argparse defaults of False/None
-    # with no config fallback). All five now accept a project-config value
+    # with no config fallback). All seven now accept a project-config value
     # too — argparse's store_true flags use default=None (not False) so
     # that "flag not passed on the CLI" can be distinguished from
     # "explicitly disabled", letting _resolve() fall through to the config
@@ -917,7 +1010,6 @@ def main():
     # not the raw config file contents, which a CLI flag may have silently
     # overridden. Keys match collect_run_parameters()'s resolved_params
     # contract exactly.
-    #
     resolved_params_for_provenance = {
         "min_species":          min_species,
         "min_sequences":        min_sequences,
@@ -1000,6 +1092,7 @@ def main():
     _setup_logging(outdir, quiet=quiet)
     logger = logging.getLogger(__name__)
     logger.info("Welcome to Enhydra")
+    logger.info("Using code configuration: %s", code_config_path)
     logger.info(
         "Resolved parameters: metric=%s, all_metrics=%s, replot=%s, "
         "paralogs=%s, trim=%s, divergence_filter_sd=%s, min_species=%d, "
@@ -1080,7 +1173,7 @@ def main():
 
         run_params = collect_run_parameters(
             outdir=outdir,
-            code_config_path=args.code_config,
+            code_config_path=code_config_path,
             project_config_path=args.project_config,
             command_line=sys.argv,
             inputdir=parameters['inputdir'],
@@ -1256,7 +1349,7 @@ def main():
 
         run_params = collect_run_parameters(
             outdir=outdir,
-            code_config_path=args.code_config,
+            code_config_path=code_config_path,
             project_config_path=args.project_config,
             command_line=sys.argv,
             inputdir=parameters['inputdir'],
