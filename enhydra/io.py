@@ -106,6 +106,8 @@ def read_config_file(fh_project, fh_code) -> dict:
         'replot':           _parse_bool(project.get('replot', '')),
         'quiet':            _parse_bool(project.get('quiet', '')),
         'all_metrics':      _parse_bool(project.get('all_metrics', '')),
+        'package_dir':      project.get('package_dir', ''),
+        'package_overwrite': _parse_bool(project.get('package_overwrite', '')),
     }
     return parameters
 

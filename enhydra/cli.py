@@ -26,6 +26,7 @@ from .msa_viewer import build_alignment_pages, load_group_anchor
 from .provenance import collect_run_parameters, write_run_parameters, \
     add_stage_summary
 from .stage_markers import check_stage, write_stage_marker, aggregate_stage_markers
+from .package_report import package_report
 from .exceptions import EnhydraConfigError, EnhydraIOError, EnhydraToolError
 
 ALL_METRICS = ("identity", "zscore", "rank")
@@ -795,6 +796,24 @@ def _build_arg_parser():
     parser.add_argument("--top-n",         type=int,   default=None)
     parser.add_argument("--obo-cache",     default=None)
 
+    parser.add_argument(
+        "--package-dir", default=None, metavar="DIR",
+        help="After a successful run, copy only the files needed to view "
+             "the report (report.html, enrichment plot images, alignment "
+             "pages, and filtering-detail pages) into this directory, as "
+             "a single self-contained folder suitable for sharing without "
+             "any intermediate pipeline files. Can also be set via "
+             "'package_dir' in the project config."
+    )
+    parser.add_argument(
+        "--package-overwrite", action="store_true", default=None,
+        help="If --package-dir already exists, replace it rather than "
+             "raising an error. Can also be set via 'package_overwrite' "
+             "in the project config."
+    )
+
+
+
     return parser
 
 
@@ -877,6 +896,8 @@ def main():
     replot          = _resolve(args.replot,          parameters['replot'],          False)
     quiet           = _resolve(args.quiet,           parameters['quiet'],           False)
     all_metrics     = _resolve(args.all_metrics,     parameters['all_metrics'],     False)
+    package_dir       = _resolve(args.package_dir,       parameters['package_dir'],       None) or None
+    package_overwrite = _resolve(args.package_overwrite, parameters['package_overwrite'], False)
     resume          = resume_flag or replot
 
     try:
@@ -1489,5 +1510,18 @@ def main():
                          fdr_threshold, label=lbl1)
             _log_summary(stats2, metric_outputs[m]["results_dir"],
                          fdr_threshold, label=lbl2)
+
+    if package_dir:
+        logger.info("Packaging shareable report bundle...")
+        try:
+            packaged_report_path = package_report(
+                outdir, package_dir, overwrite=package_overwrite,
+            )
+            logger.info("Shareable report bundle ready: %s", packaged_report_path)
+        except EnhydraIOError as e:
+            logger.warning(
+                "Could not package shareable report bundle: %s. The full "
+                "run output is still available at: %s", e, outdir,
+            )
 
     logger.info("Enhydra finished successfully.")
