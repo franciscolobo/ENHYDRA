@@ -20,7 +20,7 @@ from .gsea import run_gsea
 from .orthofinder import preprocess_orthofinder
 from .differential import compute_differential, normalise_scores
 from .plotting import make_single_list_plots, make_differential_plots
-from .report import build_report, build_multi_metric_report
+from .report import build_report, build_multi_metric_report, load_ranked_gene_ids
 from .stats import aggregate_pipeline_stats, compute_differential_stats
 from .msa_viewer import build_alignment_pages, load_group_anchor
 from .provenance import collect_run_parameters, write_run_parameters, \
@@ -1375,6 +1375,14 @@ def main():
         raw_anchor2mean = os.path.join(tables_dir, "anchor2mean.tsv")
         metric_outputs  = {}
 
+        # Gene ID set is identical across identity/zscore/rank (only the
+        # score column differs — see _normalise_anchor2mean()), so this is
+        # computed once here rather than per metric. Used by the report's
+        # "Tested genes" column to show only genes that actually made it
+        # into the ranked list, as opposed to a gene set's full raw GMT
+        # membership (see report.load_ranked_gene_ids()).
+        ranked_gene_ids = load_ranked_gene_ids(raw_anchor2mean)
+
         for m in metrics_to_run:
             sfx           = ("_%s" % m) if all_metrics else ""
             results_dir_m = os.path.join(outdir, "enrichment%s" % sfx)
@@ -1417,6 +1425,7 @@ def main():
                 alignment_pages1=alignment_pages,
                 run_parameters_path=run_parameters_path,
                 gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
             )
         else:
             build_report(
@@ -1432,6 +1441,7 @@ def main():
                 alignment_pages1=alignment_pages,
                 run_parameters_path=run_parameters_path,
                 gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
             )
 
         # Fold every stage marker produced under outdir into
@@ -1585,6 +1595,19 @@ def main():
             _pd.read_csv(diff_scores_path, sep="\t")["group_id"].astype(str)
         )
 
+        # Gene ID set is identical across identity/zscore/rank for a given
+        # differential run (see compute_differential() — normalisation
+        # only transforms the score column), so this is computed once
+        # here using the first metric's own anchor2mean.tsv, not per
+        # metric. Note this is deliberately the differential run's own
+        # anchor2mean.tsv (post group-intersection, post anchor-gene-ID
+        # mapping via list1) — NOT tables_dir1/tables_dir2 directly, since
+        # those are pre-intersection and are not what GSEA actually ran
+        # against. See report.load_ranked_gene_ids().
+        ranked_gene_ids = load_ranked_gene_ids(
+            os.path.join(first_diff_dir, "anchor2mean.tsv")
+        )
+
         list1_alignment_dir = os.path.join(
             outdir, "list1",
             "alignment_divergence_filtered" if divergence_filter_sd else "alignment",
@@ -1684,6 +1707,7 @@ def main():
                 alignment_pages2=alignment_pages2,
                 run_parameters_path=run_parameters_path,
                 gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
             )
         else:
             build_report(
@@ -1706,6 +1730,7 @@ def main():
                 alignment_pages2=alignment_pages2,
                 run_parameters_path=run_parameters_path,
                 gene_list_fdr_threshold=gene_list_fdr_threshold,
+                ranked_gene_ids=ranked_gene_ids,
             )
 
         # See the single-list branch's identical call for the full
